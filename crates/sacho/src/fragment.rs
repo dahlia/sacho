@@ -368,7 +368,11 @@ fn split_frontmatter(source: &str) -> std::result::Result<ParsedSource<'_>, Frag
             .strip_suffix('\r')
             .unwrap_or(line_without_newline);
         if delimiter == "---" {
-            let yaml = &source[first_line_end + 1..offset];
+            let yaml = &source[first_line_end..offset];
+            let yaml = yaml
+                .strip_prefix("\r\n")
+                .or_else(|| yaml.strip_prefix('\n'))
+                .expect("frontmatter delimiter line ended at first_line_end");
             let body = &source[offset + line.len()..];
             return Ok(ParsedSource {
                 frontmatter: Frontmatter::parse(yaml)?,
@@ -487,10 +491,8 @@ fn collect_references<'a>(
     references: &mut Vec<ReferenceUse>,
 ) -> std::result::Result<(), FragmentError> {
     let data = node.data();
-    match &data.value {
-        NodeValue::Text(text) => scan_reference_labels(text, link_templates, references)?,
-        NodeValue::Code(_) | NodeValue::CodeBlock(_) => return Ok(()),
-        _ => {}
+    if let NodeValue::Text(text) = &data.value {
+        scan_reference_labels(text, link_templates, references)?;
     }
     drop(data);
     for child in node.children() {
@@ -505,16 +507,14 @@ fn scan_reference_labels(
     references: &mut Vec<ReferenceUse>,
 ) -> std::result::Result<(), FragmentError> {
     let mut rest = text;
-    while let Some(open) = rest.find('[') {
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find(']') else {
+    while let Some((_, after_open)) = rest.split_once('[') {
+        let Some((label, after_close)) = after_open.split_once(']') else {
             break;
         };
-        let label = &rest[..close];
         if let Some(reference) = parse_reference_label(label, link_templates)? {
             references.push(reference);
         }
-        rest = &rest[close + 1..];
+        rest = after_close;
     }
     Ok(())
 }
@@ -712,6 +712,20 @@ mod tests {
     }
 
     #[test]
+    fn strips_frontmatter_before_fragment_body() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\npriority: 1\nowner: docs\n---\n -  Added thing.\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(fragment.items[0].markdown, "-  Added thing.");
+        assert_eq!(fragment.items[0].sort_text, "Added thing.");
+    }
+
+    #[test]
     fn rejects_ordered_list() {
         let error = parse_fragment("change.md".into(), "1. Added thing.\n", None, &links())
             .expect_err("ordered list is invalid");
@@ -723,6 +737,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn reports_specific_invalid_top_level_node_kinds() {
+        let cases = [
+            ("> quoted\n", "block quote"),
+            ("~~~~ text\ncode\n~~~~\n", "code block"),
+            ("# Heading\n", "heading"),
+            ("<div>\nhtml\n</div>\n", "HTML block"),
+            ("***\n", "thematic break"),
+        ];
+
+        for (source, expected_kind) in cases {
+            let error = parse_fragment("change.md".into(), source, None, &links())
+                .expect_err("top-level node is invalid");
+            assert!(matches!(
+                error,
+                FragmentError::InvalidShape {
+                    kind,
+                    ..
+                } if kind == expected_kind
+            ));
+        }
+
+        let arena = Arena::new();
+        let root = parse_document(&arena, " -  item\n", &comrak_options());
+        assert_eq!(node_kind(root), "document");
+        let list = root.first_child().expect("list");
+        let item = list.first_child().expect("item");
+        assert_eq!(node_kind(item), "list item");
     }
 
     #[test]
@@ -768,6 +812,46 @@ mod tests {
             fragment.items[0].sort_text,
             "Added clear() method and docs."
         );
+    }
+
+    #[test]
+    fn extracts_sort_text_from_extended_markdown_nodes() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            " -  Added <span>inline</span> HTML, $math$, and line\n    break.\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(
+            fragment.items[0].sort_text,
+            "Added <span>inline</span> HTML, math, and line break."
+        );
+    }
+
+    #[test]
+    fn plain_text_handles_block_nodes() {
+        let arena = Arena::new();
+        let root = parse_document(
+            &arena,
+            "~~~~ text\ncode literal\n~~~~\n\n<div>\nhtml literal\n</div>\n",
+            &comrak_options(),
+        );
+        let code = root.first_child().expect("code block");
+        let html = code.next_sibling().expect("HTML block");
+
+        assert_eq!(plain_text(code), "code literal\n");
+        assert_eq!(plain_text(html), "<div>\nhtml literal\n</div>\n");
+
+        let arena = Arena::new();
+        let root = parse_document(
+            &arena,
+            "[^note]\n\n[^note]: Footnote text.\n",
+            &comrak_options(),
+        );
+        let paragraph = root.first_child().expect("paragraph");
+        assert_eq!(plain_text(paragraph), "note");
     }
 
     #[test]
@@ -819,6 +903,47 @@ mod tests {
             &links(),
         )
         .expect("code literals should not be references");
+
+        assert!(fragment.items[0].references.is_empty());
+    }
+
+    #[test]
+    fn scans_multiple_reference_labels_with_surrounding_text() {
+        let mut references = Vec::new();
+
+        scan_reference_labels(
+            "Fixed before [#12], middle [#345], and after.",
+            &links(),
+            &mut references,
+        )
+        .expect("references");
+
+        assert_eq!(
+            references,
+            vec![
+                ReferenceUse {
+                    label: String::from("#12"),
+                    sigil: String::from("#"),
+                    number: 12,
+                },
+                ReferenceUse {
+                    label: String::from("#345"),
+                    sigil: String::from("#"),
+                    number: 345,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_incomplete_reference_like_labels() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            " -  Mentioned [#], [ABC-], [abc-123], and [ABC-x] literally.\n",
+            None,
+            &links(),
+        )
+        .expect("incomplete labels are plain text");
 
         assert!(fragment.items[0].references.is_empty());
     }
@@ -879,6 +1004,26 @@ mod tests {
                 PathBuf::from("changes.d/core/z.md")
             ]
         );
+    }
+
+    #[test]
+    fn discovers_no_candidates_when_section_fragment_directory_is_missing() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "Core"
+            directory = "core"
+            "#,
+        )
+        .expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert!(discovered.candidates.is_empty());
+        assert!(discovered.warnings.is_empty());
     }
 
     #[test]

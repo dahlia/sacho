@@ -112,6 +112,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, mutants::skip)]
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::iter;
     use std::os::windows::ffi::OsStrExt;

@@ -261,6 +261,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_report_is_clean_only_without_violations() {
+        assert!(CheckReport::default().is_clean());
+        assert!(
+            !CheckReport {
+                violations: vec![CheckViolation {
+                    message: String::from("bad fragment")
+                }],
+            }
+            .is_clean()
+        );
+    }
+
+    #[test]
+    fn unimplemented_commands_report_unsupported_command() {
+        let (_temp, repo) = repo_with_config("");
+
+        let format_error =
+            format_fragments(&repo, FormatOptions).expect_err("format is unsupported");
+        let sync_error = apply_sync(&repo, SyncPlan::Clean).expect_err("sync is unsupported");
+        let release_error = apply_release(
+            &repo,
+            ReleasePlan {
+                version: String::from("1.0.0"),
+            },
+        )
+        .expect_err("release is unsupported");
+        let carry_error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.0.0"),
+            },
+        )
+        .expect_err("carry is unsupported");
+
+        assert!(matches!(
+            format_error,
+            Error::UnsupportedCommand { command: "fmt" }
+        ));
+        assert!(matches!(
+            sync_error,
+            Error::UnsupportedCommand { command: "sync" }
+        ));
+        assert!(matches!(
+            release_error,
+            Error::UnsupportedCommand { command: "release" }
+        ));
+        assert!(matches!(
+            carry_error,
+            Error::UnsupportedCommand { command: "carry" }
+        ));
+    }
+
     proptest! {
         #[test]
         fn check_collects_every_invalid_fragment(

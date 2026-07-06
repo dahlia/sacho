@@ -404,17 +404,13 @@ fn append_reference_definitions(markdown: &mut String, references: &[CompiledRef
 fn hongdown_options() -> HongdownOptions {
     HongdownOptions {
         line_width: Some(LineWidth::new(80).expect("80 is a valid line width")),
-        setext_h1: true,
-        setext_h2: true,
         unordered_marker: UnorderedMarker::Hyphen,
         leading_spaces: LeadingSpaces::new(1).expect("1 is valid leading spaces"),
         trailing_spaces: TrailingSpaces::new(2).expect("2 is valid trailing spaces"),
         indent_width: IndentWidth::new(4).expect("4 is a valid indent width"),
         curly_double_quotes: false,
         curly_single_quotes: false,
-        curly_apostrophes: false,
         ellipsis: false,
-        en_dash: DashSetting::Disabled,
         em_dash: DashSetting::Disabled,
         ..HongdownOptions::default()
     }
@@ -562,6 +558,18 @@ mod tests {
     }
 
     #[test]
+    fn treats_empty_next_file_as_unreleased() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "\n  \n").expect("next");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(compiled.version_label, VersionLabel::Unreleased);
+        assert!(compiled.markdown.starts_with("Unreleased\n----------\n"));
+    }
+
+    #[test]
     fn compiles_repository_without_sections() {
         let (temp, repo) = repo_with_config(
             r##"
@@ -584,6 +592,25 @@ mod tests {
         );
         assert_eq!(compiled.sections[0].id, None);
         assert_eq!(compiled.sections[0].references.len(), 1);
+    }
+
+    #[test]
+    fn preserves_ascii_punctuation_in_compiled_markdown() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/punctuation.md"),
+            " -  Added \"quoted\" 'single' can't wait... from 1---3.\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(compiled.markdown.contains("\"quoted\""));
+        assert!(compiled.markdown.contains("'single'"));
+        assert!(compiled.markdown.contains("can't"));
+        assert!(compiled.markdown.contains("wait..."));
+        assert!(compiled.markdown.contains("1---3"));
     }
 
     #[test]
