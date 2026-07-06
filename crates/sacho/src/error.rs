@@ -121,7 +121,12 @@ pub enum ConfigError {
 
 /// Fragment-specific error.
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum FragmentError {
+    /// YAML frontmatter was opened but never closed.
+    #[snafu(display("YAML frontmatter delimiter was not closed"))]
+    UnclosedFrontmatter,
+
     /// YAML frontmatter could not be parsed.
     #[snafu(display("YAML frontmatter parse error: {source}"))]
     Frontmatter {
@@ -130,6 +135,24 @@ pub enum FragmentError {
     },
 
     /// The fragment Markdown did not match Sacho's structural constraints.
-    #[snafu(display("fragment body must contain exactly one top-level unordered list"))]
-    InvalidShape,
+    #[snafu(display(
+        "fragment body must contain exactly one top-level unordered list; found {kind} at {line}:{column}"
+    ))]
+    InvalidShape {
+        /// Top-level node kind that violated the constraint.
+        kind: &'static str,
+
+        /// Source line where the violating node starts.
+        line: usize,
+
+        /// Source column where the violating node starts.
+        column: usize,
+    },
+
+    /// A fragment referenced an unknown link sigil.
+    #[snafu(display("reference label {label:?} does not match any configured link template"))]
+    UnknownReference {
+        /// Reference label that could not be resolved.
+        label: String,
+    },
 }

@@ -1,6 +1,8 @@
+use std::fs;
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
+use crate::fragment::{discover_fragment_candidates, parse_fragment};
 use crate::repo::Repository;
 
 /// Command execution context shared by command APIs.
@@ -208,6 +210,26 @@ pub fn carry(_repo: &Repository, _options: CarryOptions) -> Result<CarryResult> 
 }
 
 /// Checks fragments, materialized output, and missing-fragment policy.
-pub fn check(_repo: &Repository, _options: CheckOptions) -> Result<CheckReport> {
-    Err(Error::UnsupportedCommand { command: "check" })
+pub fn check(repo: &Repository, _options: CheckOptions) -> Result<CheckReport> {
+    let discovered = discover_fragment_candidates(repo)?;
+    let mut violations = Vec::new();
+
+    for candidate in discovered.candidates {
+        let source = fs::read_to_string(&candidate.path).map_err(|source| Error::ReadFile {
+            path: candidate.path.clone(),
+            source,
+        })?;
+        if let Err(error) = parse_fragment(
+            candidate.relative_path.clone(),
+            &source,
+            candidate.section,
+            &repo.config().links,
+        ) {
+            violations.push(CheckViolation {
+                message: format!("{}: {error}", candidate.relative_path.display()),
+            });
+        }
+    }
+
+    Ok(CheckReport { violations })
 }
