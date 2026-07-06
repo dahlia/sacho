@@ -6,6 +6,7 @@ experimental = true
 [tools]
 "aqua:dahlia/hongdown" = "0.5.1"
 "aqua:nushell/nushell" = "0.114.0"
+"cargo:cargo-mutants" = "27.1.0"
 
 [tools.rust]
 version = "1.96.1"
@@ -52,6 +53,10 @@ run = "cargo build --workspace"
 [tasks.test]
 description = "Run the Rust tests"
 run = "cargo test --workspace"
+
+[tasks.mutants]
+description = "Run mutation tests"
+run = "cargo mutants --workspace"
 
 [tasks.run]
 description = "Run the Rust project"

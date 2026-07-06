@@ -36,7 +36,8 @@ mise install
 ~~~~
 
 The project requires the Rust toolchain configured in *mise.toml*. The mise
-installation also provides supporting tools such as Hongdown and Nushell.
+installation also provides supporting tools such as Hongdown, Nushell, and
+cargo-mutants.
 
 After installing tools, mise runs the repository post-install hook. This fetches
 Cargo dependencies and writes a Git pre-commit hook that runs the `check` task.
@@ -84,6 +85,18 @@ Run tests:
 ~~~~ sh
 mise run test
 ~~~~
+
+Run mutation tests:
+
+~~~~ sh
+mise run mutants
+~~~~
+
+This runs cargo-mutants, which checks whether the test suite catches small
+changes injected into the Rust code.  Mutation testing is useful for finding
+weak assertions and untested behavior, but it is much slower than the normal
+checks, so it is available as a separate task rather than part of
+`mise run check`.
 
 Run the Sacho binary during development:
 
