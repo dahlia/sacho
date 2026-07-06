@@ -221,3 +221,84 @@ pub fn check(repo: &Repository, _options: CheckOptions) -> Result<CheckReport> {
 
     Ok(CheckReport { violations })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use proptest::prelude::*;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn repo_with_config(config: &str) -> (TempDir, Repository) {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("sacho.toml"), config).expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+        (temp, repo)
+    }
+
+    fn normalize_separators(value: impl AsRef<str>) -> String {
+        value.as_ref().replace('\\', "/")
+    }
+
+    #[test]
+    fn check_reports_invalid_fragment_shape() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/bad.md"), "not a list\n").expect("fragment");
+
+        let report = check(&repo, CheckOptions::default()).expect("check");
+
+        assert!(!report.is_clean());
+        assert_eq!(report.violations.len(), 1);
+        assert!(normalize_separators(&report.violations[0].message).contains("changes.d/bad.md"));
+        assert!(
+            report.violations[0]
+                .message
+                .contains("exactly one top-level unordered list")
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn check_collects_every_invalid_fragment(
+            invalid_fragments in prop::collection::vec("[a-z]{1,12}", 1..12),
+        ) {
+            let (temp, repo) = repo_with_config("");
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            fs::write(temp.path().join("changes.d/valid.md"), " -  Valid change.\n")
+                .expect("valid fragment");
+
+            let expected_paths = invalid_fragments
+                .iter()
+                .enumerate()
+                .map(|(index, word)| {
+                    let relative =
+                        PathBuf::from("changes.d").join(format!("{index:02}-{word}.md"));
+                    fs::write(
+                        temp.path().join(&relative),
+                        format!("Invalid top-level paragraph {word}.\n"),
+                    )
+                    .expect("invalid fragment");
+                    relative
+                })
+                .collect::<Vec<_>>();
+
+            let report = check(&repo, CheckOptions::default()).expect("check");
+
+            prop_assert_eq!(report.violations.len(), expected_paths.len());
+            for path in expected_paths {
+                let path = normalize_separators(path.display().to_string());
+                prop_assert!(
+                    report
+                        .violations
+                        .iter()
+                        .any(|violation| normalize_separators(&violation.message).contains(&path)),
+                    "missing violation for {path}"
+                );
+            }
+        }
+    }
+}

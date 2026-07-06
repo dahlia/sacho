@@ -144,9 +144,14 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 mod tests {
     use std::fs;
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::*;
+
+    fn path_segments() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec("dir-[a-z][a-z0-9_-]{0,8}", 1..8)
+    }
 
     #[test]
     fn opens_repository_from_nested_directory() {
@@ -189,5 +194,39 @@ mod tests {
             fs::read_to_string(temp.path().join("nested/file.txt")).expect("read"),
             "new\n"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn discovers_config_from_any_nested_directory(segments in path_segments()) {
+            let temp = TempDir::new().expect("tempdir");
+            let config_path = temp.path().join("sacho.toml");
+            fs::write(&config_path, "").expect("config");
+            let nested = segments.iter().fold(temp.path().to_path_buf(), |path, segment| {
+                path.join(segment)
+            });
+            fs::create_dir_all(&nested).expect("nested dir");
+
+            let discovered = Repository::discover_config(&nested);
+
+            prop_assert_eq!(discovered, Some(config_path));
+        }
+
+        #[test]
+        fn discovers_config_from_files_inside_nested_directories(segments in path_segments()) {
+            let temp = TempDir::new().expect("tempdir");
+            let config_path = temp.path().join("sacho.toml");
+            fs::write(&config_path, "").expect("config");
+            let nested = segments.iter().fold(temp.path().to_path_buf(), |path, segment| {
+                path.join(segment)
+            });
+            fs::create_dir_all(&nested).expect("nested dir");
+            let file = nested.join("source.rs");
+            fs::write(&file, "fn main() {}\n").expect("file");
+
+            let discovered = Repository::discover_config(&file);
+
+            prop_assert_eq!(discovered, Some(config_path));
+        }
     }
 }

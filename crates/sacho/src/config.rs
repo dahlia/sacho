@@ -235,7 +235,58 @@ pub struct SectionConfig {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
+
+    fn safe_text() -> impl Strategy<Value = String> {
+        "[A-Za-z0-9][A-Za-z0-9_-]{0,12}"
+    }
+
+    fn safe_path() -> impl Strategy<Value = PathBuf> {
+        prop::collection::vec("[a-z][a-z0-9_-]{0,8}", 1..4)
+            .prop_map(|segments| segments.into_iter().collect())
+    }
+
+    fn config_strategy() -> impl Strategy<Value = Config> {
+        (
+            safe_path(),
+            safe_path(),
+            prop::collection::vec((safe_text(), safe_path()), 0..8),
+            prop::collection::vec(("[!#$%&*+./:=?@^|~-]{1,3}", "[a-z]{1,8}"), 0..8),
+        )
+            .prop_map(|(changelog_path, fragment_dir, sections, links)| {
+                let mut link_map = IndexMap::new();
+                for (sigil, stem) in links {
+                    link_map.insert(
+                        ReferenceSigil::new(sigil),
+                        UrlTemplate::new(format!("https://example.com/{stem}/{{n}}")),
+                    );
+                }
+
+                Config {
+                    changelog: ChangelogConfig {
+                        path: changelog_path,
+                        ..ChangelogConfig::default()
+                    },
+                    fragments: FragmentsConfig {
+                        directory: fragment_dir,
+                        ..FragmentsConfig::default()
+                    },
+                    links: link_map,
+                    vcs: VcsConfig::default(),
+                    check: CheckConfig::default(),
+                    sections: sections
+                        .into_iter()
+                        .map(|(id, directory)| SectionConfig {
+                            id,
+                            directory,
+                            paths: Vec::new(),
+                        })
+                        .collect(),
+                }
+            })
+    }
 
     #[test]
     fn fills_documented_defaults() {
@@ -298,5 +349,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["!", "#"]
         );
+    }
+
+    proptest! {
+        #[test]
+        fn serialized_valid_configs_parse_back_to_same_value(config in config_strategy()) {
+            let toml = toml::to_string(&config).expect("serialize config");
+
+            let parsed = Config::parse(&toml).expect("serialized config should parse");
+
+            prop_assert_eq!(parsed, config);
+        }
+
+        #[test]
+        fn validates_any_link_template_containing_number_placeholder(
+            prefix in "[A-Za-z0-9/:._?=&-]{0,24}",
+            suffix in "[A-Za-z0-9/:._?=&-]{0,24}",
+        ) {
+            let mut config = Config::parse("").expect("default config");
+            config.links.insert(
+                ReferenceSigil::new("#"),
+                UrlTemplate::new(format!("{prefix}{{n}}{suffix}")),
+            );
+
+            prop_assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn rejects_any_link_template_missing_number_placeholder(
+            template in "[A-Za-z0-9/:._?=&-]{0,48}",
+        ) {
+            prop_assume!(!template.contains("{n}"));
+            let mut config = Config::parse("").expect("default config");
+            config
+                .links
+                .insert(ReferenceSigil::new("#"), UrlTemplate::new(template));
+
+            let error = config.validate().expect_err("missing placeholder");
+            let is_missing_placeholder = matches!(
+                error,
+                ConfigError::LinkTemplateMissingNumber { .. }
+            );
+
+            prop_assert!(is_missing_placeholder);
+        }
     }
 }
