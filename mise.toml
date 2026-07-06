@@ -1,0 +1,58 @@
+min_version = "2026.6.15"
+
+[settings]
+experimental = true
+
+[tools]
+"aqua:dahlia/hongdown" = "0.5.1"
+"aqua:nushell/nushell" = "0.114.0"
+
+[tools.rust]
+version = "1.96.1"
+profile = "default"
+components = "rust-analyzer,rustfmt,clippy"
+
+[deps.cargo]
+auto = true
+description = "Fetch Rust dependencies"
+sources = ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml"]
+outputs = ["."]
+run = """
+nu -c "
+  if not ('Cargo.toml' | path exists) { exit 0 }
+  if ('Cargo.lock' | path exists) { cargo fetch --locked } else { cargo fetch }
+"
+"""
+
+[hooks.postinstall]
+shell = "nu -c"
+run = """
+mise deps
+mise generate git-pre-commit --write --task=check
+"""
+
+[tasks.check]
+description = "Run type check, lint, and check Markdown format"
+run = [
+  "cargo check",
+  "cargo clippy",
+  "cargo fmt --check",
+  "hongdown --check",
+  "mise fmt --check",
+]
+
+[tasks.fmt]
+description = "Format code and docs"
+run = ["cargo fmt", "hongdown --write", "mise fmt"]
+
+[tasks.build]
+description = "Build the Rust project"
+run = "cargo build --workspace"
+
+[tasks.test]
+description = "Run the Rust tests"
+run = "cargo test --workspace"
+
+[tasks.run]
+description = "Run the Rust project"
+run = "cargo run --package sacho"
