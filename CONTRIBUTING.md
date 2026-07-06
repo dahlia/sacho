@@ -98,6 +98,13 @@ Contribution guidelines
 Keep changes focused and small enough to review comfortably. Include tests when
 the change affects behavior, parsing, output, or error handling.
 
+Prefer property-based tests for behavior with broad input space or invariants:
+parsing, ordering, deterministic output, reference resolution, path discovery,
+format normalization, and error classification.  Use example-based unit tests
+or integration tests when property-based testing does not fit the behavior, for
+example CLI help text, a fixed regression fixture, or a workflow that needs a
+specific user-visible transcript.
+
 Sacho is intentionally opinionated. Before adding configuration or broadening
 behavior, check whether the change fits the project philosophy in
 *PHILOSOPHY.md*. Configuration should describe a repository, not turn Sacho into

@@ -5,6 +5,8 @@ use crate::error::{Error, Result};
 use crate::fragment::{discover_fragment_candidates, parse_fragment};
 use crate::repo::Repository;
 
+pub use crate::compile::{CompileOptions, CompiledRegion};
+
 /// Command execution context shared by command APIs.
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -51,20 +53,6 @@ pub struct FormatOptions;
 pub struct FormatResult {
     /// Fragment paths whose contents changed.
     pub changed: Vec<PathBuf>,
-}
-
-/// Options for compiling the unreleased region.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CompileOptions {
-    /// Optional section identifier to compile by itself.
-    pub section: Option<String>,
-}
-
-/// Compiled unreleased changelog region.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledRegion {
-    /// Markdown text produced by the compiler.
-    pub text: String,
 }
 
 /// Options for planning a changelog synchronization.
@@ -180,8 +168,8 @@ pub fn format_fragments(_repo: &Repository, _options: FormatOptions) -> Result<F
 }
 
 /// Compiles the current fragments into an unreleased changelog region.
-pub fn compile_unreleased(_repo: &Repository, _options: CompileOptions) -> Result<CompiledRegion> {
-    Err(Error::UnsupportedCommand { command: "preview" })
+pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<CompiledRegion> {
+    crate::compile::compile_unreleased(repo, options)
 }
 
 /// Plans a synchronization between fragments and the materialized changelog.

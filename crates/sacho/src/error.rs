@@ -72,6 +72,27 @@ pub enum Error {
         source: FragmentError,
     },
 
+    /// Markdown formatting failed.
+    #[snafu(display("failed to format compiled Markdown: {source}"))]
+    Format {
+        /// Underlying Hongdown formatting error.
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// A requested section does not exist.
+    #[snafu(display("unknown section {section:?}"))]
+    UnknownSection {
+        /// Section identifier requested by the caller.
+        section: String,
+    },
+
+    /// The next-version file did not contain a single version line.
+    #[snafu(display("{} must contain at most one non-empty line", path.display()))]
+    InvalidNextVersion {
+        /// Next-version file path.
+        path: PathBuf,
+    },
+
     /// The unreleased changelog region could not be found.
     #[snafu(display("changelog region not found in {}", path.display()))]
     RegionNotFound {

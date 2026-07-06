@@ -10,7 +10,7 @@ use sacho::commands::{
 use sacho::{Error, Repository};
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about = "Manage unreleased changelog fragments")]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,43 +18,90 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a new changelog fragment.
     Add {
-        #[arg(long)]
+        /// Section id to place the fragment under.
+        #[arg(long, help = "Section id to place the fragment under")]
         section: Option<String>,
+
+        /// Topic-based fragment file name, without the .md extension.
+        #[arg(help = "Topic-based fragment file name, without the .md extension")]
         name: String,
     },
+
+    /// Set the next unreleased version.
     Next {
+        /// Version label to write to the next-version file.
+        #[arg(help = "Version label to write to the next-version file")]
         version: String,
     },
+
+    /// Check fragments, materialized output, and missing-fragment policy.
     Check {
-        #[arg(long)]
+        /// Base revision for VCS-backed missing-fragment checks.
+        #[arg(long, help = "Base revision for missing-fragment checks")]
         base: Option<String>,
-        #[arg(long)]
+
+        /// Repair mechanically fixable violations.
+        #[arg(long, help = "Repair mechanically fixable violations")]
         fix: bool,
     },
+
+    /// Format changelog fragments.
     Fmt,
+
+    /// Print the compiled unreleased region.
     Preview {
-        #[arg(long)]
+        /// Section id to preview by itself.
+        #[arg(long, help = "Section id to preview by itself")]
         section: Option<String>,
     },
+
+    /// Regenerate the materialized unreleased changelog region.
     Sync {
-        #[arg(long)]
+        /// Apply the sync even when existing edits would be discarded.
+        #[arg(long, help = "Apply even when existing edits would be discarded")]
         force: bool,
     },
+
+    /// Compile fragments into a released changelog section.
     Release {
+        /// Version to release; defaults to the next-version file.
+        #[arg(help = "Version to release; defaults to the next-version file")]
         version: Option<String>,
-        #[arg(long)]
+
+        /// Release date in YYYY-MM-DD form.
+        #[arg(long, help = "Release date in YYYY-MM-DD form")]
         date: Option<String>,
-        #[arg(long)]
+
+        /// Next unreleased version to write after release.
+        #[arg(long, help = "Next unreleased version to write after release")]
         next: Option<String>,
     },
+
+    /// Carry entries from a released section back into fragments.
     Carry {
+        /// Released version whose entries should be carried.
+        #[arg(help = "Released version whose entries should be carried")]
         version: String,
     },
+
+    /// Resolve changelog merge conflicts by recompiling fragments.
     MergeDriver {
+        /// Common ancestor file passed by the VCS merge driver.
+        #[arg(help = "Common ancestor file passed by the VCS merge driver")]
         original: String,
+
+        /// Current-side file passed by the VCS merge driver.
+        #[arg(help = "Current-side file passed by the VCS merge driver")]
         current: String,
+
+        /// Other-side file passed by the VCS merge driver.
+        #[arg(help = "Other-side file passed by the VCS merge driver")]
         other: String,
+
+        /// Repository path being merged.
+        #[arg(help = "Repository path being merged")]
         path: String,
     },
 }
@@ -90,8 +137,14 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Preview { section } => {
-                let compiled = compile_unreleased(&repo, CompileOptions { section })?;
-                print!("{}", compiled.text);
+                let compiled = compile_unreleased(
+                    &repo,
+                    CompileOptions {
+                        section,
+                        include_empty_region: true,
+                    },
+                )?;
+                print!("{}", compiled.markdown);
                 Ok(ExitCode::SUCCESS)
             }
             Command::Sync { force: _ } => {

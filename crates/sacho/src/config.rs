@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::Hash;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
@@ -21,7 +22,7 @@ pub struct Config {
 
     /// Reference-link URL templates keyed by sigil.
     #[serde(default)]
-    pub links: BTreeMap<ReferenceSigil, UrlTemplate>,
+    pub links: IndexMap<ReferenceSigil, UrlTemplate>,
 
     /// Version-control integration settings.
     #[serde(default)]
@@ -128,7 +129,7 @@ impl Default for FragmentsConfig {
 }
 
 /// Reference sigil used in shortcut links, such as `#`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ReferenceSigil(String);
 
@@ -276,5 +277,26 @@ mod tests {
         assert_eq!(config.changelog.region_detection, RegionDetection::Heading);
         assert_eq!(config.fragments.directory, PathBuf::from("news.d"));
         assert_eq!(config.fragments.next_file, PathBuf::from("next"));
+    }
+
+    #[test]
+    fn preserves_link_template_order() {
+        let config = Config::parse(
+            r##"
+            [links]
+            "!" = "https://example.com/pulls/{n}"
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        )
+        .expect("config");
+
+        assert_eq!(
+            config
+                .links
+                .keys()
+                .map(ReferenceSigil::as_str)
+                .collect::<Vec<_>>(),
+            vec!["!", "#"]
+        );
     }
 }

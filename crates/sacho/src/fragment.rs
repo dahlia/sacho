@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
 use comrak::{Arena, Options as ComrakOptions, parse_document};
+use indexmap::IndexMap;
 use serde::Deserialize;
 use snafu::ResultExt;
 
@@ -241,7 +242,7 @@ pub fn parse_fragment(
     path: PathBuf,
     source: &str,
     section: Option<String>,
-    link_templates: &BTreeMap<ReferenceSigil, UrlTemplate>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
 ) -> std::result::Result<Fragment, FragmentError> {
     let ParsedSource {
         frontmatter,
@@ -482,7 +483,7 @@ fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
 
 fn collect_references<'a>(
     node: &'a AstNode<'a>,
-    link_templates: &BTreeMap<ReferenceSigil, UrlTemplate>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
     references: &mut Vec<ReferenceUse>,
 ) -> std::result::Result<(), FragmentError> {
     let data = node.data();
@@ -500,7 +501,7 @@ fn collect_references<'a>(
 
 fn scan_reference_labels(
     text: &str,
-    link_templates: &BTreeMap<ReferenceSigil, UrlTemplate>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
     references: &mut Vec<ReferenceUse>,
 ) -> std::result::Result<(), FragmentError> {
     let mut rest = text;
@@ -520,7 +521,7 @@ fn scan_reference_labels(
 
 fn parse_reference_label(
     label: &str,
-    link_templates: &BTreeMap<ReferenceSigil, UrlTemplate>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
 ) -> std::result::Result<Option<ReferenceUse>, FragmentError> {
     let label = label.trim_matches(|character| character == '[' || character == ']');
     for sigil in link_templates.keys() {
@@ -595,12 +596,12 @@ fn slice_sourcepos<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use proptest::prelude::*;
 
     use super::*;
 
-    fn links() -> BTreeMap<ReferenceSigil, UrlTemplate> {
-        BTreeMap::from([(
+    fn links() -> IndexMap<ReferenceSigil, UrlTemplate> {
+        IndexMap::from([(
             ReferenceSigil::new("#"),
             UrlTemplate::new("https://example.com/issues/{n}"),
         )])
@@ -913,5 +914,91 @@ mod tests {
             discovered.candidates[0].section,
             Some(String::from("extra"))
         );
+    }
+
+    proptest! {
+        #[test]
+        fn parses_frontmatter_priority(priority in -10_000_i32..10_000) {
+            let source = format!("---\npriority: {priority}\n---\n -  Changed thing.\n");
+
+            let fragment = parse_fragment("change.md".into(), &source, None, &links())
+                .expect("fragment");
+
+            prop_assert_eq!(fragment.priority, priority);
+        }
+
+        #[test]
+        fn preserves_item_ordinals(words in prop::collection::vec("[a-z]{1,8}", 1..12)) {
+            let source = words
+                .iter()
+                .map(|word| format!(" -  Changed {word}.\n"))
+                .collect::<String>();
+
+            let fragment = parse_fragment("change.md".into(), &source, None, &links())
+                .expect("fragment");
+
+            prop_assert_eq!(fragment.items.len(), words.len());
+            prop_assert_eq!(
+                fragment
+                    .items
+                    .iter()
+                    .map(|item| item.ordinal)
+                    .collect::<Vec<_>>(),
+                (0..words.len()).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn collects_and_deduplicates_references(numbers in prop::collection::vec(1_u64..100, 1..25)) {
+            let labels = numbers
+                .iter()
+                .map(|number| format!("[#{number}]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!(" -  Fixed references.  [{labels}]\n");
+
+            let fragment = parse_fragment("change.md".into(), &source, None, &links())
+                .expect("fragment");
+
+            let mut expected = numbers
+                .into_iter()
+                .map(|number| ReferenceUse {
+                    label: format!("#{number}"),
+                    sigil: String::from("#"),
+                    number,
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected.dedup();
+
+            prop_assert_eq!(fragment.items[0].references.clone(), expected);
+        }
+
+        #[test]
+        fn discovers_fragment_candidates_in_path_order(stems in prop::collection::vec("[a-z]{1,8}", 1..12)) {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+            std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            let mut paths = Vec::new();
+            for (index, stem) in stems.iter().enumerate().rev() {
+                let path = PathBuf::from(format!("changes.d/{index:02}-{stem}.md"));
+                std::fs::write(temp.path().join(&path), " -  Changed thing.\n")
+                    .expect("fragment");
+                paths.push(path);
+            }
+            paths.sort();
+            let repo = Repository::from_root(temp.path()).expect("repo");
+
+            let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+            prop_assert_eq!(
+                discovered
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.relative_path.clone())
+                    .collect::<Vec<_>>(),
+                paths
+            );
+        }
     }
 }
