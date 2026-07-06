@@ -107,6 +107,22 @@ Write changelog-related prose for users, not for maintainers reading commit
 history. The project exists to preserve that distinction.
 
 
+Coding conventions
+------------------
+
+Keep the Rust library API documented.  Every public module, type, variant,
+field, constant, and function should have a rustdoc comment explaining its role
+in the library API.
+
+Rustdoc warnings are part of the code quality bar.  The library crate enables
+warnings for missing documentation, bare URLs, and broken intra-doc links; new
+public API should compile cleanly under those warnings.
+
+Workspace lint settings are inherited by each crate.  Keep each package's
+`[lints] workspace = true` setting in place so Rust and Clippy warnings are
+treated consistently across the workspace.
+
+
 Before opening a pull request
 -----------------------------
 
