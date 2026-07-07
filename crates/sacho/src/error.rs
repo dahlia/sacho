@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::changelog::ChangelogError;
 use snafu::Snafu;
 
 /// Result type returned by Sacho library APIs.
@@ -98,6 +99,16 @@ pub enum Error {
     RegionNotFound {
         /// Changelog path that did not contain the region.
         path: PathBuf,
+    },
+
+    /// A changelog file could not be parsed or updated.
+    #[snafu(display("invalid changelog region in {}: {source}", path.display()))]
+    Changelog {
+        /// Changelog path containing the invalid region.
+        path: PathBuf,
+
+        /// Region-specific error.
+        source: ChangelogError,
     },
 
     /// No configuration file was found during repository discovery.

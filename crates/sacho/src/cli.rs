@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CompileOptions, FormatOptions, NextOptions,
-    ReleaseOptions, SyncOptions, add_fragment, carry, check, compile_unreleased, format_fragments,
-    plan_release, plan_sync, set_next_version,
+    ReleaseOptions, SyncOptions, SyncPlan, add_fragment, apply_sync, carry, check,
+    compile_unreleased, format_fragments, plan_release, plan_sync, set_next_version,
 };
 use sacho::{Error, Repository};
 
@@ -147,8 +147,16 @@ impl Cli {
                 print!("{}", compiled.markdown);
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Sync { force: _ } => {
-                let _plan = plan_sync(&repo, SyncOptions)?;
+            Command::Sync { force } => {
+                let plan = plan_sync(&repo, SyncOptions { force })?;
+                if let SyncPlan::NeedsConfirmation { diff, .. } = &plan {
+                    eprint!("{diff}");
+                    eprintln!(
+                        "sync may discard hand edits in the materialized changelog; rerun with --force to apply"
+                    );
+                    return Ok(ExitCode::from(2));
+                }
+                apply_sync(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Release {

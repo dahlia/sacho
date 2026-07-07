@@ -96,7 +96,9 @@ This runs cargo-mutants, which checks whether the test suite catches small
 changes injected into the Rust code.  Mutation testing is useful for finding
 weak assertions and untested behavior, but it is much slower than the normal
 checks, so it is available as a separate task rather than part of
-`mise run check`.
+`mise run check`.  A successful mutation-testing run must report zero missed
+mutants and zero timed-out mutants.  Unviable mutants are acceptable; missed or
+timed-out mutants mean the test suite or implementation needs more work.
 
 Run the Sacho binary during development:
 
@@ -111,10 +113,16 @@ Contribution guidelines
 Keep changes focused and small enough to review comfortably. Include tests when
 the change affects behavior, parsing, output, or error handling.
 
-Prefer property-based tests for behavior with broad input space or invariants:
-parsing, ordering, deterministic output, reference resolution, path discovery,
-format normalization, and error classification.  Use example-based unit tests
-or integration tests when property-based testing does not fit the behavior, for
+Develop behavior changes test-first when practical: write the failing test that
+captures the intended behavior, watch it fail for the right reason, then
+implement the smallest change that makes it pass.  Keep the test as the
+regression guard.
+
+Use property-based testing wherever the behavior can be expressed as generated
+inputs plus invariants.  This is especially important for parsing, ordering,
+deterministic output, reference resolution, path discovery, format
+normalization, and error classification.  Use example-based unit tests or
+integration tests when property-based testing does not fit the behavior, for
 example CLI help text, a fixed regression fixture, or a workflow that needs a
 specific user-visible transcript.
 
@@ -157,5 +165,14 @@ If your change affects runtime behavior, also run:
 ~~~~ sh
 mise run test
 ~~~~
+
+If your change affects behavior or tests, run:
+
+~~~~ sh
+mise run mutants
+~~~~
+
+The mutation-testing result must have zero missed mutants and zero timed-out
+mutants before opening a pull request.
 
 Make sure generated formatting changes are included in your commit.

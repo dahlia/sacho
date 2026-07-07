@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use similar::TextDiff;
+
+use crate::changelog::{ChangelogError, replace_unreleased_region};
 use crate::error::{Error, Result};
 use crate::fragment::{discover_fragment_candidates, parse_fragment};
 use crate::repo::Repository;
@@ -57,23 +60,61 @@ pub struct FormatResult {
 
 /// Options for planning a changelog synchronization.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SyncOptions;
+pub struct SyncOptions {
+    /// Apply the sync even when the existing region may contain hand edits.
+    pub force: bool,
+}
+
+/// Pending file write prepared by a command plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWrite {
+    /// Repository-relative path that will be written.
+    pub path: PathBuf,
+
+    /// File contents before the planned write.
+    pub old_contents: String,
+
+    /// File contents after the planned write.
+    pub new_contents: String,
+}
+
+/// Reason a sync plan was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSkipReason {
+    /// Materialized changelogs are disabled by configuration.
+    MaterializationDisabled,
+
+    /// The changelog already matches the compiled fragment output.
+    AlreadyCurrent,
+}
+
+/// Risk that requires caller confirmation before applying a sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncRisk {
+    /// The existing materialized region may contain hand edits.
+    PossibleHandEdits,
+}
 
 /// Planned synchronization action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncPlan {
-    /// The changelog already matches the compiled fragment output.
-    Clean,
     /// The changelog can be updated without confirmation.
-    Apply {
-        /// Replacement Markdown for the unreleased region.
-        replacement: String,
-    },
+    Apply(PendingWrite),
+
     /// Applying the sync may discard hand edits and needs confirmation.
     NeedsConfirmation {
+        /// Pending write that would synchronize the changelog.
+        pending: PendingWrite,
+
         /// Diff showing the content that would be replaced.
         diff: String,
+
+        /// Reason confirmation is required.
+        reason: SyncRisk,
     },
+
+    /// No write is needed.
+    Skipped(SyncSkipReason),
 }
 
 /// Result of applying a synchronization plan.
@@ -173,13 +214,65 @@ pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<
 }
 
 /// Plans a synchronization between fragments and the materialized changelog.
-pub fn plan_sync(_repo: &Repository, _options: SyncOptions) -> Result<SyncPlan> {
-    Err(Error::UnsupportedCommand { command: "sync" })
+pub fn plan_sync(repo: &Repository, options: SyncOptions) -> Result<SyncPlan> {
+    let config = repo.config();
+    if !config.changelog.materialize {
+        return Ok(SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled));
+    }
+
+    let compiled = compile_unreleased(repo, CompileOptions::default())?;
+    let changelog_path = config.changelog.path.clone();
+    let absolute_path = repo.resolve(&changelog_path);
+    let old_contents = fs::read_to_string(&absolute_path).map_err(|source| Error::ReadFile {
+        path: absolute_path,
+        source,
+    })?;
+    let replacement = replace_unreleased_region(
+        &old_contents,
+        &compiled.markdown,
+        config.changelog.region_detection,
+        &config.changelog.unreleased_heading,
+    )
+    .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+
+    if old_contents == replacement.new_contents {
+        return Ok(SyncPlan::Skipped(SyncSkipReason::AlreadyCurrent));
+    }
+
+    let pending = PendingWrite {
+        path: changelog_path,
+        old_contents,
+        new_contents: replacement.new_contents,
+    };
+    if options.force {
+        Ok(SyncPlan::Apply(pending))
+    } else {
+        let diff = unified_diff(&pending.old_contents, &pending.new_contents);
+        Ok(SyncPlan::NeedsConfirmation {
+            pending,
+            diff,
+            reason: SyncRisk::PossibleHandEdits,
+        })
+    }
 }
 
 /// Applies a previously planned synchronization.
-pub fn apply_sync(_repo: &Repository, _plan: SyncPlan) -> Result<SyncResult> {
-    Err(Error::UnsupportedCommand { command: "sync" })
+pub fn apply_sync(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
+    let pending = match plan {
+        SyncPlan::Apply(pending)
+        | SyncPlan::NeedsConfirmation {
+            pending,
+            diff: _,
+            reason: _,
+        } => pending,
+        SyncPlan::Skipped(_) => return Ok(SyncResult { changed: false }),
+    };
+    if pending.old_contents == pending.new_contents {
+        return Ok(SyncResult { changed: false });
+    }
+
+    repo.atomic_write(&pending.path, pending.new_contents.as_bytes())?;
+    Ok(SyncResult { changed: true })
 }
 
 /// Plans a release operation.
@@ -219,7 +312,41 @@ pub fn check(repo: &Repository, _options: CheckOptions) -> Result<CheckReport> {
         }
     }
 
+    if violations.is_empty() {
+        match plan_sync(repo, SyncOptions { force: false })? {
+            SyncPlan::NeedsConfirmation { diff, .. } => {
+                violations.push(CheckViolation {
+                    message: format!(
+                        "materialized changelog is out of sync with fragments; run `sacho sync --force`\n{diff}"
+                    ),
+                });
+            }
+            SyncPlan::Apply(_) => {
+                violations.push(CheckViolation {
+                    message: String::from(
+                        "materialized changelog is out of sync with fragments; run `sacho sync --force`",
+                    ),
+                });
+            }
+            SyncPlan::Skipped(_) => {}
+        }
+    }
+
     Ok(CheckReport { violations })
+}
+
+fn changelog_error(path: PathBuf, source: ChangelogError) -> Error {
+    match source {
+        ChangelogError::RegionNotFound => Error::RegionNotFound { path },
+        source => Error::Changelog { path, source },
+    }
+}
+
+fn unified_diff(old_contents: &str, new_contents: &str) -> String {
+    TextDiff::from_lines(old_contents, new_contents)
+        .unified_diff()
+        .header("current", "compiled")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -280,7 +407,6 @@ mod tests {
 
         let format_error =
             format_fragments(&repo, FormatOptions).expect_err("format is unsupported");
-        let sync_error = apply_sync(&repo, SyncPlan::Clean).expect_err("sync is unsupported");
         let release_error = apply_release(
             &repo,
             ReleasePlan {
@@ -301,10 +427,6 @@ mod tests {
             Error::UnsupportedCommand { command: "fmt" }
         ));
         assert!(matches!(
-            sync_error,
-            Error::UnsupportedCommand { command: "sync" }
-        ));
-        assert!(matches!(
             release_error,
             Error::UnsupportedCommand { command: "release" }
         ));
@@ -312,6 +434,83 @@ mod tests {
             carry_error,
             Error::UnsupportedCommand { command: "carry" }
         ));
+    }
+
+    #[test]
+    fn sync_skips_when_materialization_is_disabled() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        let plan = plan_sync(&repo, SyncOptions::default()).expect("plan");
+
+        assert!(matches!(
+            plan,
+            SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled)
+        ));
+    }
+
+    #[test]
+    fn sync_skips_when_changelog_is_current() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_sync(&repo, SyncOptions::default()).expect("plan");
+
+        assert!(matches!(
+            plan,
+            SyncPlan::Skipped(SyncSkipReason::AlreadyCurrent)
+        ));
+    }
+
+    #[test]
+    fn sync_force_applies_pending_write() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_sync(&repo, SyncOptions { force: true }).expect("plan");
+        let result = apply_sync(&repo, plan).expect("apply");
+
+        assert!(result.changed);
+        assert!(
+            fs::read_to_string(temp.path().join("CHANGES.md"))
+                .expect("read")
+                .contains(" -  Fixed sync.\n")
+        );
+    }
+
+    #[test]
+    fn check_reports_materialized_changelog_mismatch() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let report = check(&repo, CheckOptions::default()).expect("check");
+
+        assert!(!report.is_clean());
+        assert!(report.violations.iter().any(|violation| {
+            violation
+                .message
+                .contains("materialized changelog is out of sync")
+        }));
     }
 
     proptest! {
