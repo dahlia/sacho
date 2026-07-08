@@ -235,3 +235,39 @@ fn check_reports_mismatch_and_passes_after_sync() {
         .assert()
         .success();
 }
+
+#[test]
+fn release_command_writes_changelog_and_consumes_fragments() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+materialize = false
+",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/release.md"),
+        " -  Fixed release.\n",
+    )
+    .expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Changelog\n=========\n\nVersion 0.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["release", "0.2.0", "--date", "2026-07-08"])
+        .assert()
+        .success();
+
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains("Version 0.2.0\n-------------"));
+    assert!(changelog.contains("Released on July 8, 2026."));
+    assert!(!temp.path().join("changes.d/release.md").exists());
+}

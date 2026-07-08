@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CompileOptions, FormatOptions, NextOptions,
-    ReleaseOptions, SyncOptions, SyncPlan, add_fragment, apply_sync, carry, check,
+    ReleaseOptions, SyncOptions, SyncPlan, add_fragment, apply_release, apply_sync, carry, check,
     compile_unreleased, format_fragments, plan_release, plan_sync, set_next_version,
 };
 use sacho::{Error, Repository};
@@ -167,7 +167,7 @@ impl Cli {
                 date,
                 next,
             } => {
-                let _plan = plan_release(
+                let plan = plan_release(
                     &repo,
                     ReleaseOptions {
                         version,
@@ -175,6 +175,7 @@ impl Cli {
                         next,
                     },
                 )?;
+                apply_release(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Carry { version } => {

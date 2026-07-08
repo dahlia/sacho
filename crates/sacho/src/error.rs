@@ -123,6 +123,29 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A release version argument disagreed with the next-version file.
+    #[snafu(display(
+        "release version {version:?} does not match next-version file value {next_version:?}"
+    ))]
+    ReleaseVersionMismatch {
+        /// Explicit release version supplied by the caller.
+        version: String,
+
+        /// Version read from the next-version file.
+        next_version: String,
+    },
+
+    /// No release version was supplied or configured.
+    #[snafu(display("release version is required when the next-version file is absent or empty"))]
+    MissingReleaseVersion,
+
+    /// A release date was not a valid `YYYY-MM-DD` calendar date.
+    #[snafu(display("invalid release date {date:?}; expected YYYY-MM-DD"))]
+    InvalidReleaseDate {
+        /// Invalid date string supplied by the caller.
+        date: String,
+    },
+
     /// The unreleased changelog region could not be found.
     #[snafu(display("changelog region not found in {}", path.display()))]
     RegionNotFound {

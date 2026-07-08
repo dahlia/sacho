@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hongdown::{
     DashSetting, IndentWidth, LeadingSpaces, LineWidth, Options as HongdownOptions, TrailingSpaces,
@@ -10,6 +11,7 @@ use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
 use crate::changelog::{ChangelogError, replace_unreleased_region};
+use crate::config::RegionDetection;
 use crate::error::{Error, Result};
 use crate::fragment::{
     DiscoveryWarning, FragmentWarning, discover_fragment_candidates, parse_fragment,
@@ -148,6 +150,82 @@ pub struct ReleaseOptions {
 pub struct ReleasePlan {
     /// Version that will be released.
     pub version: String,
+
+    /// Date line that will be written into the released section.
+    pub date: ReleaseDate,
+
+    /// Next unreleased version to write after release.
+    pub next: Option<String>,
+
+    /// Markdown for the released changelog section.
+    pub released_markdown: String,
+
+    /// Fragment files consumed by the release.
+    pub consumed_fragments: Vec<PathBuf>,
+}
+
+/// Calendar date used for a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseDate {
+    /// Four-digit year.
+    pub year: i32,
+
+    /// Month number in the range 1 through 12.
+    pub month: u8,
+
+    /// Day of month in the valid range for `month`.
+    pub day: u8,
+}
+
+impl ReleaseDate {
+    fn parse(source: &str) -> Result<Self> {
+        let parts = source.split('-').collect::<Vec<_>>();
+        if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+            return Err(Error::InvalidReleaseDate {
+                date: source.to_owned(),
+            });
+        }
+        let year = parts[0]
+            .parse::<i32>()
+            .map_err(|_| Error::InvalidReleaseDate {
+                date: source.to_owned(),
+            })?;
+        let month = parts[1]
+            .parse::<u8>()
+            .map_err(|_| Error::InvalidReleaseDate {
+                date: source.to_owned(),
+            })?;
+        let day = parts[2]
+            .parse::<u8>()
+            .map_err(|_| Error::InvalidReleaseDate {
+                date: source.to_owned(),
+            })?;
+        let date = Self { year, month, day };
+        if !date.is_valid() {
+            return Err(Error::InvalidReleaseDate {
+                date: source.to_owned(),
+            });
+        }
+        Ok(date)
+    }
+
+    fn today_utc() -> Self {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_secs();
+        civil_from_days((seconds / 86_400) as i64)
+    }
+
+    fn long_form(self) -> String {
+        format!("{} {}, {}", month_name(self.month), self.day, self.year)
+    }
+
+    fn is_valid(self) -> bool {
+        (1..=12).contains(&self.month)
+            && self.day >= 1
+            && self.day <= days_in_month(self.year, self.month)
+    }
 }
 
 /// Result of applying a release plan.
@@ -408,13 +486,93 @@ pub fn apply_sync(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
 }
 
 /// Plans a release operation.
-pub fn plan_release(_repo: &Repository, _options: ReleaseOptions) -> Result<ReleasePlan> {
-    Err(Error::UnsupportedCommand { command: "release" })
+pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<ReleasePlan> {
+    ensure_materialized_current_before_mutation(repo)?;
+
+    let next_version = read_next_version(repo)?;
+    let version = match (options.version.as_deref().map(str::trim), next_version) {
+        (Some(""), _) => return Err(Error::MissingReleaseVersion),
+        (Some(version), Some(next_version)) if version != next_version => {
+            return Err(Error::ReleaseVersionMismatch {
+                version: version.to_owned(),
+                next_version,
+            });
+        }
+        (Some(version), _) => version.to_owned(),
+        (None, Some(next_version)) => next_version,
+        (None, None) => return Err(Error::MissingReleaseVersion),
+    };
+    let date = match options.date {
+        Some(date) => ReleaseDate::parse(&date)?,
+        None => ReleaseDate::today_utc(),
+    };
+    let compiled = compile_unreleased(repo, CompileOptions::default())?;
+    let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
+    let consumed_fragments = discover_fragment_candidates(repo)?
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.relative_path)
+        .collect();
+
+    Ok(ReleasePlan {
+        version,
+        date,
+        next: options.next.map(|next| next.trim().to_owned()),
+        released_markdown,
+        consumed_fragments,
+    })
 }
 
 /// Applies a previously planned release.
-pub fn apply_release(_repo: &Repository, _plan: ReleasePlan) -> Result<ReleaseResult> {
-    Err(Error::UnsupportedCommand { command: "release" })
+pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResult> {
+    let config = repo.config();
+    let changelog_path = config.changelog.path.clone();
+    let old_changelog = match fs::read_to_string(repo.resolve(&changelog_path)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound && !config.changelog.materialize => {
+            initial_changelog(&config.changelog.title)
+        }
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: repo.resolve(&changelog_path),
+                source,
+            });
+        }
+    };
+
+    let new_changelog = if config.changelog.materialize {
+        let empty_unreleased = empty_unreleased_markdown(repo, plan.next.as_deref());
+        replace_region_for_release(
+            &old_changelog,
+            &empty_unreleased,
+            &plan.released_markdown,
+            config.changelog.region_detection,
+            &config.changelog.unreleased_heading,
+        )
+        .map_err(|source| changelog_error(changelog_path.clone(), source))?
+    } else {
+        insert_released_section(&old_changelog, &plan.released_markdown)
+    };
+    repo.atomic_write(&changelog_path, new_changelog.as_bytes())?;
+
+    for fragment in &plan.consumed_fragments {
+        match fs::remove_file(repo.resolve(fragment)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::WriteFile {
+                    path: repo.resolve(fragment),
+                    source,
+                });
+            }
+        }
+    }
+    write_next_after_release(repo, plan.next.as_deref())?;
+
+    let mut changed_paths = vec![changelog_path];
+    changed_paths.extend(plan.consumed_fragments);
+    changed_paths.push(next_version_path(repo));
+    Ok(ReleaseResult { changed_paths })
 }
 
 /// Carries entries from an existing release into unreleased fragments.
@@ -577,6 +735,268 @@ fn next_version_path(repo: &Repository) -> PathBuf {
         .fragments
         .directory
         .join(&repo.config().fragments.next_file)
+}
+
+fn read_next_version(repo: &Repository) -> Result<Option<String>> {
+    let path = next_version_path(repo);
+    let absolute = repo.resolve(&path);
+    match fs::read_to_string(&absolute) {
+        Ok(contents) => {
+            let values = contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>();
+            match values.as_slice() {
+                [] => Ok(None),
+                [value] => Ok(Some((*value).to_owned())),
+                _ => Err(Error::InvalidNextVersion { path: absolute }),
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::ReadFile {
+            path: absolute,
+            source,
+        }),
+    }
+}
+
+fn write_next_after_release(repo: &Repository, next: Option<&str>) -> Result<()> {
+    let path = next_version_path(repo);
+    let absolute = repo.resolve(&path);
+    match next {
+        Some(next) if !next.is_empty() => {
+            repo.atomic_write(&path, format!("{}\n", next.trim()).as_bytes())?;
+        }
+        _ => match fs::remove_file(&absolute) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::WriteFile {
+                    path: absolute,
+                    source,
+                });
+            }
+        },
+    }
+    Ok(())
+}
+
+fn released_markdown(
+    unreleased_markdown: &str,
+    version: &str,
+    date: ReleaseDate,
+    repo: &Repository,
+) -> String {
+    let release_heading = format!("Version {version}");
+    let release_underline = "-".repeat(release_heading.len());
+    let released_date = format!("Released on {}.", date.long_form());
+    let unreleased_date = &repo.config().changelog.unreleased_heading;
+
+    let mut lines = unreleased_markdown
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if lines.len() >= 2 {
+        lines[0] = release_heading;
+        lines[1] = release_underline;
+    }
+    let mut markdown = lines.join("\n");
+    markdown.push('\n');
+    markdown = markdown.replacen(unreleased_date, &released_date, 1);
+    markdown
+}
+
+fn empty_unreleased_markdown(repo: &Repository, next: Option<&str>) -> String {
+    let heading = next
+        .map(str::trim)
+        .filter(|next| !next.is_empty())
+        .map_or_else(String::new, |next| format!("Version {next}"));
+    let heading = if heading.is_empty() {
+        String::from("Unreleased")
+    } else {
+        heading
+    };
+    let mut markdown = String::new();
+    markdown.push_str(&heading);
+    markdown.push('\n');
+    markdown.push_str(&"-".repeat(heading.len()));
+    markdown.push_str("\n\n");
+    markdown.push_str(&repo.config().changelog.unreleased_heading);
+    markdown.push('\n');
+    markdown
+}
+
+fn replace_region_for_release(
+    source: &str,
+    empty_unreleased: &str,
+    released: &str,
+    detection: RegionDetection,
+    unreleased_heading: &str,
+) -> std::result::Result<String, ChangelogError> {
+    match detection {
+        RegionDetection::Heading => {
+            let replacement = format!("{}\n\n{}", empty_unreleased.trim_end(), released);
+            replace_unreleased_region(source, &replacement, detection, unreleased_heading)
+                .map(|replacement| replacement.new_contents)
+        }
+        RegionDetection::Marker => {
+            let replacement =
+                replace_unreleased_region(source, empty_unreleased, detection, unreleased_heading)?;
+            Ok(insert_released_after_marker_region(
+                &replacement.new_contents,
+                released,
+            ))
+        }
+    }
+}
+
+fn insert_released_after_marker_region(source: &str, released: &str) -> String {
+    const END_MARKER: &str = "<!-- sacho:unreleased:end -->";
+
+    let Some(marker_index) = source.find(END_MARKER) else {
+        return insert_released_section(source, released);
+    };
+    let after_marker = marker_index + END_MARKER.len();
+    let insertion = source[after_marker..]
+        .find('\n')
+        .map_or(source.len(), |offset| {
+            after_marker + offset.saturating_add(1)
+        });
+
+    let mut output = String::with_capacity(source.len() + released.len() + 2);
+    output.push_str(&source[..insertion]);
+    if !output.ends_with("\n\n") {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output.push_str(released.trim_end());
+    output.push_str("\n\n");
+    output.push_str(source[insertion..].trim_start_matches(['\n', '\r']));
+    output
+}
+
+fn insert_released_section(source: &str, released: &str) -> String {
+    let insertion = insertion_index_after_title(source);
+    let mut output = String::with_capacity(source.len() + released.len() + 2);
+    output.push_str(&source[..insertion]);
+    if !output.ends_with("\n\n") {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output.push_str(released.trim_end());
+    output.push_str("\n\n");
+    output.push_str(source[insertion..].trim_start_matches(['\n', '\r']));
+    output
+}
+
+fn insertion_index_after_title(source: &str) -> usize {
+    let lines = source_lines_with_offsets(source);
+    if lines.len() >= 2 && is_setext_title_underline(lines[1].text) {
+        return skip_blank_lines(&lines, 2).map_or(source.len(), |index| lines[index].start);
+    }
+    if lines
+        .first()
+        .is_some_and(|line| line.text.trim_start().starts_with("# "))
+    {
+        return skip_blank_lines(&lines, 1).map_or(source.len(), |index| lines[index].start);
+    }
+    0
+}
+
+fn initial_changelog(title: &str) -> String {
+    let mut changelog = String::new();
+    changelog.push_str(title);
+    changelog.push('\n');
+    changelog.push_str(&"=".repeat(title.len()));
+    changelog.push_str("\n\n");
+    changelog
+}
+
+#[derive(Clone, Copy)]
+struct SourceLine<'a> {
+    start: usize,
+    text: &'a str,
+}
+
+fn source_lines_with_offsets(source: &str) -> Vec<SourceLine<'_>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for raw in source.split_inclusive('\n') {
+        let end = start + raw.len();
+        let text = raw.trim_end_matches(['\n', '\r']);
+        lines.push(SourceLine { start, text });
+        start = end;
+    }
+    lines
+}
+
+fn skip_blank_lines(lines: &[SourceLine<'_>], start: usize) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, line)| (!line.text.trim().is_empty()).then_some(index))
+}
+
+fn is_setext_title_underline(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with('=') && text.trim_matches('=').is_empty()
+}
+
+fn civil_from_days(days_since_epoch: i64) -> ReleaseDate {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    ReleaseDate {
+        year: year as i32,
+        month: month as u8,
+        day: day as u8,
+    }
+}
+
+fn month_name(month: u8) -> &'static str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => unreachable!("validated month"),
+    }
+}
+
+fn days_in_month(year: i32, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 fn sync_after_mutation(repo: &Repository) -> Result<()> {
@@ -880,13 +1300,6 @@ mod tests {
     fn commands_outside_milestone_report_unsupported_command() {
         let (_temp, repo) = repo_with_config("");
 
-        let release_error = apply_release(
-            &repo,
-            ReleasePlan {
-                version: String::from("1.0.0"),
-            },
-        )
-        .expect_err("release is unsupported");
         let carry_error = carry(
             &repo,
             CarryOptions {
@@ -896,13 +1309,558 @@ mod tests {
         .expect_err("carry is unsupported");
 
         assert!(matches!(
-            release_error,
-            Error::UnsupportedCommand { command: "release" }
-        ));
-        assert!(matches!(
             carry_error,
             Error::UnsupportedCommand { command: "carry" }
         ));
+    }
+
+    #[test]
+    fn release_uses_next_file_and_inserts_section_without_materialization() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            title = "Project changes"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/fix.md"), " -  Fixed release.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            changelog,
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+        assert!(!temp.path().join("changes.d/fix.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.3.0\n"
+        );
+    }
+
+    #[test]
+    fn release_leaves_empty_materialized_region() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Added release.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            changelog,
+            "Project changes\n===============\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
+        );
+        assert!(!temp.path().join("changes.d/add.md").exists());
+        assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn release_with_blank_next_removes_next_file_and_uses_unreleased_heading() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.2.0\n-------------\n\nTo be released.\n\n -  Added release.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("  ")),
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Unreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
+        );
+        assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn release_with_marker_detection_inserts_released_section_after_markers() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            region-detection = "marker"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/fix.md"),
+            " -  Fixed marker release.\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Fixed marker release.\n<!-- sacho:unreleased:end -->\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            changelog,
+            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\nUnreleased\n----------\n\nTo be released.\n<!-- sacho:unreleased:end -->\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+    }
+
+    #[test]
+    fn release_failure_before_changelog_write_keeps_fragments_and_next_file() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Added release.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("stale changelog");
+
+        let error = apply_release(&repo, plan).expect_err("missing unreleased region");
+
+        assert!(matches!(error, Error::RegionNotFound { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+    }
+
+    #[test]
+    fn release_ignores_consumed_fragment_that_is_already_absent() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        apply_release(
+            &repo,
+            ReleasePlan {
+                version: String::from("1.2.0"),
+                date: ReleaseDate::parse("2026-07-08").expect("date"),
+                next: None,
+                released_markdown: String::from(
+                    "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n",
+                ),
+                consumed_fragments: vec![PathBuf::from("changes.d/missing.md")],
+            },
+        )
+        .expect("release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+        );
+    }
+
+    #[test]
+    fn release_rejects_missing_materialized_changelog_without_deleting_fragments() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = apply_release(
+            &repo,
+            ReleasePlan {
+                version: String::from("1.2.0"),
+                date: ReleaseDate::parse("2026-07-08").expect("date"),
+                next: None,
+                released_markdown: String::from(
+                    "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n",
+                ),
+                consumed_fragments: vec![PathBuf::from("changes.d/add.md")],
+            },
+        )
+        .expect_err("missing changelog");
+
+        assert!(matches!(error, Error::ReadFile { .. }));
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_without_materialization_creates_missing_changelog() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            title = "Project changes"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n\n"
+        );
+    }
+
+    #[test]
+    fn release_rejects_version_that_disagrees_with_next_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.1")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("mismatch");
+
+        assert!(matches!(error, Error::ReleaseVersionMismatch { .. }));
+    }
+
+    #[test]
+    fn release_requires_version_when_next_file_is_empty() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("missing version");
+
+        assert!(matches!(error, Error::MissingReleaseVersion));
+    }
+
+    #[test]
+    fn release_rejects_invalid_date_forms_and_calendar_dates() {
+        for date in [
+            "2026-07",
+            "2026-7-08",
+            "2026-07-8",
+            "2026/07/08",
+            "2026-02-29",
+            "2026-00-08",
+            "2026-07-00",
+        ] {
+            assert!(
+                matches!(
+                    ReleaseDate::parse(date),
+                    Err(Error::InvalidReleaseDate { .. })
+                ),
+                "{date:?} should be invalid"
+            );
+        }
+
+        assert_eq!(
+            ReleaseDate::parse("2024-02-29").expect("leap day"),
+            ReleaseDate {
+                year: 2024,
+                month: 2,
+                day: 29,
+            }
+        );
+    }
+
+    #[test]
+    fn release_date_long_form_uses_month_names() {
+        let names = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            let date = ReleaseDate {
+                year: 2026,
+                month: (index + 1) as u8,
+                day: 8,
+            };
+
+            assert_eq!(date.long_form(), format!("{name} 8, 2026"));
+        }
+    }
+
+    #[test]
+    fn release_today_utc_matches_system_day() {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_secs();
+        let expected = civil_from_days((seconds / 86_400) as i64);
+
+        assert_eq!(ReleaseDate::today_utc(), expected);
+    }
+
+    #[test]
+    fn release_insertion_helpers_handle_boundary_spacing() {
+        assert_eq!(
+            insert_released_section("# Changelog", "Version 1.2.0\n-------------\n"),
+            "# Changelog\n\nVersion 1.2.0\n-------------\n\n"
+        );
+        assert_eq!(
+            insert_released_section(
+                "Changelog\n=========\n\nVersion 1.1.0\n-------------\n",
+                "Version 1.2.0\n-------------\n",
+            ),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n-------------\n"
+        );
+        assert_eq!(
+            insert_released_after_marker_region(
+                "Header\n<!-- sacho:unreleased:end --> trailer\nVersion 1.1.0\n",
+                "Version 1.2.0\n-------------\n",
+            ),
+            "Header\n<!-- sacho:unreleased:end --> trailer\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n"
+        );
+    }
+
+    #[test]
+    fn release_line_scanning_helpers_classify_titles_and_blanks() {
+        let lines = source_lines_with_offsets("Title\n=====\n\nBody\n");
+
+        assert_eq!(skip_blank_lines(&lines, 2), Some(3));
+        assert!(is_setext_title_underline("====="));
+        assert!(!is_setext_title_underline("=====x"));
+        assert_eq!(insertion_index_after_title("Plain one-line file"), 0);
+    }
+
+    #[test]
+    fn release_date_helpers_handle_leap_years_and_month_lengths() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2026));
+
+        assert_eq!(days_in_month(2026, 1), 31);
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2026, 2), 28);
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_utc_dates() {
+        let cases = [
+            (
+                -1,
+                ReleaseDate {
+                    year: 1969,
+                    month: 12,
+                    day: 31,
+                },
+            ),
+            (
+                0,
+                ReleaseDate {
+                    year: 1970,
+                    month: 1,
+                    day: 1,
+                },
+            ),
+            (
+                31,
+                ReleaseDate {
+                    year: 1970,
+                    month: 2,
+                    day: 1,
+                },
+            ),
+            (
+                365,
+                ReleaseDate {
+                    year: 1971,
+                    month: 1,
+                    day: 1,
+                },
+            ),
+            (
+                789,
+                ReleaseDate {
+                    year: 1972,
+                    month: 2,
+                    day: 29,
+                },
+            ),
+            (
+                10_957,
+                ReleaseDate {
+                    year: 2000,
+                    month: 1,
+                    day: 1,
+                },
+            ),
+            (
+                11_016,
+                ReleaseDate {
+                    year: 2000,
+                    month: 2,
+                    day: 29,
+                },
+            ),
+            (
+                -719_162,
+                ReleaseDate {
+                    year: 1,
+                    month: 1,
+                    day: 1,
+                },
+            ),
+            (
+                -719_469,
+                ReleaseDate {
+                    year: 0,
+                    month: 2,
+                    day: 29,
+                },
+            ),
+            (
+                -800_000,
+                ReleaseDate {
+                    year: -221,
+                    month: 9,
+                    day: 4,
+                },
+            ),
+            (
+                -135_080,
+                ReleaseDate {
+                    year: 1600,
+                    month: 3,
+                    day: 1,
+                },
+            ),
+            (
+                -25_508,
+                ReleaseDate {
+                    year: 1900,
+                    month: 3,
+                    day: 1,
+                },
+            ),
+            (
+                20_272,
+                ReleaseDate {
+                    year: 2025,
+                    month: 7,
+                    day: 3,
+                },
+            ),
+            (
+                157_113,
+                ReleaseDate {
+                    year: 2400,
+                    month: 2,
+                    day: 29,
+                },
+            ),
+        ];
+
+        for (days, date) in cases {
+            assert_eq!(civil_from_days(days), date, "{days}");
+        }
     }
 
     #[test]
