@@ -123,6 +123,9 @@ impl Cli {
             }
             Command::Check { base, fix } => {
                 let report = check(&repo, CheckOptions { base, fix })?;
+                for warning in &report.warnings {
+                    eprintln!("warning: {}", warning.message);
+                }
                 if report.is_clean() {
                     Ok(ExitCode::SUCCESS)
                 } else {

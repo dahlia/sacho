@@ -87,6 +87,35 @@ pub enum Error {
         section: String,
     },
 
+    /// A section was required but omitted by the caller.
+    #[snafu(display("section is required because this repository configures sections"))]
+    MissingSection,
+
+    /// A section was supplied for a repository that does not use sections.
+    #[snafu(display("section must not be supplied because this repository has no sections"))]
+    UnexpectedSection,
+
+    /// A fragment file name was invalid.
+    #[snafu(display("invalid fragment name {name:?}: {reason}"))]
+    InvalidFragmentName {
+        /// Fragment file name supplied by the caller.
+        name: String,
+
+        /// Reason the name was rejected.
+        reason: &'static str,
+    },
+
+    /// A fragment file already exists.
+    #[snafu(display("fragment already exists at {}", path.display()))]
+    FragmentAlreadyExists {
+        /// Existing fragment path.
+        path: PathBuf,
+    },
+
+    /// The next version argument was empty after trimming.
+    #[snafu(display("next version must not be empty"))]
+    EmptyNextVersion,
+
     /// The next-version file did not contain a single version line.
     #[snafu(display("{} must contain at most one non-empty line", path.display()))]
     InvalidNextVersion {
@@ -98,6 +127,16 @@ pub enum Error {
     #[snafu(display("changelog region not found in {}", path.display()))]
     RegionNotFound {
         /// Changelog path that did not contain the region.
+        path: PathBuf,
+    },
+
+    /// Synchronizing could overwrite hand edits in the materialized changelog.
+    #[snafu(display(
+        "materialized changelog may contain hand edits in {}; run `sacho sync --force` to discard them",
+        path.display()
+    ))]
+    SyncNeedsConfirmation {
+        /// Changelog path that needs explicit synchronization.
         path: PathBuf,
     },
 

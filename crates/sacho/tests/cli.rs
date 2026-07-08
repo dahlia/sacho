@@ -76,7 +76,7 @@ fn preview_help_describes_section_option() {
 }
 
 #[test]
-fn add_accepts_section_flag() {
+fn add_rejects_section_flag_without_sections() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
     let mut command = Command::cargo_bin("sacho").expect("binary");
@@ -86,9 +86,60 @@ fn add_accepts_section_flag() {
         .args(["add", "--section", "core", "clear-function"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "add command is not implemented yet",
-        ));
+        .stderr(predicate::str::contains("section must not be supplied"));
+}
+
+#[test]
+fn add_prints_created_fragment_path() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+materialize = false
+",
+    )
+    .expect("config");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["add", "clear-function"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changes.d/clear-function.md"));
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/clear-function.md")).expect("fragment"),
+        " -\n"
+    );
+}
+
+#[test]
+fn check_warning_only_exits_success() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+materialize = false
+",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/warning.md"),
+        "---\nowner: docs\n---\n -  Added docs.\n",
+    )
+    .expect("fragment");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["check"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning:"));
 }
 
 #[test]
