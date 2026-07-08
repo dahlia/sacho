@@ -60,4 +60,5 @@ run = "cargo mutants --workspace"
 
 [tasks.run]
 description = "Run the Rust project"
-run = "cargo run --package sacho"
+raw_args = true
+run = "cargo run --package sacho --"
