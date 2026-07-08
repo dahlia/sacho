@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::fragment::{
     DiscoveryWarning, FragmentWarning, discover_fragment_candidates, parse_fragment,
 };
+use crate::released::carry_release;
 use crate::repo::Repository;
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
@@ -245,8 +246,11 @@ pub struct CarryOptions {
 /// Result of carrying released entries.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CarryResult {
-    /// Fragment paths changed by the carry operation.
-    pub changed_paths: Vec<PathBuf>,
+    /// Fragment paths written by the carry operation.
+    pub written_fragments: Vec<PathBuf>,
+
+    /// Synchronization result when materialization is enabled.
+    pub sync: Option<SyncResult>,
 }
 
 /// Options for running repository checks.
@@ -576,8 +580,46 @@ pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResu
 }
 
 /// Carries entries from an existing release into unreleased fragments.
-pub fn carry(_repo: &Repository, _options: CarryOptions) -> Result<CarryResult> {
-    Err(Error::UnsupportedCommand { command: "carry" })
+pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
+    ensure_materialized_current_before_mutation(repo)?;
+
+    let changelog_path = repo.config().changelog.path.clone();
+    let changelog =
+        fs::read_to_string(repo.resolve(&changelog_path)).map_err(|source| Error::ReadFile {
+            path: repo.resolve(&changelog_path),
+            source,
+        })?;
+    let carried = carry_release(repo, &changelog, &options.version)?;
+    for fragment in &carried.fragments {
+        parse_fragment(
+            fragment.path.clone(),
+            &fragment.markdown,
+            fragment.section.clone(),
+            &repo.config().links,
+        )
+        .map_err(|source| Error::Fragment {
+            path: fragment.path.clone(),
+            source,
+        })?;
+    }
+
+    let mut written_fragments = Vec::new();
+    for fragment in carried.fragments {
+        repo.atomic_write(&fragment.path, fragment.markdown.as_bytes())?;
+        written_fragments.push(fragment.path);
+    }
+
+    let sync = if repo.config().changelog.materialize {
+        let plan = plan_sync(repo, SyncOptions { force: true })?;
+        Some(apply_sync(repo, plan)?)
+    } else {
+        None
+    };
+
+    Ok(CarryResult {
+        written_fragments,
+        sync,
+    })
 }
 
 /// Checks fragments, materialized output, and missing-fragment policy.
@@ -1251,6 +1293,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::FragmentError;
 
     fn repo_with_config(config: &str) -> (TempDir, Repository) {
         let temp = TempDir::new().expect("tempdir");
@@ -1297,21 +1340,175 @@ mod tests {
     }
 
     #[test]
-    fn commands_outside_milestone_report_unsupported_command() {
-        let (_temp, repo) = repo_with_config("");
+    fn carry_reports_missing_version() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.0.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
 
         let carry_error = carry(
             &repo,
             CarryOptions {
-                version: String::from("1.0.0"),
+                version: String::from("1.1.5"),
             },
         )
-        .expect_err("carry is unsupported");
+        .expect_err("missing version");
+
+        assert!(matches!(carry_error, Error::ReleasedVersionNotFound { .. }));
+    }
+
+    #[test]
+    fn carry_writes_root_fragment_and_overwrites_existing_file() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/carried-from-1.1.5.md"),
+            " -  Old.\n",
+        )
+        .expect("old fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.  [[#8]]\n\n[#8]: https://example.com/issues/8\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![PathBuf::from("changes.d/carried-from-1.1.5.md")]
+        );
+        assert_eq!(result.sync, None);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
+                .expect("fragment"),
+            " -  Fixed carry.  [[#8]]\n"
+        );
+    }
+
+    #[test]
+    fn carry_preserves_historical_item_formatting() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n*   Fixed historical wrapping.\n    This continuation keeps old spacing.\n",
+        )
+        .expect("changelog");
+
+        carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
+                .expect("fragment"),
+            "*   Fixed historical wrapping.\n    This continuation keeps old spacing.\n"
+        );
+    }
+
+    #[test]
+    fn carry_validates_every_fragment_before_writing_any_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n### core\n\n -  Fixed core.\n\n### cli\n\n -  Fixed CLI.  [[#8]]\n",
+        )
+        .expect("changelog");
+
+        let error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect_err("unknown reference");
 
         assert!(matches!(
-            carry_error,
-            Error::UnsupportedCommand { command: "carry" }
+            error,
+            Error::Fragment {
+                source: FragmentError::UnknownReference { .. },
+                ..
+            }
         ));
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/core/carried-from-1.1.5.md")
+                .exists()
+        );
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/cli/carried-from-1.1.5.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn carry_syncs_after_writing_when_materialized() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains(" -  Fixed carry.\n"));
+        assert!(temp.path().join("changes.d/carried-from-1.1.5.md").exists());
     }
 
     #[test]

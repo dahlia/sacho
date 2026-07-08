@@ -146,6 +146,17 @@ pub enum Error {
         date: String,
     },
 
+    /// The requested released version was absent from the changelog.
+    #[snafu(display("released version {version:?} not found in changelog"))]
+    ReleasedVersionNotFound {
+        /// Released version requested by the caller.
+        version: String,
+    },
+
+    /// A sectioned changelog had released entries before any section heading.
+    #[snafu(display("released entries must appear under a configured section heading"))]
+    ReleasedEntryWithoutSection,
+
     /// The unreleased changelog region could not be found.
     #[snafu(display("changelog region not found in {}", path.display()))]
     RegionNotFound {
