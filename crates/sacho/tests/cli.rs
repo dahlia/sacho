@@ -19,6 +19,318 @@ fn help_lists_commands() {
 }
 
 #[test]
+fn init_scaffolds_empty_git_repository() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created sacho.toml"))
+        .stdout(predicate::str::contains("created changes.d"))
+        .stdout(predicate::str::contains("created CHANGES.md"))
+        .stdout(predicate::str::contains("created .gitattributes"))
+        .stdout(predicate::str::contains("configured merge.sacho.driver"));
+
+    assert!(temp.path().join("sacho.toml").is_file());
+    assert!(temp.path().join("changes.d").is_dir());
+    assert!(temp.path().join("CHANGES.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
+        "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+    assert_eq!(
+        git_output(temp.path(), ["config", "--get", "merge.sacho.driver"]).trim(),
+        "sacho merge-driver %O %A %B %P"
+    );
+    assert!(!temp.path().join(".git/hooks/pre-commit").exists());
+
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already initialized"))
+        .stdout(predicate::str::contains("configured").not());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
+        "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_install_hook_writes_marked_hook() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive", "--install-hook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created .git/hooks/pre-commit"));
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("hook"),
+        "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+    );
+}
+
+#[test]
+fn init_install_hook_honors_core_hooks_path() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    git(temp.path(), ["config", "core.hooksPath", ".githooks"]);
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive", "--install-hook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("created .githooks/pre-commit"));
+
+    assert!(temp.path().join(".githooks/pre-commit").is_file());
+    assert!(!temp.path().join(".git/hooks/pre-commit").exists());
+}
+
+#[test]
+fn init_install_hook_works_from_git_worktree() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let main = temp.path().join("main");
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir(&main).expect("main dir");
+    git(&main, ["init"]);
+    git(&main, ["config", "user.email", "test@example.com"]);
+    git(&main, ["config", "user.name", "Test User"]);
+    std::fs::write(main.join("README.md"), "test\n").expect("readme");
+    git(&main, ["add", "README.md"]);
+    git(&main, ["commit", "-m", "Initial"]);
+    git(
+        &main,
+        ["worktree", "add", worktree.to_str().expect("utf8 path")],
+    );
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(&worktree)
+        .args(["init", "--no-interactive", "--install-hook"])
+        .assert()
+        .success();
+
+    assert!(main.join(".git/hooks/pre-commit").is_file());
+    assert!(!worktree.join(".git/hooks/pre-commit").exists());
+}
+
+#[test]
+fn init_preserves_existing_config() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let config = "[changelog]\ntitle = \"Custom changelog\"\nmaterialize = false\n";
+    std::fs::write(temp.path().join("sacho.toml"), config).expect("config");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sacho.toml")).expect("config"),
+        config
+    );
+}
+
+#[test]
+fn init_appends_existing_gitattributes() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(temp.path().join(".gitattributes"), "*.md text\n").expect("attributes");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
+        "*.md text\nCHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_reports_empty_existing_gitattributes_as_modified() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(temp.path().join(".gitattributes"), "").expect("attributes");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("modified .gitattributes"))
+        .stdout(predicate::str::contains("created .gitattributes").not());
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
+        "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_quotes_gitattributes_paths_with_spaces() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+path = \"docs/change log.md\"
+
+[fragments]
+directory = \"changes dir\"
+",
+    )
+    .expect("config");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
+        "\"docs/change log.md\" merge=sacho\n\"changes dir/next\" merge=ours\n"
+    );
+    assert!(
+        git_output(
+            temp.path(),
+            ["check-attr", "merge", "--", "docs/change log.md"]
+        )
+        .contains("merge: sacho")
+    );
+    assert!(
+        git_output(
+            temp.path(),
+            ["check-attr", "merge", "--", "changes dir/next"]
+        )
+        .contains("merge: ours")
+    );
+}
+
+#[test]
+fn init_quotes_gitattributes_paths_that_start_like_comments() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+path = \"#changes.md\"
+",
+    )
+    .expect("config");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert!(
+        std::fs::read_to_string(temp.path().join(".gitattributes"))
+            .expect("attributes")
+            .contains("\"#changes.md\" merge=sacho")
+    );
+    assert!(
+        git_output(temp.path(), ["check-attr", "merge", "--", "#changes.md"])
+            .contains("merge: sacho")
+    );
+}
+
+#[test]
+fn init_reports_incompatible_gitattributes_rule() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::write(
+        temp.path().join(".gitattributes"),
+        "CHANGES.md merge=union\n",
+    )
+    .expect("attributes");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("incompatible merge attribute"));
+}
+
+#[test]
+fn init_interactive_requires_terminal() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--interactive"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--interactive requires terminal"));
+}
+
+#[test]
+fn init_rejects_conflicting_interactive_flags() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--interactive", "--no-interactive"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--interactive and --no-interactive cannot be used together",
+        ));
+}
+
+#[test]
+fn init_install_hook_rejects_existing_unmarked_hook_non_interactively() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::write(
+        temp.path().join(".git/hooks/pre-commit"),
+        "#!/bin/sh\necho existing\n",
+    )
+    .expect("hook");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive", "--install-hook"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "already exists without a Sacho marker",
+        ));
+}
+
+#[test]
 fn preview_prints_empty_unreleased_region() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
@@ -283,6 +595,20 @@ fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
         "git failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_output<const N: usize>(dir: &std::path::Path, args: [&str; N]) -> String {
+    let output = ProcessCommand::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git command");
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]

@@ -198,6 +198,34 @@ pub enum Error {
         command: &'static str,
     },
 
+    /// Mutually exclusive command-line options were used together.
+    #[snafu(display("{message}"))]
+    Usage {
+        /// Usage error message.
+        message: String,
+    },
+
+    /// A requested interactive operation cannot run without a terminal.
+    #[snafu(display("{message}"))]
+    TerminalRequired {
+        /// Terminal requirement message.
+        message: String,
+    },
+
+    /// Existing repository integration needs manual attention.
+    #[snafu(display("{message}"))]
+    InitConflict {
+        /// Conflict message.
+        message: String,
+    },
+
+    /// A pre-commit hook exists and cannot be changed non-interactively.
+    #[snafu(display("{} already exists without a Sacho marker; add the marked block manually or rerun interactively", path.display()))]
+    HookNeedsManualInstall {
+        /// Existing hook path.
+        path: PathBuf,
+    },
+
     /// A configured glob pattern could not be compiled.
     #[snafu(display("invalid glob pattern {pattern:?}: {source}"))]
     InvalidGlob {

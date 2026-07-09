@@ -1,6 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -12,8 +14,8 @@ use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
-use crate::changelog::{ChangelogError, replace_unreleased_region};
-use crate::config::{RegionDetection, VcsPreset};
+use crate::changelog::{BEGIN_MARKER, ChangelogError, END_MARKER, replace_unreleased_region};
+use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
 use crate::error::{Error, Result};
 use crate::fragment::{
     DiscoveryWarning, FragmentWarning, discover_fragment_candidates, parse_fragment,
@@ -29,6 +31,47 @@ pub use crate::compile::{CompileOptions, CompiledRegion};
 pub struct CommandContext {
     /// Repository the command operates on.
     pub repo: Repository,
+}
+
+/// Options for bootstrapping Sacho in a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitOptions {
+    /// Changelog path for newly generated configuration.
+    pub changelog_path: Option<PathBuf>,
+
+    /// Fragment directory for newly generated configuration.
+    pub fragment_directory: Option<PathBuf>,
+
+    /// Materialization policy for newly generated configuration.
+    pub materialize: Option<bool>,
+
+    /// Whether to install or update Sacho's pre-commit hook block.
+    pub install_hook: bool,
+
+    /// Whether an existing unmarked hook may receive a marked Sacho block.
+    pub append_existing_hook: bool,
+
+    /// Repository URL used for `links."#"` in newly generated configuration.
+    pub repository_url: Option<String>,
+}
+
+/// Result of bootstrapping Sacho in a repository.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InitResult {
+    /// Repository-relative files created by the operation.
+    pub created_files: Vec<PathBuf>,
+
+    /// Repository-relative files modified by the operation.
+    pub modified_files: Vec<PathBuf>,
+
+    /// Repository-relative files that already existed and were left alone.
+    pub skipped_existing_files: Vec<PathBuf>,
+
+    /// Local Git configuration keys written by the operation.
+    pub local_git_config_changes: Vec<String>,
+
+    /// Manual actions the user still needs to perform.
+    pub manual_actions_required: Vec<String>,
 }
 
 /// Options for creating a changelog fragment.
@@ -328,6 +371,99 @@ pub struct CheckWarning {
 pub struct SkippedCheck {
     /// Human-readable skip message.
     pub message: String,
+}
+
+/// Bootstraps Sacho configuration and repository integration.
+pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<InitResult> {
+    let root = init_root(root.as_ref());
+    let mut result = InitResult::default();
+    let config_path = root.join(Repository::CONFIG_FILE);
+    let (config, created_config) = if config_path.exists() {
+        let contents = fs::read_to_string(&config_path).map_err(|source| Error::ReadFile {
+            path: config_path.clone(),
+            source,
+        })?;
+        result
+            .skipped_existing_files
+            .push(PathBuf::from(Repository::CONFIG_FILE));
+        (
+            Config::parse(&contents).map_err(|source| Error::Config {
+                path: config_path.clone(),
+                source,
+            })?,
+            false,
+        )
+    } else {
+        let config = default_init_config(&root, &options);
+        fs::write(&config_path, render_init_config(&config)).map_err(|source| {
+            Error::WriteFile {
+                path: config_path.clone(),
+                source,
+            }
+        })?;
+        result
+            .created_files
+            .push(PathBuf::from(Repository::CONFIG_FILE));
+        (config, true)
+    };
+
+    let fragment_dir = root.join(&config.fragments.directory);
+    if fragment_dir.is_dir() {
+        result
+            .skipped_existing_files
+            .push(config.fragments.directory.clone());
+    } else if fragment_dir.exists() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a directory",
+                config.fragments.directory.display()
+            ),
+        });
+    } else {
+        fs::create_dir_all(&fragment_dir).map_err(|source| Error::CreateDirectory {
+            path: fragment_dir,
+            source,
+        })?;
+        result
+            .created_files
+            .push(config.fragments.directory.clone());
+    }
+
+    let changelog_path = root.join(&config.changelog.path);
+    if changelog_path.is_file() {
+        result
+            .skipped_existing_files
+            .push(config.changelog.path.clone());
+    } else if changelog_path.exists() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a file",
+                config.changelog.path.display()
+            ),
+        });
+    } else {
+        if let Some(parent) = changelog_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let changelog = initial_changelog_for_config(&config);
+        fs::write(&changelog_path, changelog).map_err(|source| Error::WriteFile {
+            path: changelog_path,
+            source,
+        })?;
+        result.created_files.push(config.changelog.path.clone());
+    }
+
+    if created_config || config.vcs.preset == VcsPreset::Git {
+        apply_git_integration(&root, &config, &mut result)?;
+    }
+    if options.install_hook {
+        install_pre_commit_hook(&root, options.append_existing_hook, &mut result)?;
+    }
+
+    Ok(result)
 }
 
 /// Creates a changelog fragment.
@@ -1636,6 +1772,479 @@ fn next_file_whitespace_warning(repo: &Repository) -> Result<Option<CheckWarning
     }
 }
 
+fn init_root(start: &Path) -> PathBuf {
+    git_output(start, ["rev-parse", "--show-toplevel"])
+        .ok()
+        .and_then(|output| parse_git_root_output(&output))
+        .unwrap_or_else(|| start.to_path_buf())
+}
+
+fn parse_git_root_output(output: &str) -> Option<PathBuf> {
+    let path = output.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+fn default_init_config(root: &Path, options: &InitOptions) -> Config {
+    let mut config = Config::parse("").expect("default config parses");
+    if let Some(name) = root.file_name().and_then(|name| name.to_str()) {
+        config.changelog.title = format!("{name} changelog");
+    }
+    if let Some(path) = &options.changelog_path {
+        config.changelog.path = path.clone();
+    }
+    if let Some(directory) = &options.fragment_directory {
+        config.fragments.directory = directory.clone();
+    }
+    if let Some(materialize) = options.materialize {
+        config.changelog.materialize = materialize;
+    }
+    config.vcs.preset = if is_git_repository(root) {
+        VcsPreset::Git
+    } else {
+        VcsPreset::None
+    };
+    if let Some(url) = options
+        .repository_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        config.links.insert(
+            ReferenceSigil::new("#"),
+            UrlTemplate::new(format!("{}/issues/{{n}}", url.trim_end_matches('/'))),
+        );
+    }
+    config
+}
+
+fn render_init_config(config: &Config) -> String {
+    let mut output = String::new();
+    output.push_str("[changelog]\n");
+    output.push_str(&format!(
+        "path = {:?}\n",
+        config.changelog.path.display().to_string()
+    ));
+    output.push_str(&format!("title = {:?}\n", config.changelog.title));
+    output.push_str(&format!(
+        "unreleased-heading = {:?}\n",
+        config.changelog.unreleased_heading
+    ));
+    output.push_str(&format!("materialize = {}\n", config.changelog.materialize));
+    output.push_str(&format!(
+        "region-detection = {:?}\n\n",
+        toml_vcs_region(config.changelog.region_detection)
+    ));
+    output.push_str("[fragments]\n");
+    output.push_str(&format!(
+        "directory = {:?}\n",
+        config.fragments.directory.display().to_string()
+    ));
+    output.push_str(&format!(
+        "next-file = {:?}\n\n",
+        config.fragments.next_file.display().to_string()
+    ));
+    if !config.links.is_empty() {
+        output.push_str("[links]\n");
+        for (sigil, template) in &config.links {
+            output.push_str(&format!("{:?} = {:?}\n", sigil.as_str(), template.as_str()));
+        }
+        output.push('\n');
+    }
+    output.push_str("[vcs]\n");
+    output.push_str(&format!(
+        "preset = {:?}\n\n",
+        toml_vcs_preset(config.vcs.preset)
+    ));
+    output.push_str("[check]\n");
+    output.push_str("paths = []\n");
+    output
+}
+
+fn toml_vcs_region(region: RegionDetection) -> &'static str {
+    match region {
+        RegionDetection::Heading => "heading",
+        RegionDetection::Marker => "marker",
+    }
+}
+
+fn toml_vcs_preset(preset: VcsPreset) -> &'static str {
+    match preset {
+        VcsPreset::Git => "git",
+        VcsPreset::Jj => "jj",
+        VcsPreset::Hg => "hg",
+        VcsPreset::None => "none",
+    }
+}
+
+fn initial_changelog_for_config(config: &Config) -> String {
+    if config.changelog.materialize {
+        initial_materialized_changelog(config)
+    } else {
+        initial_changelog(&config.changelog.title)
+    }
+}
+
+fn initial_materialized_changelog(config: &Config) -> String {
+    let mut changelog = initial_changelog(&config.changelog.title);
+    if config.changelog.region_detection == RegionDetection::Marker {
+        changelog.push_str(BEGIN_MARKER);
+        changelog.push('\n');
+    }
+    changelog.push_str("Unreleased\n----------\n\n");
+    changelog.push_str(&config.changelog.unreleased_heading);
+    changelog.push('\n');
+    if config.changelog.region_detection == RegionDetection::Marker {
+        changelog.push_str(END_MARKER);
+        changelog.push('\n');
+    }
+    changelog
+}
+
+fn apply_git_integration(root: &Path, config: &Config, result: &mut InitResult) -> Result<()> {
+    if config.vcs.preset != VcsPreset::Git || !is_git_repository(root) {
+        return Ok(());
+    }
+
+    let changelog_attr = format!("{} merge=sacho", git_attr_path(&config.changelog.path));
+    let next_path = config.fragments.directory.join(&config.fragments.next_file);
+    let next_attr = format!("{} merge=ours", git_attr_path(&next_path));
+    let attributes_path = root.join(".gitattributes");
+    let attributes_existed = attributes_path.exists();
+    let old = match fs::read_to_string(&attributes_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: attributes_path,
+                source,
+            });
+        }
+    };
+    let edited = edit_gitattributes(&old, &[changelog_attr.as_str(), next_attr.as_str()])?;
+    if old != edited {
+        fs::write(root.join(".gitattributes"), edited).map_err(|source| Error::WriteFile {
+            path: root.join(".gitattributes"),
+            source,
+        })?;
+        if attributes_existed {
+            result.modified_files.push(PathBuf::from(".gitattributes"));
+        } else {
+            result.created_files.push(PathBuf::from(".gitattributes"));
+        }
+    } else if attributes_existed {
+        result
+            .skipped_existing_files
+            .push(PathBuf::from(".gitattributes"));
+    }
+
+    set_git_config(
+        root,
+        "merge.sacho.name",
+        "Sacho changelog merge driver",
+        result,
+    )?;
+    set_git_config(
+        root,
+        "merge.sacho.driver",
+        "sacho merge-driver %O %A %B %P",
+        result,
+    )?;
+    if git_config_get(root, "merge.ours.driver").is_err() {
+        set_git_config(root, "merge.ours.driver", "true", result)?;
+    }
+    Ok(())
+}
+
+fn edit_gitattributes(source: &str, required: &[&str]) -> Result<String> {
+    let mut output = source.to_owned();
+    for required_line in required {
+        let (path, expected_merge) = parse_required_attribute(required_line);
+        let mut found = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let Some((candidate_path, attributes)) = parse_gitattributes_line(trimmed) else {
+                continue;
+            };
+            if candidate_path != path {
+                continue;
+            }
+            found = true;
+            if !attributes.contains(&expected_merge) {
+                return Err(Error::InitConflict {
+                    message: format!("{path} already has an incompatible merge attribute"),
+                });
+            }
+        }
+        if !found {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(required_line);
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn parse_required_attribute(line: &str) -> (&str, &str) {
+    let (path, attributes) =
+        parse_gitattributes_line(line).expect("required attributes include a path");
+    let merge = attributes
+        .first()
+        .copied()
+        .expect("required attributes include merge attr");
+    (path, merge)
+}
+
+fn parse_gitattributes_line(line: &str) -> Option<(&str, Vec<&str>)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let path_end = gitattributes_path_end(line)?;
+    let path = &line[..path_end];
+    let attributes = line[path_end..].split_whitespace().collect::<Vec<_>>();
+    Some((path, attributes))
+}
+
+fn gitattributes_path_end(line: &str) -> Option<usize> {
+    if line.starts_with('"') {
+        let mut escaped = false;
+        for (index, character) in line.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return Some(index + character.len_utf8());
+            }
+        }
+        None
+    } else {
+        line.find(char::is_whitespace).or(Some(line.len()))
+    }
+}
+
+fn install_pre_commit_hook(
+    root: &Path,
+    append_existing_hook: bool,
+    result: &mut InitResult,
+) -> Result<()> {
+    let hook_path = pre_commit_hook_path(root)?;
+    let reported_path = report_path(root, &hook_path);
+    let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+    let old = match fs::read_to_string(&hook_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if let Some(parent) = hook_path.parent() {
+                fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            fs::write(&hook_path, format!("#!/bin/sh\n{block}")).map_err(|source| {
+                Error::WriteFile {
+                    path: hook_path.clone(),
+                    source,
+                }
+            })?;
+            make_executable(&hook_path)?;
+            result.created_files.push(reported_path);
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: hook_path,
+                source,
+            });
+        }
+    };
+    let edited = edit_pre_commit_hook(&old, block, append_existing_hook).ok_or_else(|| {
+        Error::HookNeedsManualInstall {
+            path: reported_path.clone(),
+        }
+    })?;
+    if old != edited {
+        fs::write(&hook_path, edited).map_err(|source| Error::WriteFile {
+            path: hook_path.clone(),
+            source,
+        })?;
+        make_executable(&hook_path)?;
+        result.modified_files.push(reported_path);
+    } else {
+        result.skipped_existing_files.push(reported_path);
+    }
+    Ok(())
+}
+
+fn pre_commit_hook_path(root: &Path) -> Result<PathBuf> {
+    if let Ok(path) = git_output(root, ["config", "--path", "--get", "core.hooksPath"]) {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Ok(resolve_git_path(root, path).join("pre-commit"));
+        }
+    }
+
+    let common_dir = git_output(root, ["rev-parse", "--git-common-dir"])?;
+    Ok(resolve_git_path(root, common_dir.trim())
+        .join("hooks")
+        .join("pre-commit"))
+}
+
+fn resolve_git_path(root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn report_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path).map_err(|source| Error::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions).map_err(|source| Error::WriteFile {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn edit_pre_commit_hook(source: &str, block: &str, append_existing: bool) -> Option<String> {
+    let begin = "# sacho pre-commit begin";
+    let end = "# sacho pre-commit end";
+    match (source.find(begin), source.find(end)) {
+        (Some(begin_index), Some(end_index)) if begin_index <= end_index => {
+            let end_index = end_index + end.len();
+            let mut output = String::new();
+            output.push_str(&source[..begin_index]);
+            output.push_str(block.trim_end());
+            output.push_str(&source[end_index..]);
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            Some(output)
+        }
+        (None, None) if append_existing => {
+            let mut output = source.to_owned();
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(block);
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
+fn set_git_config(root: &Path, key: &str, value: &str, result: &mut InitResult) -> Result<()> {
+    if git_config_get(root, key).is_ok_and(|current| current.trim() == value) {
+        return Ok(());
+    }
+    git(root, ["config", key, value])?;
+    result.local_git_config_changes.push(key.to_owned());
+    Ok(())
+}
+
+fn git_config_get(root: &Path, key: &str) -> Result<String> {
+    git_output(root, ["config", "--get", key])
+}
+
+fn is_git_repository(root: &Path) -> bool {
+    git(root, ["rev-parse", "--git-dir"]).is_ok()
+}
+
+fn git_attr_path(path: &Path) -> String {
+    let path = path
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    quote_git_attr_path(&path)
+}
+
+fn quote_git_attr_path(path: &str) -> String {
+    if path.starts_with('#') || path.chars().any(char::is_whitespace) {
+        let mut quoted = String::from("\"");
+        for character in path.chars() {
+            if matches!(character, '"' | '\\') {
+                quoted.push('\\');
+            }
+            quoted.push(character);
+        }
+        quoted.push('"');
+        quoted
+    } else {
+        path.to_owned()
+    }
+}
+
+fn git<I, S>(root: &Path, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_output(root, args).map(|_| ())
+}
+
+fn git_output<I, S>(root: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    let command = command_line("git", &args);
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .map_err(|source| Error::VcsCommandIo {
+            command: command.clone(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(Error::VcsCommandFailed {
+            command,
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn command_line<S>(program: &str, args: &[S]) -> String
+where
+    S: AsRef<OsStr>,
+{
+    let mut output = String::from(program);
+    for arg in args {
+        output.push(' ');
+        output.push_str(&arg.as_ref().to_string_lossy());
+    }
+    output
+}
+
 fn changelog_error(path: PathBuf, source: ChangelogError) -> Error {
     match source {
         ChangelogError::RegionNotFound => Error::RegionNotFound { path },
@@ -1653,7 +2262,7 @@ fn unified_diff(old_contents: &str, new_contents: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use proptest::prelude::*;
     use tempfile::TempDir;
@@ -1748,6 +2357,338 @@ mod tests {
 
     fn normalize_separators(value: impl AsRef<str>) -> String {
         value.as_ref().replace('\\', "/")
+    }
+
+    #[test]
+    fn git_root_output_ignores_empty_output() {
+        assert_eq!(parse_git_root_output(" \n"), None);
+        assert_eq!(
+            parse_git_root_output("/tmp/repo\n"),
+            Some(PathBuf::from("/tmp/repo"))
+        );
+    }
+
+    #[test]
+    fn init_config_omits_blank_repository_url() {
+        let config = default_init_config(
+            Path::new("project"),
+            &InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: Some(String::from("   ")),
+            },
+        );
+
+        assert!(config.links.is_empty());
+        assert!(!render_init_config(&config).contains("[links]"));
+    }
+
+    #[test]
+    fn init_creates_configured_changelog_path() {
+        let temp = TempDir::new().expect("tempdir");
+
+        let result = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(PathBuf::from("docs/changes.md")),
+                fragment_directory: None,
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        assert!(
+            result
+                .created_files
+                .contains(&PathBuf::from("docs/changes.md"))
+        );
+        assert!(
+            fs::read_to_string(temp.path().join("docs/changes.md"))
+                .expect("changelog")
+                .contains("To be released.")
+        );
+    }
+
+    #[test]
+    fn init_non_materialized_changelog_has_no_unreleased_region() {
+        let temp = TempDir::new().expect("tempdir");
+
+        init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(PathBuf::from("CHANGES.md")),
+                fragment_directory: None,
+                materialize: Some(false),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains("changelog"));
+        assert!(!changelog.contains("Unreleased"));
+        assert!(!changelog.contains("To be released."));
+    }
+
+    #[test]
+    fn init_marker_mode_changelog_contains_markers() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            region-detection = "marker"
+            "#,
+        );
+        init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains("<!-- sacho:unreleased:begin -->"));
+        assert!(changelog.contains("<!-- sacho:unreleased:end -->"));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn init_rejects_fragment_directory_path_that_is_not_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("changes.d"), "not a directory\n").expect("file");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("fragment path conflict");
+
+        assert!(matches!(error, Error::InitConflict { .. }));
+        assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn init_rejects_changelog_path_that_is_not_file() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("CHANGES.md")).expect("directory");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("changelog path conflict");
+
+        assert!(matches!(error, Error::InitConflict { .. }));
+        assert!(error.to_string().contains("not a file"));
+    }
+
+    #[test]
+    fn gitattributes_edit_preserves_unrelated_lines() {
+        let edited = edit_gitattributes(
+            "*.md text\n",
+            &["CHANGES.md merge=sacho", "changes.d/next merge=ours"],
+        )
+        .expect("edit");
+
+        assert_eq!(
+            edited,
+            "*.md text\nCHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+        );
+    }
+
+    #[test]
+    fn gitattributes_quotes_paths_with_spaces() {
+        let edited = edit_gitattributes(
+            "",
+            &[
+                r#""docs/change log.md" merge=sacho"#,
+                r#""changes dir/next" merge=ours"#,
+            ],
+        )
+        .expect("edit");
+
+        assert_eq!(
+            edited,
+            "\"docs/change log.md\" merge=sacho\n\"changes dir/next\" merge=ours\n"
+        );
+        assert_eq!(
+            quote_git_attr_path("docs/change log.md"),
+            "\"docs/change log.md\""
+        );
+    }
+
+    #[test]
+    fn gitattributes_quotes_paths_that_would_be_comments() {
+        let edited = edit_gitattributes("", &[r##""#changes.md" merge=sacho"##]).expect("edit");
+
+        assert_eq!(edited, "\"#changes.md\" merge=sacho\n");
+        assert_eq!(quote_git_attr_path("#changes.md"), "\"#changes.md\"");
+    }
+
+    #[test]
+    fn gitattributes_parser_ignores_empty_and_comment_lines() {
+        assert_eq!(parse_gitattributes_line(""), None);
+        assert_eq!(parse_gitattributes_line("   "), None);
+        assert_eq!(parse_gitattributes_line("# CHANGES.md merge=union"), None);
+    }
+
+    #[test]
+    fn gitattributes_detects_existing_quoted_conflict() {
+        let error = edit_gitattributes(
+            r#""docs/change log.md" merge=union
+"#,
+            &[r#""docs/change log.md" merge=sacho"#],
+        )
+        .expect_err("conflict");
+
+        assert!(matches!(error, Error::InitConflict { .. }));
+    }
+
+    #[test]
+    fn hook_marker_replacement_preserves_unrelated_content() {
+        let source = "#!/bin/sh\necho before\n# sacho pre-commit begin\nold\n# sacho pre-commit end\necho after\n";
+        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+
+        let edited = edit_pre_commit_hook(source, block, false).expect("edit");
+
+        assert_eq!(
+            edited,
+            "#!/bin/sh\necho before\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\necho after\n"
+        );
+    }
+
+    #[test]
+    fn hook_edit_rejects_unmarked_hook_when_append_is_false() {
+        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+
+        assert_eq!(edit_pre_commit_hook("#!/bin/sh\n", block, false), None);
+    }
+
+    #[test]
+    fn hook_edit_rejects_reversed_marker_order() {
+        let source = "# sacho pre-commit end\nold\n# sacho pre-commit begin\n";
+        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+
+        assert_eq!(edit_pre_commit_hook(source, block, false), None);
+    }
+
+    #[test]
+    fn hook_append_separates_block_from_existing_content() {
+        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+
+        let edited = edit_pre_commit_hook("#!/bin/sh", block, true).expect("append");
+
+        assert_eq!(
+            edited,
+            "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+        );
+    }
+
+    #[test]
+    fn hook_install_updates_existing_marker_block() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), ["init"]).expect("git init");
+        fs::write(
+            temp.path().join(".git/hooks/pre-commit"),
+            "#!/bin/sh\n# sacho pre-commit begin\nold\n# sacho pre-commit end\n",
+        )
+        .expect("hook");
+        let mut result = InitResult::default();
+
+        install_pre_commit_hook(temp.path(), false, &mut result).expect("install");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("hook"),
+            "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+        );
+        assert_eq!(
+            result.modified_files,
+            vec![PathBuf::from(".git/hooks/pre-commit")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_executable_preserves_existing_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("hook");
+        fs::write(&path, "#!/bin/sh\n").expect("hook");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("permissions");
+
+        make_executable(&path).expect("executable");
+
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn gitattributes_edit_is_idempotent(prefix in "([A-Za-z0-9_.*-]+ text\n){0,5}") {
+            let once = edit_gitattributes(
+                &prefix,
+                &["CHANGES.md merge=sacho", "changes.d/next merge=ours"],
+            ).expect("first edit");
+            let twice = edit_gitattributes(
+                &once,
+                &["CHANGES.md merge=sacho", "changes.d/next merge=ours"],
+            ).expect("second edit");
+
+            prop_assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn hook_marker_replacement_is_idempotent(prefix in "([A-Za-z0-9_ -]+\n){0,5}", suffix in "([A-Za-z0-9_ -]+\n){0,5}") {
+            let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+            let source = format!("{prefix}# sacho pre-commit begin\nold command\n# sacho pre-commit end\n{suffix}");
+            let once = edit_pre_commit_hook(&source, block, false).expect("first edit");
+            let twice = edit_pre_commit_hook(&once, block, false).expect("second edit");
+
+            prop_assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn hook_append_preserves_existing_content(source in "([A-Za-z0-9_ -]+\n){1,5}") {
+            let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+            let edited = edit_pre_commit_hook(&source, block, true).expect("append");
+
+            prop_assert!(edited.starts_with(&source));
+            prop_assert!(edited.contains(block));
+        }
     }
 
     #[test]

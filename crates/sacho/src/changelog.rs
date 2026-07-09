@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use crate::config::RegionDetection;
 
-const BEGIN_MARKER: &str = "<!-- sacho:unreleased:begin -->";
-const END_MARKER: &str = "<!-- sacho:unreleased:end -->";
+pub(crate) const BEGIN_MARKER: &str = "<!-- sacho:unreleased:begin -->";
+pub(crate) const END_MARKER: &str = "<!-- sacho:unreleased:end -->";
 
 /// A released changelog section keyed by version.
 #[derive(Debug, Clone, PartialEq, Eq)]
