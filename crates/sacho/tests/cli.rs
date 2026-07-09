@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::process::Command as ProcessCommand;
 
 #[test]
 fn help_lists_commands() {
@@ -234,6 +235,54 @@ fn check_reports_mismatch_and_passes_after_sync() {
         .args(["check"])
         .assert()
         .success();
+}
+
+#[test]
+fn check_base_reports_git_missing_fragment_violation() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+materialize = false
+
+[check]
+paths = [\"src/**\"]
+",
+    )
+    .expect("config");
+    git(temp.path(), ["init"]);
+    git(temp.path(), ["config", "user.email", "test@example.com"]);
+    git(temp.path(), ["config", "user.name", "Test User"]);
+    git(temp.path(), ["add", "sacho.toml"]);
+    git(temp.path(), ["commit", "-m", "Initial config"]);
+    std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn changed() {}\n").expect("source");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    git(temp.path(), ["commit", "-m", "Change API"]);
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["check", "--base", "HEAD~1"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("missing changelog fragment"))
+        .stderr(predicate::str::contains("src/lib.rs"))
+        .stderr(predicate::str::contains("Changelog: none"));
+}
+
+fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
+    let output = ProcessCommand::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git command");
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

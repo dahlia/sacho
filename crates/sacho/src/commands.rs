@@ -3,21 +3,24 @@ use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use hongdown::{
     DashSetting, IndentWidth, LeadingSpaces, LineWidth, Options as HongdownOptions, TrailingSpaces,
     UnorderedMarker, format,
 };
+use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
 use crate::changelog::{ChangelogError, replace_unreleased_region};
-use crate::config::RegionDetection;
+use crate::config::{RegionDetection, VcsPreset};
 use crate::error::{Error, Result};
 use crate::fragment::{
     DiscoveryWarning, FragmentWarning, discover_fragment_candidates, parse_fragment,
 };
 use crate::released::carry_release;
 use crate::repo::Repository;
+use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
 
@@ -720,11 +723,374 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
         }
     }
 
+    run_missing_fragment_check(repo, options.base.as_deref(), &mut violations, &mut skipped)?;
+
     Ok(CheckReport {
         violations,
         warnings,
         skipped,
     })
+}
+
+fn run_missing_fragment_check(
+    repo: &Repository,
+    base: Option<&str>,
+    violations: &mut Vec<CheckViolation>,
+    skipped: &mut Vec<SkippedCheck>,
+) -> Result<()> {
+    let Some(base) = base else {
+        skipped.push(SkippedCheck {
+            message: String::from("missing-fragment check skipped because --base was not supplied"),
+        });
+        return Ok(());
+    };
+    if repo.config().check.paths.is_empty() {
+        skipped.push(no_checked_paths_skip());
+        return Ok(());
+    }
+    match repo.config().vcs.preset {
+        VcsPreset::Git => {
+            let vcs = GitVcs::new(repo.root());
+            let report = missing_fragment_violations(repo, &vcs, base)?;
+            violations.extend(report.violations);
+            skipped.extend(report.skipped);
+        }
+        VcsPreset::None => skipped.push(SkippedCheck {
+            message: String::from("missing-fragment check skipped because vcs.preset = \"none\""),
+        }),
+        VcsPreset::Jj | VcsPreset::Hg => skipped.push(SkippedCheck {
+            message: format!(
+                "missing-fragment check skipped because vcs.preset = {:?} is not implemented",
+                repo.config().vcs.preset
+            ),
+        }),
+    }
+    Ok(())
+}
+
+fn missing_fragment_violations(
+    repo: &Repository,
+    vcs: &impl Vcs,
+    base: &str,
+) -> Result<MissingFragmentReport> {
+    if repo.config().check.paths.is_empty() {
+        return Ok(MissingFragmentReport {
+            violations: Vec::new(),
+            skipped: vec![no_checked_paths_skip()],
+        });
+    }
+    let source_patterns = compile_glob_set(&repo.config().check.paths)?;
+    let section_patterns = repo
+        .config()
+        .sections
+        .iter()
+        .map(|section| Ok((section.id.as_str(), compile_glob_set(&section.paths)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let commits = vcs.commits(base)?;
+    let final_fragments = final_fragment_paths(repo)?;
+    let mut violations = Vec::new();
+    let mut skipped = Vec::new();
+
+    for commit in commits {
+        let message = vcs.message(&commit)?;
+        if message_exempts_changelog(&message) {
+            continue;
+        }
+        let changed_paths = vcs.changed_paths(&commit)?;
+        let mut relevant_paths = changed_paths
+            .iter()
+            .flat_map(policy_paths)
+            .filter(|path| source_patterns.is_match(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        relevant_paths.sort();
+        relevant_paths.dedup();
+        if relevant_paths.is_empty() {
+            continue;
+        }
+        let changed_fragments = changed_fragment_changes(repo, &changed_paths);
+        let requirements =
+            missing_fragment_requirements(repo, &commit, &relevant_paths, &section_patterns);
+        skipped.extend(requirements.skipped);
+
+        for requirement in requirements.requirements {
+            if !requirement_satisfied(&requirement, &changed_fragments, &final_fragments) {
+                violations.push(CheckViolation {
+                    message: missing_fragment_message(&commit, &requirement),
+                });
+            }
+        }
+    }
+
+    Ok(MissingFragmentReport {
+        violations,
+        skipped,
+    })
+}
+
+fn no_checked_paths_skip() -> SkippedCheck {
+    SkippedCheck {
+        message: String::from("missing-fragment check skipped because check.paths is empty"),
+    }
+}
+
+fn compile_glob_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|source| Error::InvalidGlob {
+            pattern: pattern.clone(),
+            source,
+        })?;
+        builder.add(glob);
+    }
+    builder.build().map_err(|source| Error::InvalidGlob {
+        pattern: patterns.join(", "),
+        source,
+    })
+}
+
+fn changed_fragment_changes(repo: &Repository, paths: &[ChangedPath]) -> Vec<FragmentChange> {
+    paths
+        .iter()
+        .filter(|path| fragment_content_changed(path))
+        .filter_map(|path| fragment_change_for_path(repo, &path.path))
+        .collect()
+}
+
+fn fragment_content_changed(path: &ChangedPath) -> bool {
+    match path.kind {
+        ChangeKind::Added | ChangeKind::Modified => true,
+        ChangeKind::Copied | ChangeKind::Renamed => {
+            path.similarity.is_some_and(|value| value < 100)
+        }
+        ChangeKind::Deleted | ChangeKind::Other => false,
+    }
+}
+
+fn policy_paths(path: &ChangedPath) -> impl Iterator<Item = &PathBuf> {
+    std::iter::once(&path.path).chain(
+        path.old_path
+            .as_ref()
+            .filter(|_| path.kind == ChangeKind::Renamed),
+    )
+}
+
+fn final_fragment_paths(repo: &Repository) -> Result<IndexSet<PathBuf>> {
+    Ok(discover_fragment_candidates(repo)?
+        .candidates
+        .iter()
+        .map(|candidate| candidate.relative_path.clone())
+        .collect())
+}
+
+fn fragment_change_for_path(repo: &Repository, path: &Path) -> Option<FragmentChange> {
+    fragment_target_for_path(repo, path).map(|target| FragmentChange {
+        path: path.to_path_buf(),
+        target,
+    })
+}
+
+fn fragment_target_for_path(repo: &Repository, path: &Path) -> Option<FragmentTarget> {
+    let config = repo.config();
+    if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+        return None;
+    }
+    if !path.starts_with(&config.fragments.directory) {
+        return None;
+    }
+    if config.sections.is_empty() {
+        if path.parent() != Some(config.fragments.directory.as_path()) {
+            return None;
+        }
+        return Some(FragmentTarget::Repository);
+    }
+    for section in &config.sections {
+        let directory = config.fragments.directory.join(&section.directory);
+        if path.parent() == Some(directory.as_path()) {
+            return Some(FragmentTarget::Section(section.id.clone()));
+        }
+    }
+    if path.parent().and_then(Path::parent) == Some(config.fragments.directory.as_path()) {
+        return Some(FragmentTarget::Repository);
+    }
+    None
+}
+
+fn requirement_satisfied(
+    requirement: &MissingFragmentRequirement,
+    changed_fragments: &[FragmentChange],
+    final_fragments: &IndexSet<PathBuf>,
+) -> bool {
+    changed_fragments.iter().any(|fragment| {
+        fragment_matches_requirement(fragment, &requirement.target)
+            && final_fragments.contains(&fragment.path)
+    })
+}
+
+fn fragment_matches_requirement(fragment: &FragmentChange, requirement: &FragmentTarget) -> bool {
+    match requirement {
+        FragmentTarget::Repository => true,
+        FragmentTarget::Section(section) => match &fragment.target {
+            FragmentTarget::Section(fragment_section) => fragment_section == section,
+            FragmentTarget::Repository => false,
+        },
+    }
+}
+
+fn missing_fragment_requirements(
+    repo: &Repository,
+    _commit: &CommitId,
+    paths: &[PathBuf],
+    section_patterns: &[(&str, GlobSet)],
+) -> MissingFragmentRequirements {
+    if repo.config().sections.is_empty() {
+        return MissingFragmentRequirements {
+            requirements: vec![MissingFragmentRequirement::repository(
+                paths.to_vec(),
+                false,
+            )],
+            skipped: Vec::new(),
+        };
+    }
+
+    let mut repository_paths = Vec::new();
+    let mut section_paths = section_patterns
+        .iter()
+        .map(|(section, _)| ((*section).to_owned(), Vec::new()))
+        .collect::<Vec<_>>();
+    for path in paths {
+        let matched_sections = section_patterns
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, patterns))| patterns.is_match(path))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matched_sections.is_empty() {
+            repository_paths.push(path.clone());
+        } else {
+            for index in matched_sections {
+                section_paths[index].1.push(path.clone());
+            }
+        }
+    }
+
+    let mut requirements = section_paths
+        .into_iter()
+        .filter(|(_, paths)| !paths.is_empty())
+        .map(|(section, paths)| MissingFragmentRequirement {
+            target: FragmentTarget::Section(section),
+            paths,
+            sectioned_repository: false,
+        })
+        .collect::<Vec<_>>();
+    if !repository_paths.is_empty() {
+        requirements.push(MissingFragmentRequirement::repository(
+            repository_paths,
+            true,
+        ));
+    }
+    MissingFragmentRequirements {
+        requirements,
+        skipped: Vec::new(),
+    }
+}
+
+fn missing_fragment_message(commit: &CommitId, requirement: &MissingFragmentRequirement) -> String {
+    let paths = path_sample(&requirement.paths);
+    let scope = match &requirement.target {
+        FragmentTarget::Repository => String::from("repository"),
+        FragmentTarget::Section(section) => format!("section {section:?}"),
+    };
+    format!(
+        "{}: missing changelog fragment for {scope}; affected paths: {paths}; run `{}` or add `Changelog: none` to the commit message",
+        commit.as_str(),
+        requirement.suggested_command()
+    )
+}
+
+fn path_sample(paths: &[PathBuf]) -> String {
+    let mut sample = paths
+        .iter()
+        .take(3)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if paths.len() > sample.len() {
+        sample.push(format!("and {} more", paths.len() - sample.len()));
+    }
+    sample.join(", ")
+}
+
+fn message_exempts_changelog(message: &str) -> bool {
+    const SKIP_MARKERS: [&str; 4] = [
+        "[changelog skip]",
+        "[changes skip]",
+        "[skip changelog]",
+        "[skip changes]",
+    ];
+
+    let lowercase = message.to_lowercase();
+    if SKIP_MARKERS.iter().any(|marker| lowercase.contains(marker)) {
+        return true;
+    }
+    message.lines().any(|line| {
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("changelog") && value.trim().eq_ignore_ascii_case("none")
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FragmentTarget {
+    Repository,
+    Section(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FragmentChange {
+    path: PathBuf,
+    target: FragmentTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MissingFragmentRequirement {
+    target: FragmentTarget,
+    paths: Vec<PathBuf>,
+    sectioned_repository: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MissingFragmentReport {
+    violations: Vec<CheckViolation>,
+    skipped: Vec<SkippedCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MissingFragmentRequirements {
+    requirements: Vec<MissingFragmentRequirement>,
+    skipped: Vec<SkippedCheck>,
+}
+
+impl MissingFragmentRequirement {
+    fn repository(paths: Vec<PathBuf>, sectioned_repository: bool) -> Self {
+        Self {
+            target: FragmentTarget::Repository,
+            paths,
+            sectioned_repository,
+        }
+    }
+
+    fn suggested_command(&self) -> String {
+        match &self.target {
+            FragmentTarget::Repository if self.sectioned_repository => {
+                String::from("sacho add --section <section-id> <topic-name>")
+            }
+            FragmentTarget::Repository => String::from("sacho add <topic-name>"),
+            FragmentTarget::Section(section) => {
+                format!("sacho add --section {section} <topic-name>")
+            }
+        }
+    }
 }
 
 fn validate_fragment_name(name: &str) -> Result<String> {
@@ -1294,6 +1660,84 @@ mod tests {
 
     use super::*;
     use crate::FragmentError;
+    use crate::vcs::ChangeKind;
+
+    #[derive(Debug, Clone)]
+    struct FakeCommit {
+        id: CommitId,
+        paths: Vec<ChangedPath>,
+        message: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeVcs {
+        commits: Vec<FakeCommit>,
+    }
+
+    struct PanicVcs;
+
+    impl Vcs for FakeVcs {
+        fn commits(&self, _base: &str) -> Result<Vec<CommitId>> {
+            Ok(self
+                .commits
+                .iter()
+                .map(|commit| commit.id.clone())
+                .collect())
+        }
+
+        fn changed_paths(&self, commit: &CommitId) -> Result<Vec<ChangedPath>> {
+            Ok(self
+                .commits
+                .iter()
+                .find(|candidate| candidate.id == *commit)
+                .expect("known commit")
+                .paths
+                .clone())
+        }
+
+        fn message(&self, commit: &CommitId) -> Result<String> {
+            Ok(self
+                .commits
+                .iter()
+                .find(|candidate| candidate.id == *commit)
+                .expect("known commit")
+                .message
+                .clone())
+        }
+    }
+
+    impl Vcs for PanicVcs {
+        fn commits(&self, _base: &str) -> Result<Vec<CommitId>> {
+            panic!("empty check.paths should skip commit lookup");
+        }
+
+        fn changed_paths(&self, _commit: &CommitId) -> Result<Vec<ChangedPath>> {
+            panic!("empty check.paths should skip changed path lookup");
+        }
+
+        fn message(&self, _commit: &CommitId) -> Result<String> {
+            panic!("empty check.paths should skip message lookup");
+        }
+    }
+
+    fn fake_commit(id: &str, paths: &[&str], message: &str) -> FakeCommit {
+        FakeCommit {
+            id: CommitId::new(id),
+            paths: paths
+                .iter()
+                .map(|path| ChangedPath::new(*path, ChangeKind::Modified))
+                .collect(),
+            message: message.to_owned(),
+        }
+    }
+
+    fn fake_commit_with_paths(id: &str, paths: Vec<ChangedPath>, message: &str) -> FakeCommit {
+        FakeCommit {
+            id: CommitId::new(id),
+            paths,
+            message: message.to_owned(),
+        }
+    }
 
     fn repo_with_config(config: &str) -> (TempDir, Repository) {
         let temp = TempDir::new().expect("tempdir");
@@ -2593,6 +3037,777 @@ priority: 0
                 .message
                 .contains("materialized changelog is out of sync")
         }));
+    }
+
+    #[test]
+    fn missing_base_skips_layer_three() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+
+        let report = check(&repo, CheckOptions::default()).expect("check");
+
+        assert!(report.is_clean());
+        assert!(report.skipped.iter().any(|skipped| {
+            skipped
+                .message
+                .contains("missing-fragment check skipped because --base was not supplied")
+        }));
+    }
+
+    #[test]
+    fn empty_check_paths_skip_layer_three_without_vcs_lookup() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        let report =
+            missing_fragment_violations(&repo, &PanicVcs, "not-a-real-base").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert_eq!(
+            report.skipped,
+            vec![SkippedCheck {
+                message: String::from(
+                    "missing-fragment check skipped because check.paths is empty"
+                )
+            }]
+        );
+    }
+
+    #[test]
+    fn check_base_with_empty_check_paths_is_no_op_outside_git() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        let report = check(
+            &repo,
+            CheckOptions {
+                base: Some(String::from("not-a-real-base")),
+                ..CheckOptions::default()
+            },
+        )
+        .expect("check");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.iter().any(|skipped| {
+            skipped
+                .message
+                .contains("missing-fragment check skipped because check.paths is empty")
+        }));
+    }
+
+    #[test]
+    fn layer_three_accepts_core_change_with_core_fragment() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/*/src/**"]
+
+            [[sections]]
+            id = "@optique/core"
+            directory = "core"
+            paths = ["packages/core/**"]
+
+            [[sections]]
+            id = "@optique/logtape"
+            directory = "logtape"
+            paths = ["packages/logtape/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/core/clear-function.md"),
+            " -  Added clear function.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &[
+                    "packages/core/src/lib.ts",
+                    "changes.d/core/clear-function.md",
+                ],
+                "Add clear function",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn layer_three_rejects_core_change_with_logtape_fragment() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/*/src/**"]
+
+            [[sections]]
+            id = "@optique/core"
+            directory = "core"
+            paths = ["packages/core/**"]
+
+            [[sections]]
+            id = "@optique/logtape"
+            directory = "logtape"
+            paths = ["packages/logtape/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/core/src/lib.ts", "changes.d/logtape/formatter.md"],
+                "Add clear function",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0]
+                .message
+                .contains("section \"@optique/core\"")
+        );
+        assert!(
+            report.violations[0]
+                .message
+                .contains("sacho add --section @optique/core")
+        );
+    }
+
+    #[test]
+    fn layer_three_ignores_docs_outside_check_paths() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit("a1", &["docs/guide.md"], "Update docs")],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn layer_three_accepts_unsectioned_source_change_with_any_fragment() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/clear-function.md"),
+            " -  Added clear function.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["src/lib.rs", "changes.d/clear-function.md"],
+                "Add clear function",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn layer_three_unsectioned_repository_suggestion_uses_root_add() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit("a1", &["src/lib.rs"], "Change API")],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0]
+                .message
+                .contains("sacho add <topic-name>")
+        );
+        assert!(
+            !report.violations[0]
+                .message
+                .contains("sacho add --section <section-id> <topic-name>")
+        );
+    }
+
+    #[test]
+    fn layer_three_rejects_fragment_missing_from_final_tree() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![
+                fake_commit(
+                    "a1",
+                    &["src/lib.rs", "changes.d/clear-function.md"],
+                    "Add clear function",
+                ),
+                fake_commit_with_paths(
+                    "b2",
+                    vec![ChangedPath::new(
+                        "changes.d/clear-function.md",
+                        ChangeKind::Deleted,
+                    )],
+                    "Remove obsolete fragment",
+                ),
+            ],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.starts_with("a1:"));
+        assert!(
+            report.violations[0]
+                .message
+                .contains("missing changelog fragment")
+        );
+    }
+
+    #[test]
+    fn layer_three_matches_surviving_fragment_by_file_not_target() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/core/**"]
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+            paths = ["packages/core/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/core/unrelated.md"),
+            " -  Added unrelated change.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![
+                fake_commit(
+                    "a1",
+                    &[
+                        "packages/core/src/lib.ts",
+                        "changes.d/core/clear-function.md",
+                    ],
+                    "Add clear function",
+                ),
+                fake_commit_with_paths(
+                    "b2",
+                    vec![ChangedPath::new(
+                        "changes.d/core/clear-function.md",
+                        ChangeKind::Deleted,
+                    )],
+                    "Remove obsolete fragment",
+                ),
+            ],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.starts_with("a1:"));
+    }
+
+    #[test]
+    fn layer_three_treats_rename_out_of_checked_paths_as_relevant() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit_with_paths(
+                "a1",
+                vec![ChangedPath::with_old_path(
+                    "internal/api.rs",
+                    ChangeKind::Renamed,
+                    "src/api.rs",
+                )],
+                "Move API internals",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.contains("src/api.rs"));
+    }
+
+    #[test]
+    fn changelog_none_trailer_exempts_one_commit_only() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![
+                fake_commit(
+                    "a1",
+                    &["src/lib.rs"],
+                    "Refactor internals\n\nChangelog: none\n",
+                ),
+                fake_commit("b2", &["src/main.rs"], "Change CLI"),
+            ],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.starts_with("b2:"));
+    }
+
+    #[test]
+    fn layer_three_does_not_accept_deleted_fragment_as_coverage() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit_with_paths(
+                "a1",
+                vec![
+                    ChangedPath::new("src/lib.rs", ChangeKind::Modified),
+                    ChangedPath::new("changes.d/old-entry.md", ChangeKind::Deleted),
+                ],
+                "Change API and remove stale fragment",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0]
+                .message
+                .contains("missing changelog fragment")
+        );
+    }
+
+    #[test]
+    fn layer_three_does_not_accept_renamed_fragment_as_coverage() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/new-entry.md"),
+            " -  Added previous behavior.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit_with_paths(
+                "a1",
+                vec![
+                    ChangedPath::new("src/lib.rs", ChangeKind::Modified),
+                    ChangedPath::with_old_path(
+                        "changes.d/new-entry.md",
+                        ChangeKind::Renamed,
+                        "changes.d/old-entry.md",
+                    ),
+                ],
+                "Change API and rename stale fragment",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0]
+                .message
+                .contains("missing changelog fragment")
+        );
+    }
+
+    #[test]
+    fn layer_three_accepts_edited_copied_fragment_as_coverage() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/new-entry.md"),
+            " -  Added new behavior.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit_with_paths(
+                "a1",
+                vec![
+                    ChangedPath::new("src/lib.rs", ChangeKind::Modified),
+                    ChangedPath::with_old_path_and_similarity(
+                        "changes.d/new-entry.md",
+                        ChangeKind::Copied,
+                        "changes.d/template.md",
+                        85,
+                    ),
+                ],
+                "Change API with copied fragment",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn fragment_coverage_requires_content_changes() {
+        assert!(fragment_content_changed(&ChangedPath::new(
+            "changes.d/added.md",
+            ChangeKind::Added
+        )));
+        assert!(fragment_content_changed(&ChangedPath::new(
+            "changes.d/modified.md",
+            ChangeKind::Modified
+        )));
+        assert!(fragment_content_changed(
+            &ChangedPath::with_old_path_and_similarity(
+                "changes.d/copied.md",
+                ChangeKind::Copied,
+                "changes.d/template.md",
+                85,
+            )
+        ));
+        assert!(fragment_content_changed(
+            &ChangedPath::with_old_path_and_similarity(
+                "changes.d/renamed.md",
+                ChangeKind::Renamed,
+                "changes.d/old.md",
+                85,
+            )
+        ));
+        assert!(!fragment_content_changed(
+            &ChangedPath::with_old_path_and_similarity(
+                "changes.d/copied.md",
+                ChangeKind::Copied,
+                "changes.d/template.md",
+                100,
+            )
+        ));
+        assert!(!fragment_content_changed(&ChangedPath::with_old_path(
+            "changes.d/copied.md",
+            ChangeKind::Copied,
+            "changes.d/template.md",
+        )));
+        assert!(!fragment_content_changed(&ChangedPath::new(
+            "changes.d/deleted.md",
+            ChangeKind::Deleted
+        )));
+        assert!(!fragment_content_changed(&ChangedPath::new(
+            "changes.d/other.md",
+            ChangeKind::Other
+        )));
+    }
+
+    #[test]
+    fn layer_three_does_not_accept_nested_unsectioned_markdown_as_fragment() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["src/lib.rs", "changes.d/nested/not-a-fragment.md"],
+                "Change API",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(
+            report.violations[0]
+                .message
+                .contains("missing changelog fragment")
+        );
+    }
+
+    #[test]
+    fn layer_three_does_not_accept_nested_section_markdown_as_fragment() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/core/**"]
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+            paths = ["packages/core/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &[
+                    "packages/core/src/lib.ts",
+                    "changes.d/core/nested/not-a-fragment.md",
+                ],
+                "Change core API",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.contains("section \"core\""));
+    }
+
+    #[test]
+    fn layer_three_requires_any_fragment_for_unattributed_paths_in_sectioned_repo() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+            paths = ["packages/core/**"]
+            "#,
+        );
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/unknown/src/lib.ts"],
+                "Change unknown package",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.skipped.is_empty());
+        assert!(
+            report.violations[0]
+                .message
+                .contains("sacho add --section <section-id> <topic-name>")
+        );
+    }
+
+    #[test]
+    fn layer_three_accepts_unknown_section_fragment_for_unattributed_paths() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+            paths = ["packages/core/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/unknown")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/unknown/change.md"),
+            " -  Added unknown package behavior.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/unknown/src/lib.ts", "changes.d/unknown/change.md"],
+                "Change unknown package",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn path_sample_reports_only_overflow_after_three_paths() {
+        let three = path_sample(&[
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("src/b.rs"),
+            PathBuf::from("src/c.rs"),
+        ]);
+        let four = path_sample(&[
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("src/b.rs"),
+            PathBuf::from("src/c.rs"),
+            PathBuf::from("src/d.rs"),
+        ]);
+
+        assert_eq!(three, "src/a.rs, src/b.rs, src/c.rs");
+        assert_eq!(four, "src/a.rs, src/b.rs, src/c.rs, and 1 more");
+    }
+
+    #[test]
+    fn changelog_trailer_requires_changelog_key_and_none_value() {
+        assert!(!message_exempts_changelog(
+            "Change behavior\n\nChangelog: later\n"
+        ));
+        assert!(!message_exempts_changelog(
+            "Change behavior\n\nNote: none\n"
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn skip_markers_are_case_insensitive(marker in prop::sample::select(vec![
+            "[changelog skip]",
+            "[changes skip]",
+            "[skip changelog]",
+            "[skip changes]",
+        ])) {
+            let message = format!("Update docs\n\n{}", marker.to_uppercase());
+
+            prop_assert!(message_exempts_changelog(&message));
+        }
+
+        #[test]
+        fn path_attribution_is_deterministic_under_shuffled_input(shuffle in any::<bool>()) {
+            let (_temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                materialize = false
+
+                [check]
+                paths = ["packages/**"]
+
+                [[sections]]
+                id = "core"
+                directory = "core"
+                paths = ["packages/core/**"]
+
+                [[sections]]
+                id = "logtape"
+                directory = "logtape"
+                paths = ["packages/logtape/**"]
+                "#,
+            );
+            let mut paths = vec![
+                ChangedPath::new("packages/logtape/src/lib.ts", ChangeKind::Modified),
+                ChangedPath::new("packages/core/src/lib.ts", ChangeKind::Modified),
+            ];
+            if shuffle {
+                paths.reverse();
+            }
+            let vcs = FakeVcs {
+                commits: vec![FakeCommit {
+                    id: CommitId::new("a1"),
+                    paths,
+                    message: String::from("Change packages"),
+                }],
+            };
+
+            let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+            let messages = report
+                .violations
+                .iter()
+                .map(|violation| violation.message.as_str())
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(messages.len(), 2);
+            prop_assert!(messages[0].contains("section \"core\""));
+            prop_assert!(messages[1].contains("section \"logtape\""));
+        }
     }
 
     proptest! {

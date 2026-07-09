@@ -197,6 +197,39 @@ pub enum Error {
         /// Name of the unsupported command.
         command: &'static str,
     },
+
+    /// A configured glob pattern could not be compiled.
+    #[snafu(display("invalid glob pattern {pattern:?}: {source}"))]
+    InvalidGlob {
+        /// Glob pattern from configuration.
+        pattern: String,
+
+        /// Underlying globset error.
+        source: globset::Error,
+    },
+
+    /// A VCS integration command failed.
+    #[snafu(display("VCS command `{command}` failed with status {status}: {stderr}"))]
+    VcsCommandFailed {
+        /// Command line that failed.
+        command: String,
+
+        /// Process exit status.
+        status: std::process::ExitStatus,
+
+        /// Standard error emitted by the command.
+        stderr: String,
+    },
+
+    /// A VCS integration command could not be started.
+    #[snafu(display("failed to run VCS command `{command}`: {source}"))]
+    VcsCommandIo {
+        /// Command line that failed to start.
+        command: String,
+
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
 }
 
 /// Configuration-specific error.

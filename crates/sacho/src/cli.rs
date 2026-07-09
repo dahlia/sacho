@@ -126,6 +126,9 @@ impl Cli {
                 for warning in &report.warnings {
                     eprintln!("warning: {}", warning.message);
                 }
+                for skipped in &report.skipped {
+                    eprintln!("skipped: {}", skipped.message);
+                }
                 if report.is_clean() {
                     Ok(ExitCode::SUCCESS)
                 } else {

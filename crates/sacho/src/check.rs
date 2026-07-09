@@ -1,1 +1,3 @@
-pub use crate::commands::{CheckOptions, CheckReport, CheckViolation};
+pub use crate::commands::{
+    CheckOptions, CheckReport, CheckStatus, CheckViolation, CheckWarning, SkippedCheck,
+};
