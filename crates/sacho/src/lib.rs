@@ -22,6 +22,8 @@ pub mod error;
 pub mod fragment;
 /// Markdown formatting adapter types.
 pub mod markdown;
+/// Changelog merge driver types.
+pub mod merge;
 /// Released changelog parsing types.
 pub mod released;
 /// Repository discovery and path helpers.

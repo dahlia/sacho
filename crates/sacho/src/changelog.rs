@@ -35,6 +35,16 @@ pub struct UnreleasedRegionSpan {
     pub end: usize,
 }
 
+/// Byte span and text of a version-like changelog heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VersionHeadingSpan {
+    /// Byte offset where the heading starts.
+    pub start: usize,
+
+    /// Rendered heading text without Markdown markers.
+    pub text: String,
+}
+
 /// Result of replacing an unreleased region in a changelog source string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionReplacement {
@@ -99,6 +109,30 @@ pub fn replace_unreleased_region(
         old_region: source[span.start..span.end].to_owned(),
         new_contents,
     })
+}
+
+/// Finds all version-like headings outside code blocks.
+pub(crate) fn version_heading_spans(source: &str) -> Vec<VersionHeadingSpan> {
+    let lines = source_lines(source);
+    heading_candidates(&lines)
+        .candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let line = lines.iter().find(|line| line.start == candidate.start)?;
+            let text = if lines
+                .get(candidate.after_line.saturating_sub(1))
+                .is_some_and(|underline| is_setext_underline(underline.text))
+            {
+                line.text.trim().to_owned()
+            } else {
+                atx_heading_text(line.text)?.to_owned()
+            };
+            Some(VersionHeadingSpan {
+                start: candidate.start,
+                text,
+            })
+        })
+        .collect()
 }
 
 fn normalize_compiled_region(compiled: &str) -> String {

@@ -258,6 +258,19 @@ pub enum Error {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+
+    /// A fragment file could not be merged while reconstructing merge inputs.
+    #[snafu(display("failed to merge fragment {}: {stderr}", path.display()))]
+    MergeFragment {
+        /// Fragment path that could not be merged.
+        path: std::path::PathBuf,
+
+        /// Process exit status from the merge tool.
+        status: std::process::ExitStatus,
+
+        /// Standard error emitted by the merge tool.
+        stderr: String,
+    },
 }
 
 /// Configuration-specific error.

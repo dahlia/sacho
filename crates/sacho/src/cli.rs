@@ -10,6 +10,7 @@ use sacho::commands::{
     carry, check, compile_unreleased, format_fragments, init_repository, plan_release, plan_sync,
     set_next_version,
 };
+use sacho::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use sacho::{Error, Repository};
 
 #[derive(Debug, Parser)]
@@ -220,14 +221,59 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::MergeDriver {
-                original: _,
-                current: _,
-                other: _,
-                path: _,
-            } => Err(Error::UnsupportedCommand {
-                command: "merge-driver",
+                original,
+                current,
+                other,
+                path,
+            } => run_merge_driver(original, current, other, path),
+        }
+    }
+}
+
+fn run_merge_driver(
+    original: String,
+    current: String,
+    other: String,
+    path: String,
+) -> Result<ExitCode, CliReport> {
+    let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+    let current_path = PathBuf::from(&current);
+    match merge_driver(
+        &repo,
+        MergeDriverOptions {
+            ancestor: PathBuf::from(original),
+            current: current_path.clone(),
+            other: PathBuf::from(other),
+            path: PathBuf::from(path),
+        },
+    ) {
+        Ok(MergeDriverResult::Clean { output, hints }) => {
+            std::fs::write(&current_path, output).map_err(|source| {
+                CliReport::from(Error::WriteFile {
+                    path: current_path.clone(),
+                    source,
+                })
+            })?;
+            for hint in hints {
+                eprintln!("{hint}");
             }
-            .into()),
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(MergeDriverResult::Conflict {
+            output_with_markers,
+            reason: _,
+        }) => {
+            std::fs::write(&current_path, output_with_markers).map_err(|source| {
+                CliReport::from(Error::WriteFile {
+                    path: current_path.clone(),
+                    source,
+                })
+            })?;
+            Ok(ExitCode::from(1))
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            Ok(ExitCode::from(1))
         }
     }
 }
