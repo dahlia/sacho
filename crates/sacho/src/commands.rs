@@ -88,6 +88,9 @@ pub struct AddOptions {
 pub struct AddResult {
     /// Path of the created fragment.
     pub path: PathBuf,
+
+    /// Synchronization result when materialization is enabled.
+    pub sync: Option<SyncResult>,
 }
 
 /// Options for setting the next unreleased version.
@@ -488,6 +491,7 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
     };
     let path = directory.join(name);
     let absolute = repo.resolve(&path);
+    ensure_materialized_current_before_mutation(repo)?;
     if let Some(parent) = absolute.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
             path: parent.to_path_buf(),
@@ -508,11 +512,31 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
                 }
             }
         })?;
-    file.write_all(b" -\n").map_err(|source| Error::WriteFile {
-        path: absolute,
-        source,
-    })?;
-    Ok(AddResult { path })
+    if let Err(source) = file.write_all(b" -\n") {
+        drop(file);
+        fs::remove_file(&absolute).map_err(|cleanup_source| Error::WriteFile {
+            path: absolute.clone(),
+            source: cleanup_source,
+        })?;
+        return Err(Error::WriteFile {
+            path: absolute,
+            source,
+        });
+    }
+    drop(file);
+
+    let sync = match sync_after_mutation(repo) {
+        Ok(sync) => sync,
+        Err(error) => {
+            fs::remove_file(&absolute).map_err(|source| Error::WriteFile {
+                path: absolute,
+                source,
+            })?;
+            return Err(error);
+        }
+    };
+
+    Ok(AddResult { path, sync })
 }
 
 /// Sets the next unreleased version.
@@ -524,7 +548,7 @@ pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextR
     ensure_materialized_current_before_mutation(repo)?;
     let path = next_version_path(repo);
     repo.atomic_write(&path, format!("{version}\n").as_bytes())?;
-    sync_after_mutation(repo)?;
+    let _sync = sync_after_mutation(repo)?;
     Ok(NextResult { path })
 }
 
@@ -557,7 +581,7 @@ pub fn format_fragments(repo: &Repository, _options: FormatOptions) -> Result<Fo
         }
     }
 
-    sync_after_mutation(repo)?;
+    let _sync = sync_after_mutation(repo)?;
     Ok(FormatResult { changed })
 }
 
@@ -1543,12 +1567,12 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
-fn sync_after_mutation(repo: &Repository) -> Result<()> {
+fn sync_after_mutation(repo: &Repository) -> Result<Option<SyncResult>> {
     if repo.config().changelog.materialize {
         let plan = plan_sync(repo, SyncOptions { force: true })?;
-        apply_sync(repo, plan)?;
+        return apply_sync(repo, plan).map(Some);
     }
-    Ok(())
+    Ok(None)
 }
 
 fn ensure_materialized_current_before_mutation(repo: &Repository) -> Result<()> {
@@ -3527,8 +3551,9 @@ mod tests {
             result.path,
             PathBuf::from("changes.d/core/clear-function.md")
         );
+        assert_eq!(result.sync, None);
         assert_eq!(
-            fs::read_to_string(temp.path().join(result.path)).expect("fragment"),
+            fs::read_to_string(temp.path().join(&result.path)).expect("fragment"),
             " -\n"
         );
     }
@@ -3574,9 +3599,142 @@ mod tests {
         .expect("add");
 
         assert_eq!(result.path, PathBuf::from("changes.d/clear-function.md"));
+        assert_eq!(result.sync, None);
         assert_eq!(
-            fs::read_to_string(temp.path().join(result.path)).expect("fragment"),
+            fs::read_to_string(temp.path().join(&result.path)).expect("fragment"),
             " -\n"
+        );
+    }
+
+    #[test]
+    fn add_syncs_materialized_changelog_without_sections() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let result = add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("clear-function"),
+            },
+        )
+        .expect("add");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains(" -\n"));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn add_syncs_materialized_changelog_with_sections() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+            "#,
+        );
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let result = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("core")),
+                name: String::from("clear-function"),
+            },
+        )
+        .expect("add");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains("### core\n"));
+        assert!(changelog.contains(" -\n"));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn add_rejects_stale_materialized_changelog_before_creating_fragment() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n\n -  Hand edit.\n",
+        )
+        .expect("changelog");
+
+        let error = add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("clear-function"),
+            },
+        )
+        .expect_err("stale changelog");
+
+        assert!(matches!(error, Error::SyncNeedsConfirmation { .. }));
+        assert!(!temp.path().join("changes.d/clear-function.md").exists());
+    }
+
+    #[test]
+    fn add_does_not_create_fragment_when_existing_fragments_do_not_compile() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/invalid.md"), "not a list\n")
+            .expect("invalid fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("clear-function"),
+            },
+        )
+        .expect_err("invalid existing fragment");
+
+        assert!(!temp.path().join("changes.d/clear-function.md").exists());
+    }
+
+    #[test]
+    fn add_removes_created_fragment_when_changelog_sync_fails() {
+        let (temp, repo) = repo_with_config("");
+        let original = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), original).expect("changelog");
+        fs::create_dir(temp.path().join("CHANGES.md.tmp")).expect("blocking temp path");
+
+        add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("clear-function"),
+            },
+        )
+        .expect_err("sync failure");
+
+        assert!(!temp.path().join("changes.d/clear-function.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            original
         );
     }
 
@@ -4793,6 +4951,40 @@ priority: 0
     }
 
     proptest! {
+        #[test]
+        fn successful_add_leaves_layer_one_and_two_clean(
+            name in "[a-z][a-z0-9-]{0,16}",
+            with_sections in any::<bool>(),
+        ) {
+            let config = if with_sections {
+                r#"
+                [[sections]]
+                id = "core"
+                directory = "core"
+                "#
+            } else {
+                ""
+            };
+            let (temp, repo) = repo_with_config(config);
+            fs::write(
+                temp.path().join("CHANGES.md"),
+                "Unreleased\n----------\n\nTo be released.\n",
+            )
+            .expect("changelog");
+
+            add_fragment(
+                &repo,
+                AddOptions {
+                    section: with_sections.then(|| String::from("core")),
+                    name,
+                },
+            )
+            .expect("add");
+
+            let report = check(&repo, CheckOptions::default()).expect("check");
+            prop_assert!(report.is_clean(), "{report:?}");
+        }
+
         #[test]
         fn fragment_filename_validator_rejects_path_traversal(
             prefix in "([A-Za-z0-9_-]{0,8}/)?",

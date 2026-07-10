@@ -429,6 +429,33 @@ materialize = false
 }
 
 #[test]
+fn add_updates_materialized_changelog_and_leaves_check_clean() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n",
+    )
+    .expect("changelog");
+    let mut add = Command::cargo_bin("sacho").expect("binary");
+
+    add.current_dir(temp.path())
+        .args(["add", "clear-function"])
+        .assert()
+        .success();
+
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains(" -\n"));
+
+    let mut check = Command::cargo_bin("sacho").expect("binary");
+    check
+        .current_dir(temp.path())
+        .args(["check"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn check_warning_only_exits_success() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(
