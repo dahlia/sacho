@@ -45,7 +45,7 @@ pub struct InitOptions {
     /// Materialization policy for newly generated configuration.
     pub materialize: Option<bool>,
 
-    /// Whether to install or update Sacho's pre-commit hook block.
+    /// Whether to install or update Sacho's Git commit hook blocks.
     pub install_hook: bool,
 
     /// Whether an existing unmarked hook may receive a marked Sacho block.
@@ -307,6 +307,10 @@ pub struct CarryResult {
 pub struct CheckOptions {
     /// Optional base revision for VCS-backed missing-fragment checks.
     pub base: Option<String>,
+    /// Whether Layer 3 should inspect the staged Git index.
+    ///
+    /// This mode is mutually exclusive with [`Self::base`].
+    pub staged: bool,
     /// Whether mechanically fixable violations should be repaired.
     pub fix: bool,
 }
@@ -463,7 +467,18 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
         apply_git_integration(&root, &config, &mut result)?;
     }
     if options.install_hook {
-        install_pre_commit_hook(&root, options.append_existing_hook, &mut result)?;
+        if config.vcs.preset == VcsPreset::Git && is_git_repository(&root) {
+            install_commit_hooks(&root, options.append_existing_hook, &mut result)?;
+        } else if config.vcs.preset == VcsPreset::Git {
+            result.manual_actions_required.push(String::from(
+                "commit hooks not installed: automatic installation requires a Git repository",
+            ));
+        } else {
+            result.manual_actions_required.push(format!(
+                "commit hooks not installed: staged missing-fragment checks require vcs.preset = \"git\", but this repository uses vcs.preset = {:?}",
+                toml_vcs_preset(config.vcs.preset)
+            ));
+        }
     }
 
     Ok(result)
@@ -787,6 +802,11 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
 
 /// Checks fragments, materialized output, and missing-fragment policy.
 pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
+    if options.base.is_some() && options.staged {
+        return Err(Error::Usage {
+            message: String::from("--base and --staged cannot be used together"),
+        });
+    }
     if options.fix {
         ensure_materialized_current_before_mutation(repo)?;
         format_fragments(repo, FormatOptions)?;
@@ -883,7 +903,7 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
         }
     }
 
-    run_missing_fragment_check(repo, options.base.as_deref(), &mut violations, &mut skipped)?;
+    run_missing_fragment_check(repo, &options, &mut violations, &mut skipped)?;
 
     Ok(CheckReport {
         violations,
@@ -892,18 +912,145 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
     })
 }
 
+/// Arms the final commit check from Git's `commit-msg` hook.
+pub fn commit_message_hook(repo: &Repository, _message_path: &Path) -> Result<()> {
+    let vcs = GitVcs::new(repo.root());
+    let state = CommitHookState {
+        head: vcs.head()?,
+        tree: vcs.index_tree()?,
+    };
+    let path = commit_hook_state_path(repo.root())?;
+    fs::write(&path, state.encode()).map_err(|source| Error::WriteFile { path, source })
+}
+
+/// Checks a commit before Git completes its reference transaction.
+pub fn reference_transaction_hook(
+    repo: &Repository,
+    phase: &str,
+    updates: &str,
+) -> Result<Option<CheckReport>> {
+    if phase != "prepared" {
+        return Ok(None);
+    }
+    let state_path = commit_hook_state_path(repo.root())?;
+    let state = match fs::read_to_string(&state_path) {
+        Ok(state) => CommitHookState::decode(&state)?,
+        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: state_path,
+                source,
+            });
+        }
+    };
+    fs::remove_file(&state_path).map_err(|source| Error::WriteFile {
+        path: state_path,
+        source,
+    })?;
+    let vcs = GitVcs::new(repo.root());
+    let Some(commit) = reference_transaction_commit(&vcs, &state, updates)? else {
+        return Ok(None);
+    };
+    let missing = commit_missing_fragment_violations(repo, &vcs, &CommitId::new(commit))?;
+    Ok(Some(CheckReport {
+        violations: missing.violations,
+        warnings: Vec::new(),
+        skipped: missing.skipped,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitHookState {
+    head: Option<String>,
+    tree: String,
+}
+
+impl CommitHookState {
+    fn encode(&self) -> String {
+        format!(
+            "head {}\ntree {}\n",
+            self.head.as_deref().unwrap_or("-"),
+            self.tree
+        )
+    }
+
+    fn decode(value: &str) -> Result<Self> {
+        let mut lines = value.lines();
+        let head = lines
+            .next()
+            .and_then(|line| line.strip_prefix("head "))
+            .ok_or_else(|| Error::Usage {
+                message: String::from("invalid Sacho commit-hook state"),
+            })?;
+        let tree = lines
+            .next()
+            .and_then(|line| line.strip_prefix("tree "))
+            .filter(|tree| !tree.is_empty())
+            .ok_or_else(|| Error::Usage {
+                message: String::from("invalid Sacho commit-hook state"),
+            })?;
+        if lines.next().is_some() {
+            return Err(Error::Usage {
+                message: String::from("invalid Sacho commit-hook state"),
+            });
+        }
+        Ok(Self {
+            head: (head != "-").then(|| head.to_owned()),
+            tree: tree.to_owned(),
+        })
+    }
+}
+
+fn reference_transaction_commit(
+    vcs: &GitVcs,
+    state: &CommitHookState,
+    updates: &str,
+) -> Result<Option<String>> {
+    for line in updates.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(old), Some(new), Some(reference), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !matches_commit_head(old, state.head.as_deref())
+            || !(reference == "HEAD" || reference.starts_with("refs/heads/"))
+        {
+            continue;
+        }
+        if vcs.commit_tree(new).is_ok_and(|tree| tree == state.tree) {
+            return Ok(Some(new.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn matches_commit_head(old: &str, head: Option<&str>) -> bool {
+    match head {
+        Some(head) => old == head,
+        None => !old.is_empty() && old.bytes().all(|byte| byte == b'0'),
+    }
+}
+
+fn commit_hook_state_path(root: &Path) -> Result<PathBuf> {
+    let path = git_output(root, ["rev-parse", "--git-path", "sacho-commit-state"])?;
+    Ok(resolve_git_path(root, path.trim()))
+}
+
 fn run_missing_fragment_check(
     repo: &Repository,
-    base: Option<&str>,
+    options: &CheckOptions,
     violations: &mut Vec<CheckViolation>,
     skipped: &mut Vec<SkippedCheck>,
 ) -> Result<()> {
-    let Some(base) = base else {
+    if options.base.is_none() && !options.staged {
         skipped.push(SkippedCheck {
-            message: String::from("missing-fragment check skipped because --base was not supplied"),
+            message: String::from(
+                "missing-fragment check skipped because neither --base nor --staged was supplied",
+            ),
         });
         return Ok(());
-    };
+    }
     if repo.config().check.paths.is_empty() {
         skipped.push(no_checked_paths_skip());
         return Ok(());
@@ -911,7 +1058,15 @@ fn run_missing_fragment_check(
     match repo.config().vcs.preset {
         VcsPreset::Git => {
             let vcs = GitVcs::new(repo.root());
-            let report = missing_fragment_violations(repo, &vcs, base)?;
+            let report = if options.staged {
+                staged_missing_fragment_violations(repo, &vcs)?
+            } else {
+                missing_fragment_violations(
+                    repo,
+                    &vcs,
+                    options.base.as_deref().expect("base mode has a revision"),
+                )?
+            };
             violations.extend(report.violations);
             skipped.extend(report.skipped);
         }
@@ -940,12 +1095,7 @@ fn missing_fragment_violations(
         });
     }
     let source_patterns = compile_glob_set(&repo.config().check.paths)?;
-    let section_patterns = repo
-        .config()
-        .sections
-        .iter()
-        .map(|section| Ok((section.id.as_str(), compile_glob_set(&section.paths)?)))
-        .collect::<Result<Vec<_>>>()?;
+    let section_patterns = compile_section_patterns(repo)?;
     let commits = vcs.commits(base)?;
     let final_fragments = final_fragment_paths(repo)?;
     let mut violations = Vec::new();
@@ -957,35 +1107,132 @@ fn missing_fragment_violations(
             continue;
         }
         let changed_paths = vcs.changed_paths(&commit)?;
-        let mut relevant_paths = changed_paths
-            .iter()
-            .flat_map(policy_paths)
-            .filter(|path| source_patterns.is_match(path))
-            .cloned()
-            .collect::<Vec<_>>();
-        relevant_paths.sort();
-        relevant_paths.dedup();
-        if relevant_paths.is_empty() {
-            continue;
-        }
-        let changed_fragments = changed_fragment_changes(repo, &changed_paths);
-        let requirements =
-            missing_fragment_requirements(repo, &commit, &relevant_paths, &section_patterns);
-        skipped.extend(requirements.skipped);
-
-        for requirement in requirements.requirements {
-            if !requirement_satisfied(&requirement, &changed_fragments, &final_fragments) {
-                violations.push(CheckViolation {
-                    message: missing_fragment_message(&commit, &requirement),
-                });
-            }
-        }
+        let report = missing_fragment_violations_for_changes(
+            repo,
+            commit.as_str(),
+            &changed_paths,
+            &final_fragments,
+            &source_patterns,
+            &section_patterns,
+            MissingFragmentMode::Commit,
+        );
+        violations.extend(report.violations);
+        skipped.extend(report.skipped);
     }
 
     Ok(MissingFragmentReport {
         violations,
         skipped,
     })
+}
+
+fn staged_missing_fragment_violations(
+    repo: &Repository,
+    vcs: &GitVcs,
+) -> Result<MissingFragmentReport> {
+    if repo.config().check.paths.is_empty() {
+        return Ok(MissingFragmentReport {
+            violations: Vec::new(),
+            skipped: vec![no_checked_paths_skip()],
+        });
+    }
+    let source_patterns = compile_glob_set(&repo.config().check.paths)?;
+    let section_patterns = compile_section_patterns(repo)?;
+    let changed_paths = vcs.staged_paths()?;
+    let staged_fragments = changed_paths
+        .iter()
+        .filter(|path| path.kind.path_survives())
+        .filter_map(|path| fragment_target_for_path(repo, &path.path).map(|_| path.path.clone()))
+        .collect::<IndexSet<_>>();
+
+    Ok(missing_fragment_violations_for_changes(
+        repo,
+        "staged changes",
+        &changed_paths,
+        &staged_fragments,
+        &source_patterns,
+        &section_patterns,
+        MissingFragmentMode::Staged,
+    ))
+}
+
+fn commit_missing_fragment_violations(
+    repo: &Repository,
+    vcs: &GitVcs,
+    commit: &CommitId,
+) -> Result<MissingFragmentReport> {
+    if repo.config().check.paths.is_empty() {
+        return Ok(MissingFragmentReport {
+            violations: Vec::new(),
+            skipped: vec![no_checked_paths_skip()],
+        });
+    }
+    if message_exempts_changelog(&vcs.message(commit)?) {
+        return Ok(MissingFragmentReport::default());
+    }
+    let source_patterns = compile_glob_set(&repo.config().check.paths)?;
+    let section_patterns = compile_section_patterns(repo)?;
+    let changed_paths = vcs.changed_paths(commit)?;
+    let surviving_fragments = changed_paths
+        .iter()
+        .filter(|path| path.kind.path_survives())
+        .filter_map(|path| fragment_target_for_path(repo, &path.path).map(|_| path.path.clone()))
+        .collect::<IndexSet<_>>();
+    Ok(missing_fragment_violations_for_changes(
+        repo,
+        commit.as_str(),
+        &changed_paths,
+        &surviving_fragments,
+        &source_patterns,
+        &section_patterns,
+        MissingFragmentMode::Commit,
+    ))
+}
+
+fn compile_section_patterns(repo: &Repository) -> Result<Vec<(&str, GlobSet)>> {
+    repo.config()
+        .sections
+        .iter()
+        .map(|section| Ok((section.id.as_str(), compile_glob_set(&section.paths)?)))
+        .collect()
+}
+
+fn missing_fragment_violations_for_changes(
+    repo: &Repository,
+    subject: &str,
+    changed_paths: &[ChangedPath],
+    final_fragments: &IndexSet<PathBuf>,
+    source_patterns: &GlobSet,
+    section_patterns: &[(&str, GlobSet)],
+    mode: MissingFragmentMode,
+) -> MissingFragmentReport {
+    let mut relevant_paths = changed_paths
+        .iter()
+        .flat_map(policy_paths)
+        .filter(|path| source_patterns.is_match(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    relevant_paths.sort();
+    relevant_paths.dedup();
+    if relevant_paths.is_empty() {
+        return MissingFragmentReport::default();
+    }
+    let changed_fragments = changed_fragment_changes(repo, changed_paths);
+    let requirements = missing_fragment_requirements(repo, &relevant_paths, section_patterns);
+    let violations = requirements
+        .requirements
+        .iter()
+        .filter(|requirement| {
+            !requirement_satisfied(requirement, &changed_fragments, final_fragments)
+        })
+        .map(|requirement| CheckViolation {
+            message: missing_fragment_message(subject, requirement, mode),
+        })
+        .collect();
+    MissingFragmentReport {
+        violations,
+        skipped: requirements.skipped,
+    }
 }
 
 fn no_checked_paths_skip() -> SkippedCheck {
@@ -1099,7 +1346,6 @@ fn fragment_matches_requirement(fragment: &FragmentChange, requirement: &Fragmen
 
 fn missing_fragment_requirements(
     repo: &Repository,
-    _commit: &CommitId,
     paths: &[PathBuf],
     section_patterns: &[(&str, GlobSet)],
 ) -> MissingFragmentRequirements {
@@ -1155,17 +1401,27 @@ fn missing_fragment_requirements(
     }
 }
 
-fn missing_fragment_message(commit: &CommitId, requirement: &MissingFragmentRequirement) -> String {
+fn missing_fragment_message(
+    subject: &str,
+    requirement: &MissingFragmentRequirement,
+    mode: MissingFragmentMode,
+) -> String {
     let paths = path_sample(&requirement.paths);
     let scope = match &requirement.target {
         FragmentTarget::Repository => String::from("repository"),
         FragmentTarget::Section(section) => format!("section {section:?}"),
     };
-    format!(
-        "{}: missing changelog fragment for {scope}; affected paths: {paths}; run `{}` or add `Changelog: none` to the commit message",
-        commit.as_str(),
-        requirement.suggested_command()
-    )
+    let remedy = match mode {
+        MissingFragmentMode::Commit => format!(
+            "run `{}` or add `Changelog: none` to the commit message",
+            requirement.suggested_command()
+        ),
+        MissingFragmentMode::Staged => format!(
+            "run `{}` and stage the fragment; commit-message escape hatches apply in the installed commit hook and in `sacho check --base`",
+            requirement.suggested_command()
+        ),
+    };
+    format!("{subject}: missing changelog fragment for {scope}; affected paths: {paths}; {remedy}")
 }
 
 fn path_sample(paths: &[PathBuf]) -> String {
@@ -1223,6 +1479,12 @@ struct MissingFragmentRequirement {
 struct MissingFragmentReport {
     violations: Vec<CheckViolation>,
     skipped: Vec<SkippedCheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingFragmentMode {
+    Commit,
+    Staged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -2053,14 +2315,58 @@ fn gitattributes_path_end(line: &str) -> Option<usize> {
     }
 }
 
+fn install_commit_hooks(
+    root: &Path,
+    append_existing_hook: bool,
+    result: &mut InitResult,
+) -> Result<()> {
+    install_git_hook(
+        root,
+        "pre-commit",
+        "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n",
+        append_existing_hook,
+        result,
+    )?;
+    install_git_hook(
+        root,
+        "commit-msg",
+        "# sacho commit-msg begin\nsacho hook-commit-msg \"$1\"\n# sacho commit-msg end\n",
+        append_existing_hook,
+        result,
+    )?;
+    install_git_hook(
+        root,
+        "reference-transaction",
+        "# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        sacho hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n",
+        append_existing_hook,
+        result,
+    )
+}
+
+#[cfg(test)]
 fn install_pre_commit_hook(
     root: &Path,
     append_existing_hook: bool,
     result: &mut InitResult,
 ) -> Result<()> {
-    let hook_path = pre_commit_hook_path(root)?;
+    install_git_hook(
+        root,
+        "pre-commit",
+        "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n",
+        append_existing_hook,
+        result,
+    )
+}
+
+fn install_git_hook(
+    root: &Path,
+    hook_name: &str,
+    block: &str,
+    append_existing_hook: bool,
+    result: &mut InitResult,
+) -> Result<()> {
+    let hook_path = git_hook_path(root, hook_name)?;
     let reported_path = report_path(root, &hook_path);
-    let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
     let old = match fs::read_to_string(&hook_path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -2087,7 +2393,7 @@ fn install_pre_commit_hook(
             });
         }
     };
-    let edited = edit_pre_commit_hook(&old, block, append_existing_hook).ok_or_else(|| {
+    let edited = edit_marked_hook(&old, block, append_existing_hook).ok_or_else(|| {
         Error::HookNeedsManualInstall {
             path: reported_path.clone(),
         }
@@ -2105,24 +2411,24 @@ fn install_pre_commit_hook(
     Ok(())
 }
 
-fn pre_commit_hook_path(root: &Path) -> Result<PathBuf> {
+fn git_hook_path(root: &Path, hook_name: &str) -> Result<PathBuf> {
     if let Ok(path) = git_output(root, ["config", "--path", "--get", "core.hooksPath"]) {
         let path = path.trim();
         if !path.is_empty() {
-            return Ok(resolve_git_path(root, path).join("pre-commit"));
+            return Ok(resolve_git_path(root, path).join(hook_name));
         }
     }
 
     let common_dir = git_output(root, ["rev-parse", "--git-common-dir"])?;
     Ok(resolve_git_path(root, common_dir.trim())
         .join("hooks")
-        .join("pre-commit"))
+        .join(hook_name))
 }
 
-fn resolve_git_path(root: &Path, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
+fn resolve_git_path(root: &Path, path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
     if path.is_absolute() {
-        path
+        path.to_path_buf()
     } else {
         root.join(path)
     }
@@ -2155,9 +2461,14 @@ fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn edit_pre_commit_hook(source: &str, block: &str, append_existing: bool) -> Option<String> {
-    let begin = "# sacho pre-commit begin";
-    let end = "# sacho pre-commit end";
+    edit_marked_hook(source, block, append_existing)
+}
+
+fn edit_marked_hook(source: &str, block: &str, append_existing: bool) -> Option<String> {
+    let begin = block.lines().next()?;
+    let end = block.lines().next_back()?;
     match (source.find(begin), source.find(end)) {
         (Some(begin_index), Some(end_index)) if begin_index <= end_index => {
             let end_index = end_index + end.len();
@@ -2293,7 +2604,7 @@ mod tests {
 
     use super::*;
     use crate::FragmentError;
-    use crate::vcs::ChangeKind;
+    use crate::vcs::{ChangeKind, CommitId};
 
     #[derive(Debug, Clone)]
     struct FakeCommit {
@@ -2437,6 +2748,58 @@ mod tests {
                 .expect("changelog")
                 .contains("To be released.")
         );
+    }
+
+    #[test]
+    fn init_reports_manual_hook_action_for_non_git_preset() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nmaterialize = false\n\n[vcs]\npreset = \"none\"\n",
+        )
+        .expect("config");
+
+        let result = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: true,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        assert_eq!(result.manual_actions_required.len(), 1);
+        assert!(result.manual_actions_required[0].contains("vcs.preset = \"git\""));
+    }
+
+    #[test]
+    fn init_reports_manual_hook_action_outside_git_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nmaterialize = false\n",
+        )
+        .expect("config");
+
+        let result = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: true,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        assert_eq!(result.manual_actions_required.len(), 1);
+        assert!(result.manual_actions_required[0].contains("requires a Git repository"));
     }
 
     #[test]
@@ -2602,19 +2965,19 @@ mod tests {
     #[test]
     fn hook_marker_replacement_preserves_unrelated_content() {
         let source = "#!/bin/sh\necho before\n# sacho pre-commit begin\nold\n# sacho pre-commit end\necho after\n";
-        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+        let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
 
         let edited = edit_pre_commit_hook(source, block, false).expect("edit");
 
         assert_eq!(
             edited,
-            "#!/bin/sh\necho before\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\necho after\n"
+            "#!/bin/sh\necho before\n# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\necho after\n"
         );
     }
 
     #[test]
     fn hook_edit_rejects_unmarked_hook_when_append_is_false() {
-        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+        let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
 
         assert_eq!(edit_pre_commit_hook("#!/bin/sh\n", block, false), None);
     }
@@ -2622,21 +2985,138 @@ mod tests {
     #[test]
     fn hook_edit_rejects_reversed_marker_order() {
         let source = "# sacho pre-commit end\nold\n# sacho pre-commit begin\n";
-        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+        let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
 
         assert_eq!(edit_pre_commit_hook(source, block, false), None);
     }
 
     #[test]
     fn hook_append_separates_block_from_existing_content() {
-        let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+        let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
 
         let edited = edit_pre_commit_hook("#!/bin/sh", block, true).expect("append");
 
         assert_eq!(
             edited,
-            "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+            "#!/bin/sh\n# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n"
         );
+    }
+
+    #[test]
+    fn commit_hook_state_rejects_malformed_content() {
+        for value in [
+            "",
+            "head -\n",
+            "tree abc\n",
+            "head -\ntree \n",
+            "head -\ntree abc\nextra\n",
+        ] {
+            assert!(CommitHookState::decode(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn reference_transaction_matches_the_armed_commit() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), ["init"]).expect("git init");
+        git(temp.path(), ["config", "user.email", "test@example.com"]).expect("configure email");
+        git(temp.path(), ["config", "user.name", "Test User"]).expect("configure name");
+        fs::write(temp.path().join("README.md"), "initial\n").expect("readme");
+        git(temp.path(), ["add", "README.md"]).expect("stage readme");
+        git(temp.path(), ["commit", "-m", "Initial"]).expect("initial commit");
+        let vcs = GitVcs::new(temp.path());
+        let head = vcs.head().expect("head lookup").expect("head");
+        let tree = vcs.index_tree().expect("index tree");
+        let commit = git_output(
+            temp.path(),
+            ["commit-tree", &tree, "-p", &head, "-m", "Candidate"],
+        )
+        .expect("candidate commit");
+        let commit = commit.trim();
+        let state = CommitHookState {
+            head: Some(head.clone()),
+            tree,
+        };
+
+        let selected = reference_transaction_commit(
+            &vcs,
+            &state,
+            &format!("{head} {commit} refs/heads/main\n"),
+        )
+        .expect("select commit");
+
+        assert_eq!(selected.as_deref(), Some(commit));
+        assert_eq!(
+            reference_transaction_commit(&vcs, &state, &format!("{head} {commit} HEAD\n"))
+                .expect("select detached HEAD commit")
+                .as_deref(),
+            Some(commit)
+        );
+        assert_eq!(
+            reference_transaction_commit(
+                &vcs,
+                &state,
+                &format!("{} {commit} refs/heads/main\n", "0".repeat(head.len())),
+            )
+            .expect("ignore other update"),
+            None
+        );
+        assert_eq!(
+            reference_transaction_commit(&vcs, &state, &format!("{head} {commit} refs/tags/v1\n"),)
+                .expect("ignore tag update"),
+            None
+        );
+    }
+
+    #[test]
+    fn reference_transaction_ignores_non_prepared_phases_without_consuming_state() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        git(temp.path(), ["init"]).expect("git init");
+        git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
+        commit_message_hook(&repo, Path::new("COMMIT_EDITMSG")).expect("arm hook");
+        let state_path = commit_hook_state_path(repo.root()).expect("state path");
+
+        let report =
+            reference_transaction_hook(&repo, "preparing", "").expect("ignore preparing phase");
+
+        assert_eq!(report, None);
+        assert!(state_path.is_file());
+    }
+
+    #[test]
+    fn reference_transaction_propagates_state_read_errors() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        git(temp.path(), ["init"]).expect("git init");
+        let state_path = commit_hook_state_path(repo.root()).expect("state path");
+        fs::create_dir(&state_path).expect("state directory");
+
+        let error =
+            reference_transaction_hook(&repo, "prepared", "").expect_err("state read should fail");
+
+        assert!(matches!(error, Error::ReadFile { path, .. } if path == state_path));
+    }
+
+    #[test]
+    fn unborn_head_matches_only_a_nonempty_zero_object_id() {
+        assert!(matches_commit_head(
+            "0000000000000000000000000000000000000000",
+            None
+        ));
+        assert!(!matches_commit_head("", None));
+        assert!(!matches_commit_head(
+            "1000000000000000000000000000000000000000",
+            None
+        ));
     }
 
     #[test]
@@ -2654,7 +3134,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("hook"),
-            "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+            "#!/bin/sh\n# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n"
         );
         assert_eq!(
             result.modified_files,
@@ -2697,7 +3177,7 @@ mod tests {
 
         #[test]
         fn hook_marker_replacement_is_idempotent(prefix in "([A-Za-z0-9_ -]+\n){0,5}", suffix in "([A-Za-z0-9_ -]+\n){0,5}") {
-            let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+            let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
             let source = format!("{prefix}# sacho pre-commit begin\nold command\n# sacho pre-commit end\n{suffix}");
             let once = edit_pre_commit_hook(&source, block, false).expect("first edit");
             let twice = edit_pre_commit_hook(&once, block, false).expect("second edit");
@@ -2707,11 +3187,21 @@ mod tests {
 
         #[test]
         fn hook_append_preserves_existing_content(source in "([A-Za-z0-9_ -]+\n){1,5}") {
-            let block = "# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n";
+            let block = "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n";
             let edited = edit_pre_commit_hook(&source, block, true).expect("append");
 
             prop_assert!(edited.starts_with(&source));
             prop_assert!(edited.contains(block));
+        }
+
+        #[test]
+        fn commit_hook_state_round_trips(
+            head in prop::option::of("[0-9a-f]{40}"),
+            tree in "[0-9a-f]{40}",
+        ) {
+            let state = CommitHookState { head, tree };
+
+            prop_assert_eq!(CommitHookState::decode(&state.encode()).expect("decode"), state);
         }
     }
 
@@ -4101,6 +4591,7 @@ priority: 0
             CheckOptions {
                 fix: true,
                 base: None,
+                staged: false,
             },
         )
         .expect("check --fix");
@@ -4154,9 +4645,9 @@ priority: 0
 
         assert!(report.is_clean());
         assert!(report.skipped.iter().any(|skipped| {
-            skipped
-                .message
-                .contains("missing-fragment check skipped because --base was not supplied")
+            skipped.message.contains(
+                "missing-fragment check skipped because neither --base nor --staged was supplied",
+            )
         }));
     }
 
@@ -4207,6 +4698,119 @@ priority: 0
                 .message
                 .contains("missing-fragment check skipped because check.paths is empty")
         }));
+    }
+
+    #[test]
+    fn staged_layer_three_requires_a_staged_fragment_and_ignores_unstaged_source() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        git(temp.path(), ["init"]).expect("git init");
+        git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
+        git(
+            temp.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "Initial config",
+            ],
+        )
+        .expect("initial commit");
+        fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        fs::write(temp.path().join("src/lib.rs"), "pub fn changed() {}\n").expect("source");
+        git(temp.path(), ["add", "src/lib.rs"]).expect("stage source");
+        let vcs = GitVcs::new(temp.path());
+
+        let missing = staged_missing_fragment_violations(&repo, &vcs).expect("staged check");
+        assert_eq!(missing.violations.len(), 1);
+        assert!(missing.violations[0].message.starts_with("staged changes:"));
+        assert!(!missing.violations[0].message.contains("Changelog: none"));
+
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/changed.md"),
+            " -  Changed public behavior.\n",
+        )
+        .expect("fragment");
+        let unstaged_fragment =
+            staged_missing_fragment_violations(&repo, &vcs).expect("unstaged fragment check");
+        assert_eq!(unstaged_fragment.violations.len(), 1);
+
+        git(temp.path(), ["add", "changes.d/changed.md"]).expect("stage fragment");
+        fs::write(
+            temp.path().join("src/unstaged.rs"),
+            "pub fn unrelated() {}\n",
+        )
+        .expect("unstaged source");
+        let covered = staged_missing_fragment_violations(&repo, &vcs).expect("covered check");
+        assert!(covered.violations.is_empty());
+    }
+
+    #[test]
+    fn staged_layer_three_enforces_section_attribution() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+            paths = ["packages/core/**"]
+
+            [[sections]]
+            id = "logtape"
+            directory = "logtape"
+            paths = ["packages/logtape/**"]
+            "#,
+        );
+        git(temp.path(), ["init"]).expect("git init");
+        git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
+        git(
+            temp.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "Initial config",
+            ],
+        )
+        .expect("initial commit");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("source dir");
+        fs::create_dir_all(temp.path().join("changes.d/logtape")).expect("fragment dir");
+        fs::write(
+            temp.path().join("packages/core/lib.rs"),
+            "pub fn changed() {}\n",
+        )
+        .expect("source");
+        fs::write(
+            temp.path().join("changes.d/logtape/changed.md"),
+            " -  Changed LogTape behavior.\n",
+        )
+        .expect("fragment");
+        git(temp.path(), ["add", "."]).expect("stage changes");
+
+        let report = staged_missing_fragment_violations(&repo, &GitVcs::new(temp.path()))
+            .expect("staged check");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.contains("section \"core\""));
     }
 
     #[test]

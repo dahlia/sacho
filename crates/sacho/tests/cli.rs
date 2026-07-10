@@ -19,6 +19,19 @@ fn help_lists_commands() {
 }
 
 #[test]
+fn check_rejects_base_with_staged_mode() {
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .args(["check", "--base", "main", "--staged"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "the argument '--base <BASE>' cannot be used with '--staged'",
+        ));
+}
+
+#[test]
 fn init_scaffolds_empty_git_repository() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     git(temp.path(), ["init"]);
@@ -77,7 +90,16 @@ fn init_install_hook_writes_marked_hook() {
 
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("hook"),
-        "#!/bin/sh\n# sacho pre-commit begin\nsacho check\n# sacho pre-commit end\n"
+        "#!/bin/sh\n# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".git/hooks/commit-msg")).expect("commit hook"),
+        "#!/bin/sh\n# sacho commit-msg begin\nsacho hook-commit-msg \"$1\"\n# sacho commit-msg end\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".git/hooks/reference-transaction"))
+            .expect("reference hook"),
+        "#!/bin/sh\n# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        sacho hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n"
     );
 }
 
@@ -96,6 +118,12 @@ fn init_install_hook_honors_core_hooks_path() {
         .stdout(predicate::str::contains("created .githooks/pre-commit"));
 
     assert!(temp.path().join(".githooks/pre-commit").is_file());
+    assert!(temp.path().join(".githooks/commit-msg").is_file());
+    assert!(
+        temp.path()
+            .join(".githooks/reference-transaction")
+            .is_file()
+    );
     assert!(!temp.path().join(".git/hooks/pre-commit").exists());
 }
 
@@ -124,6 +152,8 @@ fn init_install_hook_works_from_git_worktree() {
         .success();
 
     assert!(main.join(".git/hooks/pre-commit").is_file());
+    assert!(main.join(".git/hooks/commit-msg").is_file());
+    assert!(main.join(".git/hooks/reference-transaction").is_file());
     assert!(!worktree.join(".git/hooks/pre-commit").exists());
 }
 
@@ -1171,12 +1201,391 @@ paths = [\"src/**\"]
         .stderr(predicate::str::contains("Changelog: none"));
 }
 
-fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
+#[cfg(unix)]
+#[test]
+fn installed_pre_commit_hook_enforces_staged_missing_fragments() {
+    let temp = initialized_hook_repository();
+
+    std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn changed() {}\n").expect("source");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    let missing = git_with_sacho(temp.path(), ["commit", "-m", "Change API"]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing changelog fragment"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    std::fs::write(
+        temp.path().join("changes.d/changed.md"),
+        " -  Changed public behavior.\n",
+    )
+    .expect("fragment");
+    assert!(
+        !git_with_sacho(temp.path(), ["commit", "-m", "Change API"])
+            .status
+            .success()
+    );
+
+    git(temp.path(), ["add", "changes.d/changed.md"]);
+    std::fs::write(
+        temp.path().join("src/unstaged.rs"),
+        "pub fn unrelated() {}\n",
+    )
+    .expect("unstaged source");
+    let covered = git_with_sacho(temp.path(), ["commit", "-m", "Change API"]);
+    assert!(
+        covered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&covered.stderr)
+    );
+
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn changed() { todo!() }\n",
+    )
+    .expect("amended source");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    let amended = git_with_sacho(temp.path(), ["commit", "--amend", "--no-edit"]);
+    assert!(
+        amended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&amended.stderr)
+    );
+
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn changed() {}\n")
+        .expect("new source change");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    assert!(
+        !git_with_sacho(temp.path(), ["commit", "-m", "Change API again"])
+            .status
+            .success()
+    );
+    let exempt = git_with_sacho(
+        temp.path(),
+        ["commit", "-m", "Refactor API\n\nChangelog: none"],
+    );
+    assert!(
+        exempt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exempt.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_ignore_incoming_changes_in_a_clean_merge() {
+    let temp = initialized_hook_repository();
+    let initial_branch = git_output(temp.path(), ["branch", "--show-current"]);
+    git(temp.path(), ["switch", "-c", "feature"]);
+    std::fs::create_dir_all(temp.path().join("src")).expect("source dir");
+    std::fs::write(
+        temp.path().join("src/incoming.rs"),
+        "pub fn incoming() {}\n",
+    )
+    .expect("incoming source");
+    git(temp.path(), ["add", "src/incoming.rs"]);
+    assert!(
+        git_with_sacho(
+            temp.path(),
+            ["commit", "-m", "Incoming API\n\nChangelog: none"],
+        )
+        .status
+        .success()
+    );
+
+    git(temp.path(), ["switch", initial_branch.trim()]);
+    std::fs::write(temp.path().join("README.md"), "main branch\n").expect("readme");
+    git(temp.path(), ["add", "README.md"]);
+    assert!(
+        git_with_sacho(temp.path(), ["commit", "-m", "Update readme"])
+            .status
+            .success()
+    );
+
+    let merged = git_with_sacho(
+        temp.path(),
+        ["merge", "--no-ff", "feature", "-m", "Merge feature"],
+    );
+
+    assert!(
+        merged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_do_not_use_an_incoming_fragment_for_merge_resolution() {
+    let temp = initialized_hook_repository();
+    std::fs::create_dir_all(temp.path().join("src")).expect("source dir");
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 0 }\n",
+    )
+    .expect("initial source");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    assert!(
+        git_with_sacho(
+            temp.path(),
+            ["commit", "-m", "Initial API\n\nChangelog: none"],
+        )
+        .status
+        .success()
+    );
+    let initial_branch = git_output(temp.path(), ["branch", "--show-current"]);
+
+    git(temp.path(), ["switch", "-c", "feature"]);
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .expect("feature source");
+    std::fs::write(
+        temp.path().join("changes.d/feature.md"),
+        " -  Changed the value API.\n",
+    )
+    .expect("feature fragment");
+    git(temp.path(), ["add", "src/lib.rs", "changes.d/feature.md"]);
+    assert!(
+        git_with_sacho(temp.path(), ["commit", "-m", "Change value API"])
+            .status
+            .success()
+    );
+
+    git(temp.path(), ["switch", initial_branch.trim()]);
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 2 }\n",
+    )
+    .expect("main source");
+    git(temp.path(), ["add", "src/lib.rs"]);
+    assert!(
+        git_with_sacho(
+            temp.path(),
+            ["commit", "-m", "Adjust value API\n\nChangelog: none"],
+        )
+        .status
+        .success()
+    );
+    let merge = git_with_sacho(temp.path(), ["merge", "feature"]);
+    assert!(!merge.status.success(), "merge should conflict");
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 3 }\n",
+    )
+    .expect("merge resolution");
+    git(temp.path(), ["add", "src/lib.rs"]);
+
+    let commit = git_with_sacho(temp.path(), ["commit", "-m", "Resolve value API"]);
+
+    assert!(!commit.status.success());
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("missing changelog fragment"),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_do_not_treat_reused_head_message_as_amend() {
+    let temp = initialized_hook_repository();
+    std::fs::create_dir_all(temp.path().join("src")).expect("source dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn first() {}\n").expect("source");
+    std::fs::write(
+        temp.path().join("changes.d/first.md"),
+        " -  Added the first API.\n",
+    )
+    .expect("fragment");
+    git(temp.path(), ["add", "src/lib.rs", "changes.d/first.md"]);
+    assert!(
+        git_with_sacho(temp.path(), ["commit", "-m", "Add first API"])
+            .status
+            .success()
+    );
+    std::fs::write(temp.path().join("src/second.rs"), "pub fn second() {}\n")
+        .expect("second source");
+    git(temp.path(), ["add", "src/second.rs"]);
+
+    let reused = git_with_sacho(temp.path(), ["commit", "-C", "HEAD"]);
+
+    assert!(!reused.status.success());
+    assert!(
+        String::from_utf8_lossy(&reused.stderr).contains("missing changelog fragment"),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_ignore_escape_markers_in_verbose_diff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = initialized_hook_repository();
+    std::fs::create_dir_all(temp.path().join("src")).expect("source dir");
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "// [changelog skip]\npub fn changed() {}\n",
+    )
+    .expect("source");
+    std::fs::write(
+        temp.path().join("message.txt"),
+        "# Commit message template\n",
+    )
+    .expect("template");
+    let editor = temp.path().join("editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\ntmp=\"$1.sacho-editor\"\n{ printf 'Change API\\n'; cat \"$1\"; } > \"$tmp\"\nmv \"$tmp\" \"$1\"\n",
+    )
+    .expect("editor");
+    let mut permissions = std::fs::metadata(&editor)
+        .expect("editor metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&editor, permissions).expect("editor permissions");
+    git(temp.path(), ["add", "src/lib.rs"]);
+
+    let commit = git_with_sacho_env(
+        temp.path(),
+        ["commit", "-v", "-t", "message.txt"],
+        [("GIT_EDITOR", editor.to_str().expect("editor path"))],
+    );
+
+    assert!(!commit.status.success());
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("missing changelog fragment"),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_hooks_accept_configured_non_utf8_commit_encoding() {
+    let temp = initialized_hook_repository();
+    git(temp.path(), ["config", "i18n.commitEncoding", "ISO-8859-1"]);
+    std::fs::create_dir_all(temp.path().join("src")).expect("source dir");
+    std::fs::write(temp.path().join("src/lib.rs"), "pub fn cafe() {}\n").expect("source");
+    std::fs::write(
+        temp.path().join("changes.d/cafe.md"),
+        " -  Added the cafe API.\n",
+    )
+    .expect("fragment");
+    std::fs::write(
+        temp.path().join("message.bin"),
+        b"Add the caf\xe9 API\n" as &[u8],
+    )
+    .expect("encoded message");
+    git(temp.path(), ["add", "src/lib.rs", "changes.d/cafe.md"]);
+
+    let commit = git_with_sacho(temp.path(), ["commit", "-F", "message.bin"]);
+
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    assert!(
+        git_output(temp.path(), ["cat-file", "commit", "HEAD"]).contains("encoding ISO-8859-1")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reference_transaction_hook_ignores_non_commit_ref_updates_without_sacho() {
+    let temp = initialized_hook_repository();
     let output = ProcessCommand::new("git")
-        .current_dir(dir)
-        .args(args)
+        .current_dir(temp.path())
+        .args(["branch", "other"])
+        .env("PATH", "/usr/bin:/bin")
         .output()
-        .expect("git command");
+        .expect("git branch");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn initialized_hook_repository() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "\
+[changelog]
+materialize = false
+
+[check]
+paths = [\"src/**\"]
+",
+    )
+    .expect("config");
+    git(temp.path(), ["init"]);
+    git(temp.path(), ["config", "user.email", "test@example.com"]);
+    git(temp.path(), ["config", "user.name", "Test User"]);
+    let mut init = Command::cargo_bin("sacho").expect("binary");
+    init.current_dir(temp.path())
+        .args(["init", "--no-interactive", "--install-hook"])
+        .assert()
+        .success();
+    assert!(temp.path().join(".git/hooks/commit-msg").is_file());
+    assert!(
+        temp.path()
+            .join(".git/hooks/reference-transaction")
+            .is_file()
+    );
+    git(temp.path(), ["add", "."]);
+    let initial = git_with_sacho(temp.path(), ["commit", "-m", "Initial config"]);
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    temp
+}
+
+#[cfg(unix)]
+fn git_with_sacho<const N: usize>(dir: &std::path::Path, args: [&str; N]) -> std::process::Output {
+    git_with_sacho_env(dir, args, [] as [(&str, &str); 0])
+}
+
+#[cfg(unix)]
+fn git_with_sacho_env<const N: usize, const E: usize>(
+    dir: &std::path::Path,
+    args: [&str; N],
+    env: [(&str, &str); E],
+) -> std::process::Output {
+    let mut command = ProcessCommand::new("git");
+    command.current_dir(dir).args(args).envs(env);
+    add_sacho_to_path(&mut command);
+    command.output().expect("git command with Sacho hooks")
+}
+
+#[cfg(unix)]
+fn add_sacho_to_path(command: &mut ProcessCommand) {
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_sacho"));
+    let mut paths = vec![binary.parent().expect("binary directory").to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command.env("PATH", std::env::join_paths(paths).expect("PATH"));
+}
+
+#[cfg(not(unix))]
+fn add_sacho_to_path(_command: &mut ProcessCommand) {}
+
+fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
+    let mut command = ProcessCommand::new("git");
+    command.current_dir(dir).args(args);
+    add_sacho_to_path(&mut command);
+    let output = command.output().expect("git command");
     assert!(
         output.status.success(),
         "git failed: {}",
@@ -1185,11 +1594,10 @@ fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
 }
 
 fn git_output<const N: usize>(dir: &std::path::Path, args: [&str; N]) -> String {
-    let output = ProcessCommand::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("git command");
+    let mut command = ProcessCommand::new("git");
+    command.current_dir(dir).args(args);
+    add_sacho_to_path(&mut command);
+    let output = command.output().expect("git command");
     assert!(
         output.status.success(),
         "git failed: {}",

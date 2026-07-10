@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
 
@@ -44,6 +45,139 @@ impl GitVcs {
         Self {
             root: root.as_ref().to_path_buf(),
         }
+    }
+
+    /// Returns repository-relative paths changed in the staged index.
+    pub fn staged_paths(&self) -> Result<Vec<ChangedPath>> {
+        let head = self.head()?;
+        let merge_heads = self.merge_heads()?;
+        if merge_heads.is_empty() {
+            self.staged_paths_against(head.as_deref(), true)
+        } else {
+            let mut parents = Vec::with_capacity(merge_heads.len() + 1);
+            parents.extend(head);
+            parents.extend(merge_heads);
+            self.staged_paths_for_merge(&parents)
+        }
+    }
+
+    pub(crate) fn head(&self) -> Result<Option<String>> {
+        let command = String::from("git rev-parse --verify -q HEAD");
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|source| Error::VcsCommandIo {
+                command: command.clone(),
+                source,
+            })?;
+        if output.status.success() {
+            Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            ))
+        } else if output.status.code() == Some(1) {
+            Ok(None)
+        } else {
+            Err(Error::VcsCommandFailed {
+                command,
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            })
+        }
+    }
+
+    pub(crate) fn index_tree(&self) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.git(["write-tree"])?)
+            .trim()
+            .to_owned())
+    }
+
+    pub(crate) fn commit_tree(&self, commit: &str) -> Result<String> {
+        let revision = format!("{commit}^{{tree}}");
+        Ok(
+            String::from_utf8_lossy(&self.git(["rev-parse", "--verify", &revision])?)
+                .trim()
+                .to_owned(),
+        )
+    }
+
+    fn staged_paths_for_merge(&self, parents: &[String]) -> Result<Vec<ChangedPath>> {
+        let Some((first, rest)) = parents.split_first() else {
+            return Ok(Vec::new());
+        };
+        let mut paths = self.staged_paths_against(Some(first), false)?;
+        for parent in rest {
+            let changed = self
+                .staged_paths_against(Some(parent), false)?
+                .into_iter()
+                .map(|path| path.path)
+                .collect::<std::collections::HashSet<_>>();
+            paths.retain(|path| changed.contains(&path.path));
+        }
+        Ok(paths)
+    }
+
+    fn staged_paths_against(
+        &self,
+        base: Option<&str>,
+        detect_copies_and_renames: bool,
+    ) -> Result<Vec<ChangedPath>> {
+        let empty_tree;
+        let base = match base {
+            Some(base) => base,
+            None => {
+                empty_tree = self.empty_tree()?;
+                empty_tree.trim()
+            }
+        };
+        let mut args = vec!["diff", "--cached", "--name-status"];
+        if detect_copies_and_renames {
+            args.extend(["--find-renames", "--find-copies", "--find-copies-harder"]);
+        }
+        args.extend(["-z", base, "--"]);
+        let output = self.git(args)?;
+        Ok(parse_name_status_paths(&output))
+    }
+
+    fn merge_heads(&self) -> Result<Vec<String>> {
+        let output = self.git(["rev-parse", "--git-path", "MERGE_HEAD"])?;
+        let path = PathBuf::from(String::from_utf8_lossy(&output).trim());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        };
+        match fs::read_to_string(&path) {
+            Ok(contents) => Ok(contents
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(source) => Err(Error::ReadFile { path, source }),
+        }
+    }
+
+    fn empty_tree(&self) -> Result<String> {
+        let command = String::from("git mktree");
+        let output = Command::new("git")
+            .arg("mktree")
+            .current_dir(&self.root)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|source| Error::VcsCommandIo {
+                command: command.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(Error::VcsCommandFailed {
+                command,
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
@@ -349,6 +483,107 @@ mod tests {
     }
 
     #[test]
+    fn git_vcs_reports_only_staged_paths_with_similarity_metadata() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        init_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        std::fs::write(temp.path().join("src/old.rs"), "pub fn old() {}\n").expect("old");
+        std::fs::write(temp.path().join("src/copy.rs"), "pub fn copy() {}\n").expect("copy");
+        std::fs::write(temp.path().join("src/delete.rs"), "pub fn delete() {}\n").expect("delete");
+        git(temp.path(), ["add", "src"]);
+        git(temp.path(), ["commit", "-m", "Initial source"]);
+
+        git(temp.path(), ["mv", "src/old.rs", "src/renamed.rs"]);
+        std::fs::copy(
+            temp.path().join("src/copy.rs"),
+            temp.path().join("src/copied.rs"),
+        )
+        .expect("copy source");
+        git(temp.path(), ["add", "src/copied.rs"]);
+        git(temp.path(), ["rm", "src/delete.rs"]);
+        std::fs::write(
+            temp.path().join("src/unstaged.rs"),
+            "pub fn unstaged() {}\n",
+        )
+        .expect("unstaged");
+        let paths = GitVcs::new(temp.path())
+            .staged_paths()
+            .expect("staged paths");
+
+        assert!(paths.contains(&ChangedPath::with_old_path_and_similarity(
+            "src/copied.rs",
+            ChangeKind::Copied,
+            "src/copy.rs",
+            100
+        )));
+        assert!(paths.contains(&ChangedPath::with_old_path_and_similarity(
+            "src/renamed.rs",
+            ChangeKind::Renamed,
+            "src/old.rs",
+            100
+        )));
+        assert!(paths.contains(&ChangedPath::new("src/delete.rs", ChangeKind::Deleted)));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.path == Path::new("src/unstaged.rs"))
+        );
+    }
+
+    #[test]
+    fn git_vcs_reports_staged_paths_in_an_unborn_repository() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        init_repo(temp.path());
+        std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn initial() {}\n").expect("source");
+        git(temp.path(), ["add", "src/lib.rs"]);
+
+        let paths = GitVcs::new(temp.path())
+            .staged_paths()
+            .expect("staged paths");
+
+        assert_eq!(
+            paths,
+            vec![ChangedPath::new("src/lib.rs", ChangeKind::Added)]
+        );
+    }
+
+    #[test]
+    fn git_vcs_staged_paths_ignore_changes_unchanged_from_a_merge_parent() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        init_repo(temp.path());
+        std::fs::write(temp.path().join("README.md"), "initial\n").expect("readme");
+        git(temp.path(), ["add", "README.md"]);
+        git(temp.path(), ["commit", "-m", "Initial"]);
+        let initial_branch = git_output(temp.path(), ["branch", "--show-current"]);
+        git(temp.path(), ["switch", "-c", "feature"]);
+        std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
+        std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("source");
+        std::fs::write(
+            temp.path().join("changes.d/value.md"),
+            " -  Added value API.\n",
+        )
+        .expect("fragment");
+        git(temp.path(), ["add", "src/lib.rs", "changes.d/value.md"]);
+        git(temp.path(), ["commit", "-m", "Add value API"]);
+        git(temp.path(), ["switch", initial_branch.trim()]);
+        std::fs::write(temp.path().join("README.md"), "main\n").expect("main readme");
+        git(temp.path(), ["commit", "-am", "Change main"]);
+        git(temp.path(), ["merge", "--no-commit", "--no-ff", "feature"]);
+
+        let paths = GitVcs::new(temp.path())
+            .staged_paths()
+            .expect("staged merge paths");
+
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    #[test]
     fn git_vcs_reports_paths_for_root_commit() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("src")).expect("src dir");
@@ -463,7 +698,14 @@ mod tests {
             "pub fn value() -> u8 { 1 }\n",
         )
         .expect("feature source");
-        git(temp.path(), ["commit", "-am", "Change feature"]);
+        std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragment dir");
+        std::fs::write(
+            temp.path().join("changes.d/value.md"),
+            " -  Changed the value API.\n",
+        )
+        .expect("feature fragment");
+        git(temp.path(), ["add", "src/lib.rs", "changes.d/value.md"]);
+        git(temp.path(), ["commit", "-m", "Change feature"]);
         git(temp.path(), ["checkout", initial_branch.trim()]);
         std::fs::write(
             temp.path().join("src/lib.rs"),
@@ -478,6 +720,15 @@ mod tests {
         )
         .expect("resolved source");
         git(temp.path(), ["add", "src/lib.rs"]);
+        let staged = GitVcs::new(temp.path())
+            .staged_paths()
+            .expect("staged merge paths");
+        assert!(staged.contains(&ChangedPath::new("src/lib.rs", ChangeKind::Modified)));
+        assert!(
+            !staged
+                .iter()
+                .any(|path| path.path == Path::new("changes.d/value.md"))
+        );
         git(temp.path(), ["commit", "-m", "Merge feature"]);
         let merge_commit = git_output(temp.path(), ["rev-parse", "HEAD"]);
         let vcs = GitVcs::new(temp.path());

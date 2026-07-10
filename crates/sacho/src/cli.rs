@@ -1,13 +1,14 @@
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
-    AddOptions, CarryOptions, CheckOptions, CompileOptions, FormatOptions, InitOptions, InitResult,
-    NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment, apply_release, apply_sync,
-    carry, check, compile_unreleased, format_fragments, init_repository, plan_release, plan_sync,
+    AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
+    InitOptions, InitResult, NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment,
+    apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
+    format_fragments, init_repository, plan_release, plan_sync, reference_transaction_hook,
     set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
@@ -32,8 +33,8 @@ enum Command {
         #[arg(long, help = "Do not ask setup questions")]
         no_interactive: bool,
 
-        /// Install or update a pre-commit hook that runs sacho check.
-        #[arg(long, help = "Install a pre-commit hook")]
+        /// Install or update Git commit hooks that run Sacho checks.
+        #[arg(long, help = "Install Git commit hooks")]
         install_hook: bool,
     },
 
@@ -58,8 +59,20 @@ enum Command {
     /// Check fragments, materialized output, and missing-fragment policy.
     Check {
         /// Base revision for VCS-backed missing-fragment checks.
-        #[arg(long, help = "Base revision for missing-fragment checks")]
+        #[arg(
+            long,
+            conflicts_with = "staged",
+            help = "Base revision for missing-fragment checks"
+        )]
         base: Option<String>,
+
+        /// Check staged Git changes for missing fragments.
+        #[arg(
+            long,
+            conflicts_with = "base",
+            help = "Check the staged Git index for missing fragments"
+        )]
+        staged: bool,
 
         /// Repair mechanically fixable violations.
         #[arg(long, help = "Repair mechanically fixable violations")]
@@ -123,6 +136,18 @@ enum Command {
         #[arg(help = "Repository path being merged")]
         path: String,
     },
+
+    /// Run filesystem checks from Git's pre-commit hook.
+    #[command(hide = true)]
+    HookPreCommit,
+
+    /// Arm the final commit check from Git's commit-msg hook.
+    #[command(hide = true)]
+    HookCommitMsg { message_file: PathBuf },
+
+    /// Check the final commit from Git's reference-transaction hook.
+    #[command(hide = true)]
+    HookReferenceTransaction { phase: String },
 }
 
 impl Cli {
@@ -150,23 +175,10 @@ impl Cli {
                 println!("{}", result.path.display());
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Check { base, fix } => {
+            Command::Check { base, staged, fix } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let report = check(&repo, CheckOptions { base, fix })?;
-                for warning in &report.warnings {
-                    eprintln!("warning: {}", warning.message);
-                }
-                for skipped in &report.skipped {
-                    eprintln!("skipped: {}", skipped.message);
-                }
-                if report.is_clean() {
-                    Ok(ExitCode::SUCCESS)
-                } else {
-                    for violation in report.violations {
-                        eprintln!("{}", violation.message);
-                    }
-                    Ok(ExitCode::from(1))
-                }
+                let report = check(&repo, CheckOptions { base, staged, fix })?;
+                Ok(print_check_report(report, true))
             }
             Command::Fmt => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
@@ -226,7 +238,50 @@ impl Cli {
                 other,
                 path,
             } => run_merge_driver(original, current, other, path),
+            Command::HookPreCommit => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let report = check(&repo, CheckOptions::default())?;
+                Ok(print_check_report(report, false))
+            }
+            Command::HookCommitMsg { message_file } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                commit_message_hook(&repo, &message_file)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::HookReferenceTransaction { phase } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let mut updates = String::new();
+                io::stdin()
+                    .read_to_string(&mut updates)
+                    .map_err(|source| Error::ReadFile {
+                        path: PathBuf::from("standard input"),
+                        source,
+                    })?;
+                match reference_transaction_hook(&repo, &phase, &updates)? {
+                    Some(report) => Ok(print_check_report(report, false)),
+                    None => Ok(ExitCode::SUCCESS),
+                }
+            }
         }
+    }
+}
+
+fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
+    for warning in &report.warnings {
+        eprintln!("warning: {}", warning.message);
+    }
+    if show_skipped {
+        for skipped in &report.skipped {
+            eprintln!("skipped: {}", skipped.message);
+        }
+    }
+    if report.is_clean() {
+        ExitCode::SUCCESS
+    } else {
+        for violation in report.violations {
+            eprintln!("{}", violation.message);
+        }
+        ExitCode::from(1)
     }
 }
 
