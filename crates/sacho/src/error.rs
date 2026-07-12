@@ -139,6 +139,10 @@ pub enum Error {
     #[snafu(display("release version is required when the next-version file is absent or empty"))]
     MissingReleaseVersion,
 
+    /// No compiled changelog entries are available to release.
+    #[snafu(display("no changelog entries to release; add a fragment before releasing"))]
+    EmptyRelease,
+
     /// A release date was not a valid `YYYY-MM-DD` calendar date.
     #[snafu(display("invalid release date {date:?}; expected YYYY-MM-DD"))]
     InvalidReleaseDate {

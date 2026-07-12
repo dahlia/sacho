@@ -47,6 +47,9 @@ pub struct FragmentItem {
     /// Plain-text key used for deterministic sorting.
     pub sort_text: String,
 
+    /// Whether the item contains intentionally authored CommonMark content.
+    pub has_substantive_content: bool,
+
     /// Reference shortcut labels found in the item.
     pub references: Vec<ReferenceUse>,
 }
@@ -273,6 +276,7 @@ pub fn parse_fragment(
             .unwrap_or_default()
             .trim()
             .to_owned();
+        let substantive_content = has_substantive_content(item);
         let mut references = Vec::new();
         collect_references(item, link_templates, &mut references)?;
         references.sort();
@@ -281,6 +285,7 @@ pub fn parse_fragment(
             ordinal,
             markdown,
             sort_text,
+            has_substantive_content: substantive_content,
             references,
         });
     }
@@ -483,6 +488,45 @@ fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
             text
         }
     }
+}
+
+// Sacho checks whether an item contains intentionally authored CommonMark
+// content, not whether a particular browser would paint pixels for it. HTML
+// visibility depends on the renderer, sanitizer, user agent, and stylesheets,
+// so attempting to reproduce those rules here would be both incomplete and
+// outside Sacho's responsibility. Only whitespace and complete HTML comments
+// are treated as scaffolding; every other Markdown or raw HTML construct is
+// substantive.
+fn has_substantive_content<'a>(node: &'a AstNode<'a>) -> bool {
+    let data = node.data();
+    match &data.value {
+        NodeValue::Text(text) => !text.trim().is_empty(),
+        NodeValue::HtmlInline(source) => html_has_substantive_content(source),
+        NodeValue::HtmlBlock(block) => html_has_substantive_content(&block.literal),
+        NodeValue::Code(_)
+        | NodeValue::CodeBlock(_)
+        | NodeValue::FootnoteReference(_)
+        | NodeValue::Image(_)
+        | NodeValue::Link(_)
+        | NodeValue::Math(_)
+        | NodeValue::TaskItem(_)
+        | NodeValue::ThematicBreak => true,
+        _ => {
+            drop(data);
+            node.children().any(has_substantive_content)
+        }
+    }
+}
+
+fn html_has_substantive_content(source: &str) -> bool {
+    let mut rest = source.trim();
+    while let Some(comment) = rest.strip_prefix("<!--") {
+        let Some((_, remainder)) = comment.split_once("-->") else {
+            return true;
+        };
+        rest = remainder.trim_start();
+    }
+    !rest.is_empty()
 }
 
 fn collect_references<'a>(
@@ -831,6 +875,47 @@ mod tests {
     }
 
     #[test]
+    fn distinguishes_substantive_content_from_html_comments() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            " -  <!-- TODO: write this -->\n -  <!-- first --><!-- second -->\n -  <span hidden></span>\n -  ![](release.png)\n -  [](/release-artifact)\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert!(!fragment.items[0].has_substantive_content);
+        assert!(!fragment.items[1].has_substantive_content);
+        assert!(fragment.items[2].has_substantive_content);
+        assert!(fragment.items[3].has_substantive_content);
+        assert!(fragment.items[4].has_substantive_content);
+    }
+
+    #[test]
+    fn substantive_content_can_appear_after_an_empty_first_block() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            " -  <!-- TODO -->\n\n    **Visible text.**\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert!(fragment.items[0].has_substantive_content);
+    }
+
+    #[test]
+    fn html_comment_scaffolding_requires_complete_comments_only() {
+        assert!(!html_has_substantive_content(
+            "<!-- first --> <!-- second -->"
+        ));
+        assert!(html_has_substantive_content(
+            "<!-- comment --> <span></span>"
+        ));
+        assert!(html_has_substantive_content("<!-- unterminated"));
+    }
+
+    #[test]
     fn plain_text_handles_block_nodes() {
         let arena = Arena::new();
         let root = parse_document(
@@ -843,6 +928,7 @@ mod tests {
 
         assert_eq!(plain_text(code), "code literal\n");
         assert_eq!(plain_text(html), "<div>\nhtml literal\n</div>\n");
+        assert!(has_substantive_content(html));
 
         let arena = Arena::new();
         let root = parse_document(
@@ -853,7 +939,6 @@ mod tests {
         let paragraph = root.first_child().expect("paragraph");
         assert_eq!(plain_text(paragraph), "note");
     }
-
     #[test]
     fn collects_resolvable_references() {
         let fragment = parse_fragment(
@@ -1062,6 +1147,21 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn comment_sequences_are_scaffolding(
+            comments in prop::collection::vec("[a-z ]{0,20}", 1..8),
+        ) {
+            let scaffolding = comments
+                .iter()
+                .map(|comment| format!("<!--{comment}-->\n"))
+                .collect::<String>();
+
+            prop_assert!(!html_has_substantive_content(&scaffolding));
+            let content = format!("{scaffolding}<span></span>");
+            let is_substantive = html_has_substantive_content(&content);
+            prop_assert!(is_substantive);
+        }
+
         #[test]
         fn parses_frontmatter_priority(priority in -10_000_i32..10_000) {
             let source = format!("---\npriority: {priority}\n---\n -  Changed thing.\n");

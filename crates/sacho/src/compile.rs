@@ -49,6 +49,9 @@ pub struct CompiledRegion {
 
     /// Rendered sections included in the region.
     pub sections: Vec<CompiledSection>,
+
+    /// Number of compiled items that contain substantive CommonMark content.
+    pub substantive_item_count: usize,
 }
 
 /// Version label for an unreleased changelog region.
@@ -117,6 +120,7 @@ struct SortableItem {
     fragment_path: PathBuf,
     ordinal: usize,
     markdown: String,
+    has_substantive_content: bool,
     references: Vec<ReferenceUse>,
 }
 
@@ -132,6 +136,10 @@ pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<
         items.retain(|item| item.section.as_deref() == Some(section.as_str()));
     }
     items.sort_by(compare_items);
+    let substantive_item_count = items
+        .iter()
+        .filter(|item| item.has_substantive_content)
+        .count();
 
     let section_ids = ordered_sections(repo, &items);
     let mut sections = Vec::new();
@@ -160,6 +168,7 @@ pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<
         version_label,
         markdown,
         sections,
+        substantive_item_count,
     })
 }
 
@@ -235,6 +244,7 @@ fn sortable_items(fragments: Vec<Fragment>) -> Vec<SortableItem> {
                 fragment_path: fragment_path.clone(),
                 ordinal: item.ordinal,
                 markdown: item.markdown,
+                has_substantive_content: item.has_substantive_content,
                 references: item.references,
             })
         })
@@ -567,6 +577,19 @@ mod tests {
 
         assert_eq!(compiled.version_label, VersionLabel::Unreleased);
         assert!(compiled.markdown.starts_with("Unreleased\n----------\n"));
+    }
+
+    #[test]
+    fn excludes_scaffolds_from_substantive_item_count() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/scaffold.md"), " -  \n").expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(compiled.substantive_item_count, 0);
+        assert_eq!(compiled.sections.len(), 1);
+        assert!(compiled.markdown.ends_with("\n\n -\n"));
     }
 
     #[test]

@@ -689,6 +689,9 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
         None => ReleaseDate::today_utc(),
     };
     let compiled = compile_unreleased(repo, CompileOptions::default())?;
+    if compiled.substantive_item_count == 0 {
+        return Err(Error::EmptyRelease);
+    }
     let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
     let consumed_fragments = discover_fragment_candidates(repo)?
         .candidates
@@ -3481,6 +3484,183 @@ mod tests {
         );
         assert!(!temp.path().join("changes.d/add.md").exists());
         assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn release_rejects_empty_materialized_repository_without_changes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        let changelog =
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect_err("empty release");
+
+        assert_eq!(
+            error.to_string(),
+            "no changelog entries to release; add a fragment before releasing"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+    }
+
+    #[test]
+    fn release_rejects_empty_scaffold_fragment_without_changes() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/scaffold.md"), " -  \n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("empty release");
+
+        assert_eq!(
+            error.to_string(),
+            "no changelog entries to release; add a fragment before releasing"
+        );
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/scaffold.md")).expect("fragment"),
+            " -  \n"
+        );
+    }
+
+    #[test]
+    fn release_rejects_fragment_containing_only_html_comment() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let fragment = " -  <!-- TODO: write this -->\n";
+        fs::write(temp.path().join("changes.d/scaffold.md"), fragment).expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("comment-only release");
+
+        assert_eq!(
+            error.to_string(),
+            "no changelog entries to release; add a fragment before releasing"
+        );
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/scaffold.md")).expect("fragment"),
+            fragment
+        );
+    }
+
+    #[test]
+    fn release_accepts_substantive_non_text_content() {
+        for fragment in [
+            " -  ![](release.png)\n",
+            " -  <img src=\"release.png\" alt=\"Release diagram\">\n",
+            " -  <span hidden></span>\n",
+            " -  <script>void 0</script>\n",
+            " -  <div style=\"display: none\">Placeholder.</div>\n",
+            " -  <div>&nbsp;</div>\n",
+            " -  [](/release-artifact)\n",
+        ] {
+            let (temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                materialize = false
+                "#,
+            );
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            fs::write(temp.path().join("changes.d/content.md"), fragment).expect("fragment");
+
+            let plan = plan_release(
+                &repo,
+                ReleaseOptions {
+                    version: Some(String::from("1.2.0")),
+                    date: Some(String::from("2026-07-08")),
+                    next: None,
+                },
+            )
+            .expect("substantive content release");
+
+            assert!(plan.released_markdown.contains(fragment.trim_end()));
+        }
+    }
+
+    #[test]
+    fn release_rejects_repository_when_every_section_is_empty() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("core dir");
+        fs::create_dir_all(temp.path().join("changes.d/cli")).expect("cli dir");
+        fs::write(temp.path().join("changes.d/core/scaffold.md"), " -  \n").expect("core fragment");
+        fs::write(temp.path().join("changes.d/cli/scaffold.md"), " -  \n").expect("cli fragment");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("empty release");
+
+        assert_eq!(
+            error.to_string(),
+            "no changelog entries to release; add a fragment before releasing"
+        );
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert!(temp.path().join("changes.d/core/scaffold.md").exists());
+        assert!(temp.path().join("changes.d/cli/scaffold.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
     }
 
     #[test]
