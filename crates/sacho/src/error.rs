@@ -178,6 +178,16 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A synchronization plan no longer matches the changelog it was built from.
+    #[snafu(display(
+        "refusing to apply stale synchronization plan because {} changed after planning; run `sacho sync` again",
+        path.display()
+    ))]
+    StaleSyncPlan {
+        /// Changelog path that changed after the plan was prepared.
+        path: PathBuf,
+    },
+
     /// A changelog file could not be parsed or updated.
     #[snafu(display("invalid changelog region in {}: {source}", path.display()))]
     Changelog {

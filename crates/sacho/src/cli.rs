@@ -8,8 +8,8 @@ use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment,
     apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
-    format_fragments, init_repository, plan_release, plan_sync, reference_transaction_hook,
-    set_next_version,
+    format_fragments, init_repository, plan_release, plan_sync, prepare_check_fix,
+    reference_transaction_hook, set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use sacho::{Error, Repository};
@@ -177,7 +177,21 @@ impl Cli {
             }
             Command::Check { base, staged, fix } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let report = check(&repo, CheckOptions { base, staged, fix })?;
+                if fix {
+                    let prepared = prepare_check_fix(&repo)?;
+                    let Some(plan) = confirm_sync_plan(prepared.sync)? else {
+                        return Ok(ExitCode::from(2));
+                    };
+                    apply_sync(&repo, plan)?;
+                }
+                let report = check(
+                    &repo,
+                    CheckOptions {
+                        base,
+                        staged,
+                        fix: false,
+                    },
+                )?;
                 Ok(print_check_report(report, true))
             }
             Command::Fmt => {
@@ -200,13 +214,9 @@ impl Cli {
             Command::Sync { force } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let plan = plan_sync(&repo, SyncOptions { force })?;
-                if let SyncPlan::NeedsConfirmation { diff, .. } = &plan {
-                    eprint!("{diff}");
-                    eprintln!(
-                        "sync may discard hand edits in the materialized changelog; rerun with --force to apply"
-                    );
+                let Some(plan) = confirm_sync_plan(plan)? else {
                     return Ok(ExitCode::from(2));
-                }
+                };
                 apply_sync(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -283,6 +293,37 @@ fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
         }
         ExitCode::from(1)
     }
+}
+
+fn confirm_sync_plan(plan: SyncPlan) -> Result<Option<SyncPlan>, CliReport> {
+    let SyncPlan::NeedsConfirmation { diff, .. } = &plan else {
+        return Ok(Some(plan));
+    };
+
+    let interactive = sync_should_prompt(io::stdin().is_terminal(), io::stdout().is_terminal());
+    if interactive {
+        print!("{diff}");
+        println!(
+            "the synchronization shown above replaces the materialized unreleased region and may discard hand edits"
+        );
+    } else {
+        eprint!("{diff}");
+        eprintln!(
+            "the synchronization shown above replaces the materialized unreleased region and may discard hand edits"
+        );
+        eprintln!("rerun with `sacho sync --force` to apply it non-interactively");
+        return Ok(None);
+    }
+    if prompt_bool("Apply this synchronization", false)? {
+        Ok(Some(plan))
+    } else {
+        eprintln!("synchronization cancelled; the changelog was not changed");
+        Ok(None)
+    }
+}
+
+fn sync_should_prompt(stdin_terminal: bool, stdout_terminal: bool) -> bool {
+    stdin_terminal && stdout_terminal
 }
 
 fn run_merge_driver(
@@ -555,6 +596,14 @@ mod tests {
         assert_eq!(parse_bool_answer("N", true), Some(false));
         assert_eq!(parse_bool_answer("no", true), Some(false));
         assert_eq!(parse_bool_answer("maybe", true), None);
+    }
+
+    #[test]
+    fn sync_prompts_only_when_both_streams_are_terminals() {
+        assert!(sync_should_prompt(true, true));
+        assert!(!sync_should_prompt(true, false));
+        assert!(!sync_should_prompt(false, true));
+        assert!(!sync_should_prompt(false, false));
     }
 
     #[test]

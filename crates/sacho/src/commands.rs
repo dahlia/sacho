@@ -328,6 +328,16 @@ pub struct CheckReport {
     pub skipped: Vec<SkippedCheck>,
 }
 
+/// Mechanically applied Layer 1 fixes and the pending Layer 2 synchronization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCheckFix {
+    /// Fragment formatting changes applied while preparing the fix.
+    pub formatting: FormatResult,
+
+    /// Synchronization plan to be confirmed or applied by the caller.
+    pub sync: SyncPlan,
+}
+
 impl CheckReport {
     /// Returns the overall check status.
     pub fn status(&self) -> CheckStatus {
@@ -570,6 +580,12 @@ pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextR
 /// Formats all changelog fragments into normal form.
 pub fn format_fragments(repo: &Repository, _options: FormatOptions) -> Result<FormatResult> {
     ensure_materialized_current_before_mutation(repo)?;
+    let result = format_fragments_only(repo)?;
+    let _sync = sync_after_mutation(repo)?;
+    Ok(result)
+}
+
+fn format_fragments_only(repo: &Repository) -> Result<FormatResult> {
     let discovered = discover_fragment_candidates(repo)?;
     let mut changed = Vec::new();
 
@@ -596,7 +612,6 @@ pub fn format_fragments(repo: &Repository, _options: FormatOptions) -> Result<Fo
         }
     }
 
-    let _sync = sync_after_mutation(repo)?;
     Ok(FormatResult { changed })
 }
 
@@ -663,8 +678,28 @@ pub fn apply_sync(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
         return Ok(SyncResult { changed: false });
     }
 
+    let absolute_path = repo.resolve(&pending.path);
+    let current_contents =
+        fs::read_to_string(&absolute_path).map_err(|source| Error::ReadFile {
+            path: absolute_path,
+            source,
+        })?;
+    if current_contents != pending.old_contents {
+        return Err(Error::StaleSyncPlan { path: pending.path });
+    }
+
     repo.atomic_write(&pending.path, pending.new_contents.as_bytes())?;
     Ok(SyncResult { changed: true })
+}
+
+/// Applies Layer 1 formatting fixes and prepares, but does not apply, Layer 2 sync.
+///
+/// Callers are responsible for confirming [`SyncPlan::NeedsConfirmation`] before
+/// passing the returned plan to [`apply_sync`].
+pub fn prepare_check_fix(repo: &Repository) -> Result<PreparedCheckFix> {
+    let formatting = format_fragments_only(repo)?;
+    let sync = plan_sync(repo, SyncOptions { force: false })?;
+    Ok(PreparedCheckFix { formatting, sync })
 }
 
 /// Plans a release operation.
@@ -811,11 +846,16 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
         });
     }
     if options.fix {
-        ensure_materialized_current_before_mutation(repo)?;
-        format_fragments(repo, FormatOptions)?;
-        if repo.config().changelog.materialize {
-            let plan = plan_sync(repo, SyncOptions { force: true })?;
-            apply_sync(repo, plan)?;
+        let prepared = prepare_check_fix(repo)?;
+        match prepared.sync {
+            SyncPlan::NeedsConfirmation { .. } => {
+                return Err(Error::SyncNeedsConfirmation {
+                    path: repo.config().changelog.path.clone(),
+                });
+            }
+            plan => {
+                apply_sync(repo, plan)?;
+            }
         }
         return check(
             repo,
@@ -4192,6 +4232,29 @@ mod tests {
             fs::read_to_string(temp.path().join("CHANGES.md"))
                 .expect("read")
                 .contains(" -  Fixed sync.\n")
+        );
+    }
+
+    #[test]
+    fn sync_rejects_plan_when_changelog_changed_after_planning() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        let plan = plan_sync(&repo, SyncOptions { force: true }).expect("plan");
+        let changed = "Unreleased\n----------\n\nChanged after prompt.\n";
+        fs::write(temp.path().join("CHANGES.md"), changed).expect("change changelog");
+
+        let error = apply_sync(&repo, plan).expect_err("stale plan");
+
+        assert!(matches!(error, Error::StaleSyncPlan { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changed
         );
     }
 

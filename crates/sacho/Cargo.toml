@@ -29,6 +29,7 @@ toml = "1.1.2"
 assert_cmd = "2.2.2"
 mutants = "0.0.3"
 predicates = "3.1.4"
+portable-pty = "0.9.0"
 proptest = "1.11.0"
 tempfile = "3.27.0"
 

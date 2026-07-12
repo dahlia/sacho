@@ -1,5 +1,7 @@
 use assert_cmd::Command;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use predicates::prelude::*;
+use std::io::{Read, Write};
 use std::process::Command as ProcessCommand;
 
 #[test]
@@ -568,6 +570,181 @@ fn sync_without_force_exits_two_and_leaves_changelog_unchanged() {
 
     let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
     assert_eq!(changelog, original);
+}
+
+#[test]
+fn sync_in_terminal_applies_after_yes_confirmation() {
+    let temp = sync_confirmation_repository();
+
+    let (success, output) = run_in_terminal(temp.path(), &["sync"], "yes\n");
+
+    assert!(success, "{output}");
+    assert!(output.contains("may discard hand edits"), "{output}");
+    assert!(output.contains("[y/N]"), "{output}");
+    assert!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md"))
+            .expect("changelog")
+            .contains(" -  Fixed sync.\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_in_terminal_shows_safety_context_when_stderr_is_redirected() {
+    let temp = sync_confirmation_repository();
+    let stderr_path = temp.path().join("sync.log");
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.cwd(temp.path());
+    command.args(["-c", "exec \"$SACHO_BIN\" sync 2>\"$SACHO_STDERR\""]);
+    command.env("SACHO_BIN", env!("CARGO_BIN_EXE_sacho"));
+    command.env("SACHO_STDERR", &stderr_path);
+
+    let (success, output) = run_command_in_terminal(command, "yes\n");
+
+    assert!(success, "{output}");
+    assert!(output.contains("--- current"), "{output}");
+    assert!(output.contains("may discard hand edits"), "{output}");
+    assert!(output.contains("[y/N]"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(stderr_path).expect("redirected stderr"),
+        ""
+    );
+}
+
+#[test]
+fn sync_in_terminal_keeps_changelog_after_default_no_confirmation() {
+    let temp = sync_confirmation_repository();
+    let original = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["sync"], "\n");
+
+    assert!(!success, "{output}");
+    assert!(output.contains("cancelled"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        original
+    );
+}
+
+#[test]
+fn check_fix_non_terminal_formats_fragments_but_refuses_risky_sync() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+    let original = "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n";
+    std::fs::write(temp.path().join("CHANGES.md"), original).expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["check", "--fix"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--force"));
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        original
+    );
+}
+
+#[test]
+fn check_fix_in_terminal_applies_risky_sync_after_confirmation() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["check", "--fix"], "y\n");
+
+    assert!(success, "{output}");
+    assert!(output.contains("may discard hand edits"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains(" -  Fixed issue.\n"));
+    assert!(!changelog.contains("Hand-edited note."));
+}
+
+#[test]
+fn check_fix_non_terminal_automatically_applies_formatting_only_fix() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["check", "--fix"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+}
+
+fn sync_confirmation_repository() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+    temp
+}
+
+fn run_in_terminal(dir: &std::path::Path, args: &[&str], input: &str) -> (bool, String) {
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_sacho"));
+    command.cwd(dir);
+    command.args(args);
+    run_command_in_terminal(command, input)
+}
+
+fn run_command_in_terminal(command: CommandBuilder, input: &str) -> (bool, String) {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pseudo-terminal");
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn in terminal");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("terminal reader");
+    let mut writer = pair.master.take_writer().expect("terminal writer");
+    writer.write_all(input.as_bytes()).expect("terminal input");
+    writer.flush().expect("flush terminal input");
+    drop(writer);
+    let status = child.wait().expect("terminal child");
+    let mut output = String::new();
+    reader.read_to_string(&mut output).expect("terminal output");
+    (status.success(), output)
 }
 
 #[test]
