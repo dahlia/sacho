@@ -844,6 +844,52 @@ Released on July 1, 2026.
 }
 
 #[test]
+fn merge_driver_honors_the_repository_mutation_lock() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "[vcs]\npreset = \"none\"\n").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/merge.md"),
+        " -  Concurrent fragment.\n",
+    )
+    .expect("fragment");
+    let source = "Unreleased\n----------\n\nTo be released.\n";
+    let ancestor = temp.path().join("ancestor.md");
+    let current = temp.path().join("current.md");
+    let other = temp.path().join("other.md");
+    std::fs::write(&ancestor, source).expect("ancestor");
+    std::fs::write(&current, source).expect("current");
+    std::fs::write(&other, source).expect("other");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(temp.path().join(".sacho.lock"))
+        .expect("mutation lock");
+    lock.lock().expect("hold mutation lock");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args([
+            "merge-driver",
+            ancestor.to_str().expect("ancestor path"),
+            current.to_str().expect("current path"),
+            other.to_str().expect("other path"),
+            "CHANGES.md",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "another Sacho mutation is already running",
+        ));
+    assert_eq!(
+        std::fs::read_to_string(current).expect("current remains readable"),
+        source
+    );
+}
+
+#[test]
 fn merge_driver_writes_conflict_markers_and_exits_one() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
@@ -1816,5 +1862,31 @@ materialize = false
     let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
     assert!(changelog.contains("Version 0.2.0\n-------------"));
     assert!(changelog.contains("Released on July 8, 2026."));
+    assert!(!temp.path().join("changes.d/release.md").exists());
+}
+
+#[test]
+fn release_command_creates_a_missing_changelog_from_the_relative_repository_root() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/release.md"),
+        " -  Fixed release.\n",
+    )
+    .expect("fragment");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["release", "0.2.0", "--date", "2026-07-08"])
+        .assert()
+        .success();
+
+    assert!(temp.path().join("CHANGES.md").is_file());
     assert!(!temp.path().join("changes.d/release.md").exists());
 }

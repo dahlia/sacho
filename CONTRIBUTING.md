@@ -100,6 +100,15 @@ checks, so it is available as a separate task rather than part of
 mutants and zero timed-out mutants.  Unviable mutants are acceptable; missed or
 timed-out mutants mean the test suite or implementation needs more work.
 
+On a machine with spare CPU and memory, pass `-j` through the mise task to test
+several mutants in parallel:
+
+~~~~ sh
+mise run mutants -- -j 3
+~~~~
+
+Choose the job count to fit the machine.
+
 Run the Sacho binary during development:
 
 ~~~~ sh

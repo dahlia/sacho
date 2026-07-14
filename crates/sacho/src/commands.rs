@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -15,13 +16,15 @@ use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
 use crate::changelog::{BEGIN_MARKER, ChangelogError, END_MARKER, replace_unreleased_region};
+use crate::compile::{VersionLabel, compile_parsed_fragments};
 use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
 use crate::error::{Error, Result};
 use crate::fragment::{
-    DiscoveryWarning, FragmentWarning, discover_fragment_candidates, parse_fragment,
+    DiscoveryWarning, Fragment, FragmentWarning, discover_fragment_candidates, parse_fragment,
 };
+use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::carry_release;
-use crate::repo::Repository;
+use crate::repo::{PreparedAtomicWrite, Repository, move_path_if_absent};
 use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
@@ -210,8 +213,47 @@ pub struct ReleasePlan {
     /// Markdown for the released changelog section.
     pub released_markdown: String,
 
-    /// Fragment files consumed by the release.
-    pub consumed_fragments: Vec<PathBuf>,
+    /// Planned changelog replacement.
+    pub changelog: ReleaseFileChange,
+
+    /// Planned next-version file replacement or removal.
+    pub next_file: ReleaseFileChange,
+
+    /// Fragment files and exact contents consumed by the release.
+    pub consumed_fragments: Vec<ReleaseFragment>,
+}
+
+/// Exact state of a file participating in a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseFileState {
+    /// The path does not exist.
+    Missing,
+
+    /// The path is a regular UTF-8 file with these exact contents.
+    Present(String),
+}
+
+/// Before and after state of a file changed by a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFileChange {
+    /// Repository-relative path of the file.
+    pub path: PathBuf,
+
+    /// File state observed while planning.
+    pub before: ReleaseFileState,
+
+    /// File state required after a successful release.
+    pub after: ReleaseFileState,
+}
+
+/// Fragment snapshot consumed by a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseFragment {
+    /// Repository-relative fragment path.
+    pub path: PathBuf,
+
+    /// Exact contents observed while planning.
+    pub contents: String,
 }
 
 /// Calendar date used for a release.
@@ -393,25 +435,45 @@ pub struct SkippedCheck {
 /// Bootstraps Sacho configuration and repository integration.
 pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<InitResult> {
     let root = init_root(root.as_ref());
+    let lock = acquire_mutation_lock_at_root(&root)?;
     let mut result = InitResult::default();
     let config_path = root.join(Repository::CONFIG_FILE);
-    let (config, created_config) = if config_path.exists() {
+    let created_config = !config_path.exists();
+    let config = if created_config {
+        default_init_config(&root, &options)
+    } else {
         let contents = fs::read_to_string(&config_path).map_err(|source| Error::ReadFile {
             path: config_path.clone(),
             source,
         })?;
-        result
-            .skipped_existing_files
-            .push(PathBuf::from(Repository::CONFIG_FILE));
-        (
-            Config::parse(&contents).map_err(|source| Error::Config {
-                path: config_path.clone(),
-                source,
-            })?,
-            false,
-        )
-    } else {
-        let config = default_init_config(&root, &options);
+        Config::parse(&contents).map_err(|source| Error::Config {
+            path: config_path.clone(),
+            source,
+        })?
+    };
+    let fragment_dir = root.join(&config.fragments.directory);
+    let fragment_dir_exists = fragment_dir.exists();
+    if fragment_dir_exists && !fragment_dir.is_dir() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a directory",
+                config.fragments.directory.display()
+            ),
+        });
+    }
+    let changelog_path = root.join(&config.changelog.path);
+    let changelog_exists = changelog_path.exists();
+    if changelog_exists && !changelog_path.is_file() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a file",
+                config.changelog.path.display()
+            ),
+        });
+    }
+    validate_init_changelog_path(&config_path, &changelog_path, &config.changelog.path)?;
+    validate_configured_mutation_paths_at_root(&root, &config, &lock)?;
+    if created_config {
         fs::write(&config_path, render_init_config(&config)).map_err(|source| {
             Error::WriteFile {
                 path: config_path.clone(),
@@ -421,21 +483,16 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
         result
             .created_files
             .push(PathBuf::from(Repository::CONFIG_FILE));
-        (config, true)
-    };
-
-    let fragment_dir = root.join(&config.fragments.directory);
-    if fragment_dir.is_dir() {
+    } else {
+        result
+            .skipped_existing_files
+            .push(PathBuf::from(Repository::CONFIG_FILE));
+    }
+    validate_init_changelog_path(&config_path, &changelog_path, &config.changelog.path)?;
+    if fragment_dir_exists {
         result
             .skipped_existing_files
             .push(config.fragments.directory.clone());
-    } else if fragment_dir.exists() {
-        return Err(Error::InitConflict {
-            message: format!(
-                "{} exists but is not a directory",
-                config.fragments.directory.display()
-            ),
-        });
     } else {
         fs::create_dir_all(&fragment_dir).map_err(|source| Error::CreateDirectory {
             path: fragment_dir,
@@ -446,31 +503,18 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
             .push(config.fragments.directory.clone());
     }
 
-    let changelog_path = root.join(&config.changelog.path);
-    if changelog_path.is_file() {
+    let changelog_created = create_initial_changelog_if_absent(
+        &config_path,
+        &changelog_path,
+        &config.changelog.path,
+        &config,
+    )?;
+    if changelog_created {
+        result.created_files.push(config.changelog.path.clone());
+    } else {
         result
             .skipped_existing_files
             .push(config.changelog.path.clone());
-    } else if changelog_path.exists() {
-        return Err(Error::InitConflict {
-            message: format!(
-                "{} exists but is not a file",
-                config.changelog.path.display()
-            ),
-        });
-    } else {
-        if let Some(parent) = changelog_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let changelog = initial_changelog_for_config(&config);
-        fs::write(&changelog_path, changelog).map_err(|source| Error::WriteFile {
-            path: changelog_path,
-            source,
-        })?;
-        result.created_files.push(config.changelog.path.clone());
     }
 
     if created_config || config.vcs.preset == VcsPreset::Git {
@@ -516,6 +560,7 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
     };
     let path = directory.join(name);
     let absolute = repo.resolve(&path);
+    let _lock = acquire_mutation_lock(repo)?;
     ensure_materialized_current_before_mutation(repo)?;
     if let Some(parent) = absolute.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
@@ -570,6 +615,7 @@ pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextR
     if version.is_empty() {
         return Err(Error::EmptyNextVersion);
     }
+    let _lock = acquire_mutation_lock(repo)?;
     ensure_materialized_current_before_mutation(repo)?;
     let path = next_version_path(repo);
     repo.atomic_write(&path, format!("{version}\n").as_bytes())?;
@@ -579,6 +625,7 @@ pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextR
 
 /// Formats all changelog fragments into normal form.
 pub fn format_fragments(repo: &Repository, _options: FormatOptions) -> Result<FormatResult> {
+    let _lock = acquire_mutation_lock(repo)?;
     ensure_materialized_current_before_mutation(repo)?;
     let result = format_fragments_only(repo)?;
     let _sync = sync_after_mutation(repo)?;
@@ -622,6 +669,10 @@ pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<
 
 /// Plans a synchronization between fragments and the materialized changelog.
 pub fn plan_sync(repo: &Repository, options: SyncOptions) -> Result<SyncPlan> {
+    plan_sync_unlocked(repo, options)
+}
+
+fn plan_sync_unlocked(repo: &Repository, options: SyncOptions) -> Result<SyncPlan> {
     let config = repo.config();
     if !config.changelog.materialize {
         return Ok(SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled));
@@ -665,6 +716,11 @@ pub fn plan_sync(repo: &Repository, options: SyncOptions) -> Result<SyncPlan> {
 
 /// Applies a previously planned synchronization.
 pub fn apply_sync(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    apply_sync_unlocked(repo, plan)
+}
+
+fn apply_sync_unlocked(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
     let pending = match plan {
         SyncPlan::Apply(pending)
         | SyncPlan::NeedsConfirmation {
@@ -697,106 +753,233 @@ pub fn apply_sync(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> {
 /// Callers are responsible for confirming [`SyncPlan::NeedsConfirmation`] before
 /// passing the returned plan to [`apply_sync`].
 pub fn prepare_check_fix(repo: &Repository) -> Result<PreparedCheckFix> {
+    let _lock = acquire_mutation_lock(repo)?;
     let formatting = format_fragments_only(repo)?;
-    let sync = plan_sync(repo, SyncOptions { force: false })?;
+    let sync = plan_sync_unlocked(repo, SyncOptions { force: false })?;
     Ok(PreparedCheckFix { formatting, sync })
 }
 
 /// Plans a release operation.
 pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<ReleasePlan> {
-    ensure_materialized_current_before_mutation(repo)?;
+    let _lock = acquire_mutation_lock(repo)?;
 
-    let next_version = read_next_version(repo)?;
-    let version = match (options.version.as_deref().map(str::trim), next_version) {
+    let changelog_path = repo.config().changelog.path.clone();
+    release_failpoint(ReleaseApplyStage::PlanSnapshot, &changelog_path, repo)?;
+    let changelog_before = read_release_file_state(repo, &changelog_path)?;
+    if repo.config().changelog.materialize && matches!(changelog_before, ReleaseFileState::Missing)
+    {
+        return Err(Error::ReadFile {
+            path: repo.resolve(&changelog_path),
+            source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+        });
+    }
+    let next_path = next_version_path(repo);
+    let next_before = read_release_file_state(repo, &next_path)?;
+    let next_version = release_next_version(repo, &next_path, &next_before)?;
+    let version = match (
+        options.version.as_deref().map(str::trim),
+        next_version.as_deref(),
+    ) {
         (Some(""), _) => return Err(Error::MissingReleaseVersion),
         (Some(version), Some(next_version)) if version != next_version => {
             return Err(Error::ReleaseVersionMismatch {
                 version: version.to_owned(),
-                next_version,
+                next_version: next_version.to_owned(),
             });
         }
         (Some(version), _) => version.to_owned(),
-        (None, Some(next_version)) => next_version,
+        (None, Some(next_version)) => next_version.to_owned(),
         (None, None) => return Err(Error::MissingReleaseVersion),
     };
     let date = match options.date {
         Some(date) => ReleaseDate::parse(&date)?,
         None => ReleaseDate::today_utc(),
     };
-    let compiled = compile_unreleased(repo, CompileOptions::default())?;
+    let (consumed_fragments, parsed_fragments) = snapshot_release_fragments(repo)?;
+    let version_label = next_version
+        .as_ref()
+        .map_or(VersionLabel::Unreleased, |version| {
+            VersionLabel::Version(version.clone())
+        });
+    let compiled = compile_parsed_fragments(
+        repo,
+        CompileOptions::default(),
+        version_label,
+        parsed_fragments,
+    )?;
+    ensure_materialized_release_snapshot_current(
+        repo,
+        &changelog_path,
+        &changelog_before,
+        &compiled.markdown,
+    )?;
     if compiled.substantive_item_count == 0 {
         return Err(Error::EmptyRelease);
     }
     let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
-    let consumed_fragments = discover_fragment_candidates(repo)?
-        .candidates
-        .into_iter()
-        .map(|candidate| candidate.relative_path)
-        .collect();
+    let next = options.next.map(|next| next.trim().to_owned());
+    let old_changelog = match &changelog_before {
+        ReleaseFileState::Present(contents) => contents.clone(),
+        ReleaseFileState::Missing => initial_changelog(&repo.config().changelog.title),
+    };
+    let new_changelog = if repo.config().changelog.materialize {
+        let empty_unreleased = empty_unreleased_markdown(repo, next.as_deref());
+        replace_region_for_release(
+            &old_changelog,
+            &empty_unreleased,
+            &released_markdown,
+            repo.config().changelog.region_detection,
+            &repo.config().changelog.unreleased_heading,
+        )
+        .map_err(|source| changelog_error(changelog_path.clone(), source))?
+    } else {
+        insert_released_section(&old_changelog, &released_markdown)
+    };
+    let next_after = next
+        .as_deref()
+        .filter(|next| !next.is_empty())
+        .map_or(ReleaseFileState::Missing, |next| {
+            ReleaseFileState::Present(format!("{next}\n"))
+        });
 
-    Ok(ReleasePlan {
+    let plan = ReleasePlan {
         version,
         date,
-        next: options.next.map(|next| next.trim().to_owned()),
+        next,
         released_markdown,
+        changelog: ReleaseFileChange {
+            path: changelog_path,
+            before: changelog_before,
+            after: ReleaseFileState::Present(new_changelog),
+        },
+        next_file: ReleaseFileChange {
+            path: next_path,
+            before: next_before,
+            after: next_after,
+        },
         consumed_fragments,
-    })
+    };
+    validate_distinct_release_paths(repo, &plan)?;
+    Ok(plan)
+}
+
+fn ensure_materialized_release_snapshot_current(
+    repo: &Repository,
+    changelog_path: &Path,
+    changelog: &ReleaseFileState,
+    compiled_markdown: &str,
+) -> Result<()> {
+    if !repo.config().changelog.materialize {
+        return Ok(());
+    }
+    let ReleaseFileState::Present(contents) = changelog else {
+        unreachable!("materialized release planning rejects a missing changelog");
+    };
+    let replacement = replace_unreleased_region(
+        contents,
+        compiled_markdown,
+        repo.config().changelog.region_detection,
+        &repo.config().changelog.unreleased_heading,
+    )
+    .map_err(|source| changelog_error(changelog_path.to_path_buf(), source))?;
+    if *contents == replacement.new_contents {
+        Ok(())
+    } else {
+        Err(Error::SyncNeedsConfirmation {
+            path: changelog_path.to_path_buf(),
+        })
+    }
 }
 
 /// Applies a previously planned release.
 pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResult> {
-    let config = repo.config();
-    let changelog_path = config.changelog.path.clone();
-    let old_changelog = match fs::read_to_string(repo.resolve(&changelog_path)) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == ErrorKind::NotFound && !config.changelog.materialize => {
-            initial_changelog(&config.changelog.title)
-        }
-        Err(source) => {
-            return Err(Error::ReadFile {
-                path: repo.resolve(&changelog_path),
-                source,
-            });
-        }
-    };
+    let _lock = acquire_mutation_lock(repo)?;
+    let participant_identities = validate_distinct_release_paths(repo, &plan)?;
+    validate_release_plan(repo, &plan)?;
+    probe_release_move_support(repo, &plan, &participant_identities)?;
 
-    let new_changelog = if config.changelog.materialize {
-        let empty_unreleased = empty_unreleased_markdown(repo, plan.next.as_deref());
-        replace_region_for_release(
-            &old_changelog,
-            &empty_unreleased,
-            &plan.released_markdown,
-            config.changelog.region_detection,
-            &config.changelog.unreleased_heading,
-        )
-        .map_err(|source| changelog_error(changelog_path.clone(), source))?
-    } else {
-        insert_released_section(&old_changelog, &plan.released_markdown)
+    let prepared_changelog =
+        prepare_release_change(repo, &plan.changelog, &participant_identities)?;
+    let prepared_next = prepare_release_change(repo, &plan.next_file, &participant_identities)?;
+    let mut applied = Vec::new();
+
+    let changelog_outcome = match apply_release_change(
+        repo,
+        &plan.changelog,
+        prepared_changelog,
+        &participant_identities,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(release_apply_error(error, Vec::new())),
     };
-    repo.atomic_write(&changelog_path, new_changelog.as_bytes())?;
+    applied.push(AppliedReleaseChange {
+        path: plan.changelog.path.clone(),
+        before: plan.changelog.before.clone(),
+        after: plan.changelog.after.clone(),
+        original: changelog_outcome.original,
+        created_directories: changelog_outcome.created_directories,
+    });
+
+    let next_outcome = match apply_release_change(
+        repo,
+        &plan.next_file,
+        prepared_next,
+        &participant_identities,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(rollback_release(repo, error, applied)),
+    };
+    let unchanged_participants: &[ReleaseFileChange] =
+        if plan.next_file.before == plan.next_file.after {
+            std::slice::from_ref(&plan.next_file)
+        } else {
+            &[]
+        };
+    if unchanged_participants.is_empty() {
+        applied.push(AppliedReleaseChange {
+            path: plan.next_file.path.clone(),
+            before: plan.next_file.before.clone(),
+            after: plan.next_file.after.clone(),
+            original: next_outcome.original,
+            created_directories: next_outcome.created_directories,
+        });
+    }
 
     for fragment in &plan.consumed_fragments {
-        match fs::remove_file(repo.resolve(fragment)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(Error::WriteFile {
-                    path: repo.resolve(fragment),
-                    source,
-                });
-            }
-        }
+        let original = match remove_release_fragment(repo, fragment, &participant_identities) {
+            Ok(original) => original,
+            Err(error) => return Err(rollback_release(repo, error, applied)),
+        };
+        applied.push(AppliedReleaseChange {
+            path: fragment.path.clone(),
+            before: ReleaseFileState::Present(fragment.contents.clone()),
+            after: ReleaseFileState::Missing,
+            original: Some(original),
+            created_directories: Vec::new(),
+        });
     }
-    write_next_after_release(repo, plan.next.as_deref())?;
 
-    let mut changed_paths = vec![changelog_path];
-    changed_paths.extend(plan.consumed_fragments);
-    changed_paths.push(next_version_path(repo));
+    if let Err(failure) = commit_release_claims(repo, &mut applied, unchanged_participants) {
+        return Err(match failure {
+            ReleaseClaimCommitFailure::BeforeCommit(error) => {
+                rollback_release(repo, error, applied)
+            }
+            ReleaseClaimCommitFailure::AfterCommit(failures) => Error::ReleaseCleanup { failures },
+        });
+    }
+
+    let mut changed_paths = vec![plan.changelog.path, plan.next_file.path];
+    changed_paths.extend(
+        plan.consumed_fragments
+            .into_iter()
+            .map(|fragment| fragment.path),
+    );
     Ok(ReleaseResult { changed_paths })
 }
 
 /// Carries entries from an existing release into unreleased fragments.
 pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
+    let _lock = acquire_mutation_lock(repo)?;
     ensure_materialized_current_before_mutation(repo)?;
 
     let changelog_path = repo.config().changelog.path.clone();
@@ -826,8 +1009,8 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     }
 
     let sync = if repo.config().changelog.materialize {
-        let plan = plan_sync(repo, SyncOptions { force: true })?;
-        Some(apply_sync(repo, plan)?)
+        let plan = plan_sync_unlocked(repo, SyncOptions { force: true })?;
+        Some(apply_sync_unlocked(repo, plan)?)
     } else {
         None
     };
@@ -836,6 +1019,31 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
         written_fragments,
         sync,
     })
+}
+
+/// Runs the changelog merge driver and writes its result to the current-side file.
+///
+/// The repository mutation lock is held while fragments are compiled and until
+/// the merged output has been written.
+pub fn apply_merge_driver(
+    repo: &Repository,
+    options: MergeDriverOptions,
+) -> Result<MergeDriverResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    let current = options.current.clone();
+    let result = merge_driver(repo, options)?;
+    let output = match &result {
+        MergeDriverResult::Clean { output, .. } => output,
+        MergeDriverResult::Conflict {
+            output_with_markers,
+            ..
+        } => output_with_markers,
+    };
+    fs::write(&current, output).map_err(|source| Error::WriteFile {
+        path: current,
+        source,
+    })?;
+    Ok(result)
 }
 
 /// Checks fragments, materialized output, and missing-fragment policy.
@@ -1610,49 +1818,1394 @@ fn next_version_path(repo: &Repository) -> PathBuf {
         .join(&repo.config().fragments.next_file)
 }
 
-fn read_next_version(repo: &Repository) -> Result<Option<String>> {
-    let path = next_version_path(repo);
-    let absolute = repo.resolve(&path);
-    match fs::read_to_string(&absolute) {
-        Ok(contents) => {
-            let values = contents
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>();
-            match values.as_slice() {
-                [] => Ok(None),
-                [value] => Ok(Some((*value).to_owned())),
-                _ => Err(Error::InvalidNextVersion { path: absolute }),
+fn read_release_file_state(repo: &Repository, path: &Path) -> Result<ReleaseFileState> {
+    let absolute = repo.resolve(path);
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(source) if error_has_kind(&source, ErrorKind::NotFound) => {
+            return Ok(ReleaseFileState::Missing);
+        }
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: absolute,
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(Error::ReleasePathConflict { path: absolute });
+    }
+    fs::read_to_string(&absolute)
+        .map(ReleaseFileState::Present)
+        .map_err(|source| Error::ReadFile {
+            path: absolute,
+            source,
+        })
+}
+
+fn release_next_version(
+    repo: &Repository,
+    path: &Path,
+    state: &ReleaseFileState,
+) -> Result<Option<String>> {
+    let ReleaseFileState::Present(contents) = state else {
+        return Ok(None);
+    };
+    let values = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some((*value).to_owned())),
+        _ => Err(Error::InvalidNextVersion {
+            path: repo.resolve(path),
+        }),
+    }
+}
+
+fn snapshot_release_fragments(repo: &Repository) -> Result<(Vec<ReleaseFragment>, Vec<Fragment>)> {
+    let candidates = discover_fragment_candidates(repo)?.candidates;
+    let mut snapshots = Vec::with_capacity(candidates.len());
+    let mut parsed = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let state = read_release_file_state(repo, &candidate.relative_path)?;
+        let ReleaseFileState::Present(contents) = state else {
+            return Err(Error::StaleReleasePlan {
+                path: candidate.relative_path,
+            });
+        };
+        parsed.push(
+            parse_fragment(
+                candidate.relative_path.clone(),
+                &contents,
+                candidate.section,
+                &repo.config().links,
+            )
+            .map_err(|source| Error::Fragment {
+                path: candidate.relative_path.clone(),
+                source,
+            })?,
+        );
+        snapshots.push(ReleaseFragment {
+            path: candidate.relative_path,
+            contents,
+        });
+    }
+    Ok((snapshots, parsed))
+}
+
+struct MutationLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+const MUTATION_LOCK_FILE: &str = ".sacho.lock";
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn acquire_mutation_lock(repo: &Repository) -> Result<MutationLock> {
+    let lock = acquire_mutation_lock_at_root(repo.root())?;
+    validate_configured_mutation_paths(repo, &lock)?;
+    Ok(lock)
+}
+
+fn acquire_mutation_lock_at_root(root: &Path) -> Result<MutationLock> {
+    let path = mutation_lock_path(root);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == ErrorKind::NotFound => {
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(source) if mutation_lock_was_created_concurrently(&source) => {
+                    fs::File::open(&path).map_err(|source| Error::ReadFile {
+                        path: path.clone(),
+                        source,
+                    })?
+                }
+                Err(source) => {
+                    return Err(Error::WriteFile {
+                        path: path.clone(),
+                        source,
+                    });
+                }
             }
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::ReadFile {
-            path: absolute,
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    file.try_lock().map_err(|source| {
+        let source: std::io::Error = source.into();
+        if source.kind() == ErrorKind::WouldBlock {
+            Error::ReleaseLocked
+        } else {
+            Error::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    Ok(MutationLock { file, path })
+}
+
+fn validate_configured_mutation_paths(repo: &Repository, lock: &MutationLock) -> Result<()> {
+    validate_configured_mutation_paths_at_root(repo.root(), repo.config(), lock)
+}
+
+fn validate_configured_mutation_paths_at_root(
+    root: &Path,
+    config: &Config,
+    lock: &MutationLock,
+) -> Result<()> {
+    validate_mutation_lock_path(root, lock, &config.changelog.path)?;
+    validate_mutation_lock_path(
+        root,
+        lock,
+        &config.fragments.directory.join(&config.fragments.next_file),
+    )
+}
+
+fn validate_mutation_lock_path(root: &Path, lock: &MutationLock, path: &Path) -> Result<()> {
+    let lock_identity = filesystem_path_identity(&lock.path)?;
+    let path_identity = filesystem_path_identity(&root.join(path))?;
+    if release_paths_overlap(&lock_identity, &path_identity, true) {
+        return Err(Error::MutationLockPathOverlap {
+            path: path.to_path_buf(),
+            lock_path: lock.path.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn mutation_lock_path(root: &Path) -> PathBuf {
+    git_output(root, ["rev-parse", "--git-path", "sacho.lock"])
+        .ok()
+        .and_then(|output| parse_git_root_output(&output))
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+        .unwrap_or_else(|| root.join(MUTATION_LOCK_FILE))
+}
+
+fn mutation_lock_was_created_concurrently(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::AlreadyExists
+}
+
+fn validate_distinct_release_paths(repo: &Repository, plan: &ReleasePlan) -> Result<Vec<PathBuf>> {
+    let paths = std::iter::once(&plan.changelog.path)
+        .chain(std::iter::once(&plan.next_file.path))
+        .chain(
+            plan.consumed_fragments
+                .iter()
+                .map(|fragment| &fragment.path),
+        );
+    let mut identities = paths
+        .map(|path| Ok((path.clone(), release_path_identity(repo, path)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let identity_paths = identities
+        .iter()
+        .map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
+    let mut case_sensitivity = Vec::<(PathBuf, bool)>::new();
+    let sensitivities = identity_paths
+        .iter()
+        .map(|identity| {
+            release_path_case_sensitivity(identity, &identity_paths, &mut case_sensitivity)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for index in 0..identities.len() {
+        let (path, identity) = &identities[index];
+        if let Some((other, _)) = identities[..index]
+            .iter()
+            .enumerate()
+            .find(|(other_index, (_, other_identity))| {
+                release_paths_overlap(
+                    identity,
+                    other_identity,
+                    release_path_pair_case_sensitive(
+                        sensitivities[index],
+                        sensitivities[*other_index],
+                    ),
+                )
+            })
+            .map(|(_, identity)| identity)
+        {
+            return Err(Error::ReleasePathOverlap {
+                first: other.clone(),
+                second: path.clone(),
+            });
+        }
+    }
+    Ok(identities.drain(..).map(|(_, identity)| identity).collect())
+}
+
+fn release_path_case_sensitivity(
+    identity: &Path,
+    participant_identities: &[PathBuf],
+    cache: &mut Vec<(PathBuf, bool)>,
+) -> Result<bool> {
+    let directory = nearest_existing_directory(identity).ok_or_else(|| Error::ReadFile {
+        path: identity.to_path_buf(),
+        source: std::io::Error::new(
+            ErrorKind::NotFound,
+            "release path has no existing directory ancestor",
+        ),
+    })?;
+    if let Some((_, case_sensitive)) = cache.iter().find(|(cached, _)| *cached == directory) {
+        return Ok(*case_sensitive);
+    }
+    let case_sensitive = probe_directory_case_sensitivity(&directory, participant_identities)?;
+    cache.push((directory, case_sensitive));
+    Ok(case_sensitive)
+}
+
+fn release_path_pair_case_sensitive(first: bool, second: bool) -> bool {
+    first && second
+}
+
+fn probe_directory_case_sensitivity(
+    parent: &Path,
+    participant_identities: &[PathBuf],
+) -> Result<bool> {
+    let directory = reserve_release_probe_directory(parent, participant_identities)?;
+    let mixed_case = directory.join("Case-Sensitivity-Aa");
+    let alternate_case = directory.join("case-sensitivity-aA");
+    if let Err(source) = fs::create_dir(&mixed_case) {
+        let _ = fs::remove_dir(&directory);
+        return Err(Error::CreateDirectory {
+            path: mixed_case,
+            source,
+        });
+    }
+    let case_sensitive = match fs::symlink_metadata(&alternate_case) {
+        Ok(_) => false,
+        Err(source) if source.kind() == ErrorKind::NotFound => true,
+        Err(source) => {
+            let _ = fs::remove_dir(&mixed_case);
+            let _ = fs::remove_dir(&directory);
+            return Err(Error::ReadFile {
+                path: alternate_case,
+                source,
+            });
+        }
+    };
+    fs::remove_dir(&mixed_case).map_err(|source| Error::RemoveDirectory {
+        path: mixed_case,
+        source,
+    })?;
+    fs::remove_dir(&directory).map_err(|source| Error::RemoveDirectory {
+        path: directory,
+        source,
+    })?;
+    Ok(case_sensitive)
+}
+
+fn release_paths_overlap(first: &Path, second: &Path, case_sensitive: bool) -> bool {
+    path_starts_with(first, second, case_sensitive)
+        || path_starts_with(second, first, case_sensitive)
+}
+
+fn path_starts_with(path: &Path, base: &Path, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        return path.starts_with(base);
+    }
+    let mut path_components = path.components();
+    base.components().all(|base_component| {
+        path_components.next().is_some_and(|path_component| {
+            path_component.as_os_str().to_string_lossy().to_lowercase()
+                == base_component.as_os_str().to_string_lossy().to_lowercase()
+        })
+    })
+}
+
+fn release_path_identity(repo: &Repository, path: &Path) -> Result<PathBuf> {
+    filesystem_path_identity(&repo.resolve(path))
+}
+
+fn filesystem_path_identity(path: &Path) -> Result<PathBuf> {
+    let unresolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| Error::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    let mut missing = Vec::new();
+    for component in unresolved.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing.pop().is_none() {
+                    let candidate = resolved.join("..");
+                    resolved = fs::canonicalize(&candidate).map_err(|source| Error::ReadFile {
+                        path: unresolved.clone(),
+                        source,
+                    })?;
+                }
+            }
+            Component::Normal(name) if missing.is_empty() => {
+                let candidate = resolved.join(name);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(source) if source.kind() == ErrorKind::NotFound => {
+                        missing.push(name.to_os_string());
+                    }
+                    Err(source) => {
+                        return Err(Error::ReadFile {
+                            path: unresolved,
+                            source,
+                        });
+                    }
+                }
+            }
+            Component::Normal(name) => missing.push(name.to_os_string()),
+        }
+    }
+    resolved.extend(missing);
+    Ok(resolved)
+}
+
+fn probe_release_move_support(
+    repo: &Repository,
+    plan: &ReleasePlan,
+    participant_identities: &[PathBuf],
+) -> Result<()> {
+    let paths = std::iter::once(&plan.changelog.path)
+        .chain(std::iter::once(&plan.next_file.path))
+        .chain(
+            plan.consumed_fragments
+                .iter()
+                .map(|fragment| &fragment.path),
+        );
+    let mut probed_directories = IndexSet::new();
+    for (path, identity) in paths.zip(participant_identities) {
+        let directory = nearest_existing_directory(identity).ok_or_else(|| Error::ReadFile {
+            path: identity.clone(),
+            source: std::io::Error::new(
+                ErrorKind::NotFound,
+                "release path has no existing directory ancestor",
+            ),
+        })?;
+        if !probed_directories.insert(directory.clone()) {
+            continue;
+        }
+        probe_directory_move(repo, path, &directory, participant_identities)?;
+    }
+    Ok(())
+}
+
+fn nearest_existing_directory(identity: &Path) -> Option<PathBuf> {
+    let mut candidate = identity.parent();
+    while let Some(path) = candidate {
+        if let Ok(canonical) = fs::canonicalize(path)
+            && canonical.is_dir()
+        {
+            return Some(canonical);
+        }
+        candidate = path.parent();
+    }
+    None
+}
+
+fn probe_directory_move(
+    repo: &Repository,
+    path: &Path,
+    parent: &Path,
+    participant_identities: &[PathBuf],
+) -> Result<()> {
+    let directory = reserve_release_probe_directory(parent, participant_identities)?;
+    let source = directory.join("source");
+    let destination = directory.join("destination");
+    if let Err(source_error) = fs::create_dir(&source) {
+        let _ = fs::remove_dir(&directory);
+        return Err(Error::CreateDirectory {
+            path: source,
+            source: source_error,
+        });
+    }
+    let probe_result = release_failpoint(ReleaseApplyStage::Probe, path, repo).and_then(|()| {
+        move_path_if_absent(&source, &destination).map_err(|_| Error::ReleaseTransactionUnsupported)
+    });
+    let moved = destination.exists();
+    let cleanup_path = if moved { &destination } else { &source };
+    let cleanup_result = fs::remove_dir(cleanup_path)
+        .and_then(|()| fs::remove_dir(&directory))
+        .map_err(|source| Error::RemoveDirectory {
+            path: cleanup_path.to_path_buf(),
+            source,
+        });
+    match (probe_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(_), Ok(())) => Err(Error::ReleaseTransactionUnsupported),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(release_apply_error(error, vec![cleanup.to_string()])),
+    }
+}
+
+fn reserve_release_probe_directory(
+    parent: &Path,
+    participant_identities: &[PathBuf],
+) -> Result<PathBuf> {
+    loop {
+        let sequence = RELEASE_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".sacho-probe-{}-{sequence}", std::process::id());
+        let directory = parent.join(&name);
+        if release_claim_path_conflicts(&directory, participant_identities) {
+            continue;
+        }
+        match fs::create_dir(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => continue,
+            Err(source) => {
+                return Err(Error::CreateDirectory {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn validate_release_plan(repo: &Repository, plan: &ReleasePlan) -> Result<()> {
+    validate_release_state(repo, &plan.changelog.path, &plan.changelog.before)?;
+    validate_release_state(repo, &plan.next_file.path, &plan.next_file.before)?;
+    for fragment in &plan.consumed_fragments {
+        validate_release_state(
+            repo,
+            &fragment.path,
+            &ReleaseFileState::Present(fragment.contents.clone()),
+        )?;
+    }
+    let planned_paths = plan
+        .consumed_fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    validate_release_fragment_paths(repo, &planned_paths)
+}
+
+fn validate_release_fragment_paths(repo: &Repository, expected: &[PathBuf]) -> Result<()> {
+    let current_paths = discover_fragment_candidates(repo)?
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.relative_path)
+        .collect::<Vec<_>>();
+    if let Some(path) = differing_fragment_path(expected, &current_paths) {
+        return Err(Error::StaleReleasePlan { path });
+    }
+    Ok(())
+}
+
+fn differing_fragment_path(planned: &[PathBuf], current: &[PathBuf]) -> Option<PathBuf> {
+    if planned == current {
+        return None;
+    }
+    current
+        .iter()
+        .find(|path| !planned.contains(path))
+        .or_else(|| planned.iter().find(|path| !current.contains(path)))
+        .or_else(|| {
+            planned
+                .iter()
+                .zip(current)
+                .find_map(|(planned, current)| (planned != current).then_some(current))
+        })
+        .cloned()
+}
+
+fn validate_release_state(
+    repo: &Repository,
+    path: &Path,
+    expected: &ReleaseFileState,
+) -> Result<()> {
+    match read_release_file_state(repo, path) {
+        Ok(current) if current == *expected => Ok(()),
+        Ok(_) | Err(Error::ReleasePathConflict { .. }) => Err(Error::StaleReleasePlan {
+            path: path.to_path_buf(),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_release_change(
+    repo: &Repository,
+    change: &ReleaseFileChange,
+    participant_identities: &[PathBuf],
+) -> Result<Option<PreparedAtomicWrite>> {
+    release_failpoint(ReleaseApplyStage::Prepare, &change.path, repo)?;
+    if change.before == change.after {
+        return Ok(None);
+    }
+    match &change.after {
+        ReleaseFileState::Present(contents) => repo
+            .prepare_atomic_write_avoiding(
+                &change.path,
+                contents.as_bytes(),
+                participant_identities,
+            )
+            .map(Some),
+        ReleaseFileState::Missing => Ok(None),
+    }
+}
+
+fn apply_release_change(
+    repo: &Repository,
+    change: &ReleaseFileChange,
+    prepared: Option<PreparedAtomicWrite>,
+    participant_identities: &[PathBuf],
+) -> Result<AppliedReleaseOutcome> {
+    if change.before == change.after {
+        validate_release_state(repo, &change.path, &change.before)?;
+        return Ok(AppliedReleaseOutcome::default());
+    }
+    release_failpoint(ReleaseApplyStage::Apply, &change.path, repo)?;
+    match &change.before {
+        ReleaseFileState::Present(expected) => {
+            let claimed = claim_release_file(repo, &change.path, expected, participant_identities)?;
+            if let Err(error) =
+                release_failpoint(ReleaseApplyStage::ApplyClaimed, &change.path, repo)
+            {
+                return Err(restore_claim_after_error(claimed, &change.path, error));
+            }
+            match prepared {
+                Some(prepared) => {
+                    let ReleaseFileState::Present(_) = &change.after else {
+                        unreachable!("a prepared release change always writes a file");
+                    };
+                    install_over_claimed_file(repo, &change.path, prepared, claimed).map(
+                        |original| AppliedReleaseOutcome {
+                            original: Some(original),
+                            created_directories: Vec::new(),
+                        },
+                    )
+                }
+                None => finish_claimed_deletion(repo, &change.path, claimed).map(|original| {
+                    AppliedReleaseOutcome {
+                        original: Some(original),
+                        created_directories: Vec::new(),
+                    }
+                }),
+            }
+        }
+        ReleaseFileState::Missing => {
+            match prepared {
+                Some(prepared) => install_into_missing_path(repo, &change.path, prepared).map(
+                    |created_directories| AppliedReleaseOutcome {
+                        original: None,
+                        created_directories,
+                    },
+                ),
+                None => Ok(AppliedReleaseOutcome::default()),
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct AppliedReleaseOutcome {
+    original: Option<ClaimedReleaseFile>,
+    created_directories: Vec<PathBuf>,
+}
+
+fn remove_release_fragment(
+    repo: &Repository,
+    fragment: &ReleaseFragment,
+    participant_identities: &[PathBuf],
+) -> Result<ClaimedReleaseFile> {
+    release_failpoint(ReleaseApplyStage::Apply, &fragment.path, repo)?;
+    let claimed = claim_release_file(
+        repo,
+        &fragment.path,
+        &fragment.contents,
+        participant_identities,
+    )?;
+    if let Err(error) = release_failpoint(ReleaseApplyStage::ApplyClaimed, &fragment.path, repo) {
+        return Err(restore_claim_after_error(claimed, &fragment.path, error));
+    }
+    finish_claimed_deletion(repo, &fragment.path, claimed)
+}
+
+static RELEASE_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct ClaimedReleaseFile {
+    directory: PathBuf,
+    file: PathBuf,
+    destination: PathBuf,
+}
+
+enum ClaimDiscardFailure {
+    Retained {
+        claimed: ClaimedReleaseFile,
+        error: Box<Error>,
+    },
+    Cleaned(Box<Error>),
+}
+
+impl ClaimedReleaseFile {
+    fn preflight_discard(&self, repo: &Repository, path: &Path) -> Result<()> {
+        release_failpoint(ReleaseApplyStage::DiscardClaimed, path, repo)?;
+        release_failpoint(ReleaseApplyStage::DiscardClaimDirectory, path, repo)?;
+        #[cfg(test)]
+        inject_release_claim_interference(path, &self.file);
+        Ok(())
+    }
+
+    fn validate_retained_state(&self, path: &Path, expected: &ReleaseFileState) -> Result<()> {
+        let ReleaseFileState::Present(expected) = expected else {
+            unreachable!("a retained release original was present before applying")
+        };
+        let matches = match fs::symlink_metadata(&self.file) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                match fs::read_to_string(&self.file) {
+                    Ok(contents) => contents == *expected,
+                    Err(source) if error_has_kind(&source, ErrorKind::InvalidData) => false,
+                    Err(source) => {
+                        return Err(Error::ReadFile {
+                            path: self.file.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            Ok(_) => false,
+            Err(source) => {
+                return Err(Error::ReadFile {
+                    path: self.file.clone(),
+                    source,
+                });
+            }
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(Error::StaleReleasePlan {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+
+    fn discard(
+        self,
+        repo: &Repository,
+        path: &Path,
+    ) -> std::result::Result<(), ClaimDiscardFailure> {
+        if let Err(error) = release_failpoint(ReleaseApplyStage::DiscardClaimed, path, repo) {
+            return Err(ClaimDiscardFailure::Retained {
+                claimed: self,
+                error: Box::new(error),
+            });
+        }
+        if let Err(source) = fs::remove_file(&self.file) {
+            let error = Error::RemoveFile {
+                path: self.file.clone(),
+                source,
+            };
+            return Err(ClaimDiscardFailure::Retained {
+                claimed: self,
+                error: Box::new(error),
+            });
+        }
+        if let Err(error) = release_failpoint(ReleaseApplyStage::DiscardClaimDirectory, path, repo)
+        {
+            return Err(ClaimDiscardFailure::Cleaned(Box::new(error)));
+        }
+        fs::remove_dir(&self.directory).map_err(|source| {
+            ClaimDiscardFailure::Cleaned(Box::new(Error::RemoveDirectory {
+                path: self.directory,
+                source,
+            }))
+        })
+    }
+
+    fn discard_after_commit(
+        self,
+        repo: &Repository,
+        path: &Path,
+    ) -> std::result::Result<(), ClaimDiscardFailure> {
+        if let Err(error) =
+            release_failpoint(ReleaseApplyStage::CommittedDiscardClaimed, path, repo)
+        {
+            return Err(ClaimDiscardFailure::Retained {
+                claimed: self,
+                error: Box::new(error),
+            });
+        }
+        self.discard(repo, path)
+    }
+
+    fn restore(self, path: &Path) -> Result<()> {
+        match move_path_if_absent(&self.file, &self.destination) {
+            Ok(()) => fs::remove_dir(&self.directory).map_err(|source| Error::RemoveDirectory {
+                path: self.directory,
+                source,
+            }),
+            Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => {
+                Err(Error::ReleaseRollbackConflict {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(source) => Err(Error::WriteFile {
+                path: self.destination,
+                source,
+            }),
+        }
+    }
+}
+
+fn restore_claim_after_error(claimed: ClaimedReleaseFile, path: &Path, error: Error) -> Error {
+    match claimed.restore(path) {
+        Ok(()) => error,
+        Err(restore_error) => release_apply_error(error, vec![restore_error.to_string()]),
+    }
+}
+
+fn claim_release_file(
+    repo: &Repository,
+    path: &Path,
+    expected: &str,
+    participant_identities: &[PathBuf],
+) -> Result<ClaimedReleaseFile> {
+    let destination = repo.resolve(path);
+    let directory = reserve_release_claim_directory(&destination, participant_identities)?;
+    let file = directory.join("claimed");
+    if let Err(source) = fs::rename(&destination, &file) {
+        let _ = fs::remove_dir(&directory);
+        return if error_has_kind(&source, ErrorKind::NotFound) {
+            Err(Error::StaleReleasePlan {
+                path: path.to_path_buf(),
+            })
+        } else {
+            Err(Error::WriteFile {
+                path: destination,
+                source,
+            })
+        };
+    }
+    let claimed = ClaimedReleaseFile {
+        directory,
+        file,
+        destination,
+    };
+    let matches = match fs::symlink_metadata(&claimed.file) {
+        Ok(metadata) if metadata.file_type().is_file() => match fs::read_to_string(&claimed.file) {
+            Ok(contents) => contents == expected,
+            Err(source) if error_has_kind(&source, ErrorKind::InvalidData) => false,
+            Err(source) => {
+                let error = Error::ReadFile {
+                    path: claimed.file.clone(),
+                    source,
+                };
+                return Err(restore_claim_after_error(claimed, path, error));
+            }
+        },
+        Ok(_) => false,
+        Err(source) => {
+            let error = Error::ReadFile {
+                path: claimed.file.clone(),
+                source,
+            };
+            return Err(restore_claim_after_error(claimed, path, error));
+        }
+    };
+    if matches {
+        Ok(claimed)
+    } else {
+        let error = Error::StaleReleasePlan {
+            path: path.to_path_buf(),
+        };
+        Err(restore_claim_after_error(claimed, path, error))
+    }
+}
+
+fn reserve_release_claim_directory(
+    destination: &Path,
+    participant_identities: &[PathBuf],
+) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .expect("resolved repository paths always have a parent");
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| Error::ReadFile {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    loop {
+        let sequence = RELEASE_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let name = format!(".sacho-claim-{}-{sequence}", std::process::id());
+        let directory = parent.join(&name);
+        let identity = canonical_parent.join(name);
+        if release_claim_path_conflicts(&identity, participant_identities) {
+            continue;
+        }
+        match fs::create_dir(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => continue,
+            Err(source) => {
+                return Err(Error::CreateDirectory {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn install_over_claimed_file(
+    repo: &Repository,
+    path: &Path,
+    prepared: PreparedAtomicWrite,
+    claimed: ClaimedReleaseFile,
+) -> Result<ClaimedReleaseFile> {
+    match prepared.commit_if_absent() {
+        Ok(()) => Ok(claimed),
+        Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => {
+            let error = Error::StaleReleasePlan {
+                path: path.to_path_buf(),
+            };
+            Err(retain_claim_after_collision(path, claimed, error))
+        }
+        Err(source) => {
+            let error = Error::WriteFile {
+                path: repo.resolve(path),
+                source,
+            };
+            Err(restore_claim_after_error(claimed, path, error))
+        }
+    }
+}
+
+fn claim_discard_error(failure: ClaimDiscardFailure) -> Error {
+    match failure {
+        ClaimDiscardFailure::Retained { claimed, error } => {
+            drop(claimed);
+            *error
+        }
+        ClaimDiscardFailure::Cleaned(error) => *error,
+    }
+}
+
+fn retain_claim_after_collision(path: &Path, claimed: ClaimedReleaseFile, error: Error) -> Error {
+    drop(claimed);
+    release_apply_error(
+        error,
+        vec![
+            Error::ReleaseRollbackConflict {
+                path: path.to_path_buf(),
+            }
+            .to_string(),
+        ],
+    )
+}
+
+fn install_into_missing_path(
+    repo: &Repository,
+    path: &Path,
+    prepared: PreparedAtomicWrite,
+) -> Result<Vec<PathBuf>> {
+    prepared
+        .commit_if_absent_with_created_directories()
+        .map_err(|source| {
+            if error_has_kind(&source, ErrorKind::AlreadyExists) {
+                Error::StaleReleasePlan {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                Error::WriteFile {
+                    path: repo.resolve(path),
+                    source,
+                }
+            }
+        })
+}
+
+fn error_has_kind(error: &std::io::Error, expected: ErrorKind) -> bool {
+    error.kind() == expected
+}
+
+fn release_claim_path_conflicts(identity: &Path, participant_identities: &[PathBuf]) -> bool {
+    participant_identities
+        .iter()
+        .any(|participant| participant.starts_with(identity))
+}
+
+fn finish_claimed_deletion(
+    repo: &Repository,
+    path: &Path,
+    claimed: ClaimedReleaseFile,
+) -> Result<ClaimedReleaseFile> {
+    match fs::symlink_metadata(repo.resolve(path)) {
+        Err(source) if error_has_kind(&source, ErrorKind::NotFound) => Ok(claimed),
+        Ok(_) => {
+            let error = Error::StaleReleasePlan {
+                path: path.to_path_buf(),
+            };
+            Err(retain_claim_after_collision(path, claimed, error))
+        }
+        Err(source) => {
+            let error = Error::ReadFile {
+                path: repo.resolve(path),
+                source,
+            };
+            Err(restore_claim_after_error(claimed, path, error))
+        }
+    }
+}
+
+fn restore_release_state(
+    repo: &Repository,
+    path: &Path,
+    before: &ReleaseFileState,
+    applied_after: &ReleaseFileState,
+) -> Result<()> {
+    release_failpoint(ReleaseApplyStage::Rollback, path, repo)?;
+    match applied_after {
+        ReleaseFileState::Present(expected) => {
+            restore_over_applied_file(repo, path, before, expected)
+        }
+        ReleaseFileState::Missing => restore_into_missing_path(repo, path, before),
+    }
+}
+
+fn restore_over_applied_file(
+    repo: &Repository,
+    path: &Path,
+    before: &ReleaseFileState,
+    expected: &str,
+) -> Result<()> {
+    let absolute = repo.resolve(path);
+    let directory = reserve_release_claim_directory(&absolute, &[])?;
+    let guard = directory.join("claimed");
+    if let Err(source) = fs::rename(&absolute, &guard) {
+        let _ = fs::remove_dir(&directory);
+        return Err(if error_has_kind(&source, ErrorKind::NotFound) {
+            Error::ReleaseRollbackConflict {
+                path: path.to_path_buf(),
+            }
+        } else {
+            Error::WriteFile {
+                path: absolute.clone(),
+                source,
+            }
+        });
+    }
+    let claimed_file = ClaimedReleaseFile {
+        directory,
+        file: guard.clone(),
+        destination: absolute.clone(),
+    };
+    let metadata = match fs::symlink_metadata(&guard) {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            let error = Error::ReadFile {
+                path: guard.clone(),
+                source,
+            };
+            claimed_file.restore(path)?;
+            return Err(error);
+        }
+    };
+    if !metadata.file_type().is_file() {
+        claimed_file.restore(path)?;
+        return Err(Error::ReleaseRollbackConflict {
+            path: path.to_path_buf(),
+        });
+    }
+    let claimed_contents = match fs::read_to_string(&guard) {
+        Ok(claimed) => claimed,
+        Err(source) => {
+            let error = Error::ReadFile {
+                path: guard.clone(),
+                source,
+            };
+            claimed_file.restore(path)?;
+            return Err(error);
+        }
+    };
+    if claimed_contents != expected {
+        claimed_file.restore(path)?;
+        return Err(Error::ReleaseRollbackConflict {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if let Err(error) = release_failpoint(ReleaseApplyStage::RollbackClaimed, path, repo) {
+        preserve_applied_claim(repo, path, claimed_file)?;
+        return Err(error);
+    }
+    let result = match before {
+        ReleaseFileState::Present(contents) => {
+            install_rollback_file_if_absent(repo, path, contents)
+        }
+        ReleaseFileState::Missing => match fs::symlink_metadata(&absolute) {
+            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(Error::ReleaseRollbackConflict {
+                path: path.to_path_buf(),
+            }),
+            Err(source) => Err(Error::ReadFile {
+                path: absolute.clone(),
+                source,
+            }),
+        },
+    };
+    match result {
+        Ok(()) => claimed_file
+            .discard(repo, path)
+            .map_err(claim_discard_error),
+        Err(error) => {
+            preserve_applied_claim(repo, path, claimed_file)?;
+            Err(error)
+        }
+    }
+}
+
+fn preserve_applied_claim(
+    repo: &Repository,
+    path: &Path,
+    claimed: ClaimedReleaseFile,
+) -> Result<()> {
+    match move_path_if_absent(&claimed.file, &claimed.destination) {
+        Ok(()) => fs::remove_dir(&claimed.directory).map_err(|source| Error::RemoveDirectory {
+            path: claimed.directory,
+            source,
+        }),
+        Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => {
+            claimed.discard(repo, path).map_err(claim_discard_error)
+        }
+        Err(source) => Err(Error::WriteFile {
+            path: path.to_path_buf(),
             source,
         }),
     }
 }
 
-fn write_next_after_release(repo: &Repository, next: Option<&str>) -> Result<()> {
-    let path = next_version_path(repo);
-    let absolute = repo.resolve(&path);
-    match next {
-        Some(next) if !next.is_empty() => {
-            repo.atomic_write(&path, format!("{}\n", next.trim()).as_bytes())?;
+fn restore_into_missing_path(
+    repo: &Repository,
+    path: &Path,
+    before: &ReleaseFileState,
+) -> Result<()> {
+    release_failpoint(ReleaseApplyStage::RollbackClaimed, path, repo)?;
+    match before {
+        ReleaseFileState::Present(contents) => {
+            install_rollback_file_if_absent(repo, path, contents)
         }
-        _ => match fs::remove_file(&absolute) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(Error::WriteFile {
-                    path: absolute,
+        ReleaseFileState::Missing => Ok(()),
+    }
+}
+
+fn install_rollback_file_if_absent(repo: &Repository, path: &Path, contents: &str) -> Result<()> {
+    repo.prepare_atomic_write(path, contents.as_bytes())?
+        .commit_if_absent()
+        .map_err(|source| {
+            if source.kind() == ErrorKind::AlreadyExists {
+                Error::ReleaseRollbackConflict {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                Error::WriteFile {
+                    path: repo.resolve(path),
                     source,
-                });
+                }
             }
-        },
+        })
+}
+
+enum ReleaseClaimCommitFailure {
+    BeforeCommit(Error),
+    AfterCommit(Vec<String>),
+}
+
+fn commit_release_claims(
+    repo: &Repository,
+    applied: &mut [AppliedReleaseChange],
+    unchanged_participants: &[ReleaseFileChange],
+) -> std::result::Result<(), ReleaseClaimCommitFailure> {
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .preflight_discard(repo, &change.path)
+                .map_err(ReleaseClaimCommitFailure::BeforeCommit)?;
+        }
+    }
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .validate_retained_state(&change.path, &change.before)
+                .map_err(ReleaseClaimCommitFailure::BeforeCommit)?;
+        }
+    }
+    for change in applied.iter() {
+        validate_release_state(repo, &change.path, &change.after)
+            .map_err(ReleaseClaimCommitFailure::BeforeCommit)?;
+    }
+    for change in unchanged_participants {
+        validate_release_state(repo, &change.path, &change.after)
+            .map_err(ReleaseClaimCommitFailure::BeforeCommit)?;
+    }
+    validate_release_fragment_paths(repo, &[]).map_err(ReleaseClaimCommitFailure::BeforeCommit)?;
+    let mut failures = Vec::new();
+    for change in applied.iter_mut() {
+        let Some(original) = change.original.take() else {
+            continue;
+        };
+        match original.discard_after_commit(repo, &change.path) {
+            Ok(()) => {}
+            Err(failure) => failures.push(format!(
+                "{}: {}",
+                change.path.display(),
+                claim_discard_error(failure)
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ReleaseClaimCommitFailure::AfterCommit(failures))
+    }
+}
+
+struct AppliedReleaseChange {
+    path: PathBuf,
+    before: ReleaseFileState,
+    after: ReleaseFileState,
+    original: Option<ClaimedReleaseFile>,
+    created_directories: Vec<PathBuf>,
+}
+
+fn rollback_release(repo: &Repository, error: Error, applied: Vec<AppliedReleaseChange>) -> Error {
+    let rollback_failures = applied
+        .into_iter()
+        .rev()
+        .filter_map(|change| {
+            rollback_applied_release_change(repo, change)
+                .err()
+                .map(|error| error.to_string())
+        })
+        .collect();
+    release_apply_error(error, rollback_failures)
+}
+
+fn rollback_applied_release_change(repo: &Repository, change: AppliedReleaseChange) -> Result<()> {
+    match change.original {
+        Some(original) => {
+            restore_retained_release_original(repo, &change.path, &change.after, original)
+        }
+        None => restore_release_state(repo, &change.path, &change.before, &change.after),
+    }?;
+    remove_release_created_directories(change.created_directories)
+}
+
+fn remove_release_created_directories(directories: Vec<PathBuf>) -> Result<()> {
+    for directory in directories.into_iter().rev() {
+        fs::remove_dir(&directory).map_err(|source| Error::RemoveDirectory {
+            path: directory,
+            source,
+        })?;
     }
     Ok(())
+}
+
+fn restore_retained_release_original(
+    repo: &Repository,
+    path: &Path,
+    applied_after: &ReleaseFileState,
+    original: ClaimedReleaseFile,
+) -> Result<()> {
+    release_failpoint(ReleaseApplyStage::Rollback, path, repo)?;
+    match applied_after {
+        ReleaseFileState::Present(expected) => {
+            let applied = claim_release_file(repo, path, expected, &[]).map_err(|error| {
+                if matches!(
+                    error,
+                    Error::StaleReleasePlan { .. } | Error::ReleasePathConflict { .. }
+                ) {
+                    Error::ReleaseRollbackConflict {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    error
+                }
+            })?;
+            if let Err(error) = release_failpoint(ReleaseApplyStage::RollbackClaimed, path, repo) {
+                preserve_applied_claim(repo, path, applied)?;
+                return Err(error);
+            }
+            match original.restore(path) {
+                Ok(()) => applied.discard(repo, path).map_err(claim_discard_error),
+                Err(error) => {
+                    preserve_applied_claim(repo, path, applied)?;
+                    Err(error)
+                }
+            }
+        }
+        ReleaseFileState::Missing => {
+            match fs::symlink_metadata(repo.resolve(path)) {
+                Err(source) if source.kind() == ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(Error::ReleaseRollbackConflict {
+                        path: path.to_path_buf(),
+                    });
+                }
+                Err(source) => {
+                    return Err(Error::ReadFile {
+                        path: repo.resolve(path),
+                        source,
+                    });
+                }
+            }
+            release_failpoint(ReleaseApplyStage::RollbackClaimed, path, repo)?;
+            original.restore(path)
+        }
+    }
+}
+
+fn release_apply_error(error: Error, rollback_failures: Vec<String>) -> Error {
+    match error {
+        Error::ReleaseApply {
+            cause,
+            rollback_failures: mut existing_failures,
+        } => {
+            existing_failures.extend(rollback_failures);
+            Error::ReleaseApply {
+                cause,
+                rollback_failures: existing_failures,
+            }
+        }
+        error => Error::ReleaseApply {
+            cause: error.to_string(),
+            rollback_failures,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseApplyStage {
+    PlanSnapshot,
+    Probe,
+    Prepare,
+    Apply,
+    ApplyClaimed,
+    DiscardClaimed,
+    DiscardClaimDirectory,
+    CommittedDiscardClaimed,
+    Rollback,
+    RollbackClaimed,
+}
+
+#[cfg(not(test))]
+fn release_failpoint(_stage: ReleaseApplyStage, _path: &Path, _repo: &Repository) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASE_FAILPOINTS: std::cell::RefCell<Vec<(ReleaseApplyStage, PathBuf)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static RELEASE_INTERFERENCES: std::cell::RefCell<Vec<(ReleaseApplyStage, PathBuf, PathBuf, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static RELEASE_CLAIM_INTERFERENCES: std::cell::RefCell<Vec<(PathBuf, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn release_failpoint(stage: ReleaseApplyStage, path: &Path, repo: &Repository) -> Result<()> {
+    RELEASE_INTERFERENCES.with(|interferences| {
+        let mut interferences = interferences.borrow_mut();
+        if let Some(index) = interferences
+            .iter()
+            .position(|interference| interference.0 == stage && interference.1 == path)
+        {
+            let (_, _, target, contents) = interferences.remove(index);
+            fs::write(repo.resolve(target), contents).expect("inject concurrent release edit");
+        }
+    });
+    let should_fail = RELEASE_FAILPOINTS.with(|failpoints| {
+        let mut failpoints = failpoints.borrow_mut();
+        failpoints
+            .iter()
+            .position(|expected| expected == &(stage, path.to_path_buf()))
+            .map(|index| failpoints.remove(index))
+            .is_some()
+    });
+    if should_fail {
+        Err(Error::WriteFile {
+            path: repo.resolve(path),
+            source: std::io::Error::other("injected release I/O failure"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn set_release_failpoint(stage: ReleaseApplyStage, path: impl Into<PathBuf>) {
+    RELEASE_FAILPOINTS.with(|failpoints| failpoints.borrow_mut().push((stage, path.into())));
+}
+
+#[cfg(test)]
+fn set_release_interference(
+    stage: ReleaseApplyStage,
+    trigger: impl Into<PathBuf>,
+    target: impl Into<PathBuf>,
+    contents: impl Into<String>,
+) {
+    RELEASE_INTERFERENCES.with(|interferences| {
+        interferences
+            .borrow_mut()
+            .push((stage, trigger.into(), target.into(), contents.into()));
+    });
+}
+
+#[cfg(test)]
+fn set_release_claim_interference(path: impl Into<PathBuf>, contents: impl Into<String>) {
+    RELEASE_CLAIM_INTERFERENCES.with(|interferences| {
+        interferences
+            .borrow_mut()
+            .push((path.into(), contents.into()));
+    });
+}
+
+#[cfg(test)]
+fn inject_release_claim_interference(path: &Path, claimed: &Path) {
+    RELEASE_CLAIM_INTERFERENCES.with(|interferences| {
+        let mut interferences = interferences.borrow_mut();
+        if let Some(index) = interferences
+            .iter()
+            .position(|(expected, _)| expected == path)
+        {
+            let (_, contents) = interferences.remove(index);
+            fs::write(claimed, contents).expect("inject concurrent retained-original edit");
+        }
+    });
+}
+
+#[cfg(test)]
+fn clear_release_failpoint() {
+    RELEASE_FAILPOINTS.with(|failpoints| failpoints.borrow_mut().clear());
+    RELEASE_INTERFERENCES.with(|interferences| interferences.borrow_mut().clear());
+    RELEASE_CLAIM_INTERFERENCES.with(|interferences| interferences.borrow_mut().clear());
 }
 
 fn released_markdown(
@@ -1874,8 +3427,8 @@ fn is_leap_year(year: i32) -> bool {
 
 fn sync_after_mutation(repo: &Repository) -> Result<Option<SyncResult>> {
     if repo.config().changelog.materialize {
-        let plan = plan_sync(repo, SyncOptions { force: true })?;
-        return apply_sync(repo, plan).map(Some);
+        let plan = plan_sync_unlocked(repo, SyncOptions { force: true })?;
+        return apply_sync_unlocked(repo, plan).map(Some);
     }
     Ok(None)
 }
@@ -1885,7 +3438,7 @@ fn ensure_materialized_current_before_mutation(repo: &Repository) -> Result<()> 
         return Ok(());
     }
 
-    match plan_sync(repo, SyncOptions { force: false })? {
+    match plan_sync_unlocked(repo, SyncOptions { force: false })? {
         SyncPlan::Skipped(_) | SyncPlan::Apply(_) => Ok(()),
         SyncPlan::NeedsConfirmation { .. } => Err(Error::SyncNeedsConfirmation {
             path: repo.config().changelog.path.clone(),
@@ -2191,6 +3744,70 @@ fn render_init_config(config: &Config) -> String {
     output.push_str("[check]\n");
     output.push_str("paths = []\n");
     output
+}
+
+fn validate_init_changelog_path(
+    config_path: &Path,
+    changelog_path: &Path,
+    configured_changelog_path: &Path,
+) -> Result<()> {
+    let config_identity = filesystem_path_identity(config_path)?;
+    let changelog_identity = filesystem_path_identity(changelog_path)?;
+    if release_paths_overlap(&config_identity, &changelog_identity, true) {
+        return Err(Error::InitConflict {
+            message: format!(
+                "changelog path {} overlaps {}",
+                configured_changelog_path.display(),
+                Repository::CONFIG_FILE
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn create_initial_changelog_if_absent(
+    config_path: &Path,
+    changelog_path: &Path,
+    configured_changelog_path: &Path,
+    config: &Config,
+) -> Result<bool> {
+    if let Some(parent) = changelog_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(changelog_path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+            validate_init_changelog_path(config_path, changelog_path, configured_changelog_path)?;
+            if changelog_path.is_file() {
+                return Ok(false);
+            }
+            return Err(Error::InitConflict {
+                message: format!(
+                    "{} exists but is not a file",
+                    configured_changelog_path.display()
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(Error::WriteFile {
+                path: changelog_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    file.write_all(initial_changelog_for_config(config).as_bytes())
+        .map_err(|source| Error::WriteFile {
+            path: changelog_path.to_path_buf(),
+            source,
+        })?;
+    Ok(true)
 }
 
 fn toml_vcs_region(region: RegionDetection) -> &'static str {
@@ -2737,6 +4354,54 @@ mod tests {
         value.as_ref().replace('\\', "/")
     }
 
+    fn assert_no_release_artifacts(root: &Path) {
+        fn collect(directory: &Path, artifacts: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(directory).expect("repository entries") {
+                let entry = entry.expect("repository entry");
+                let path = entry.path();
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".sacho-claim-")
+                    || name.to_string_lossy().starts_with(".sacho-probe-")
+                {
+                    artifacts.push(path);
+                } else if entry.file_type().expect("entry type").is_dir() {
+                    collect(&path, artifacts);
+                }
+            }
+        }
+
+        let mut artifacts = Vec::new();
+        collect(root, &mut artifacts);
+        assert!(
+            artifacts.is_empty(),
+            "unexpected release transaction artifacts: {artifacts:?}"
+        );
+    }
+
+    fn retained_release_claim_contents(root: &Path) -> Vec<String> {
+        fn collect(directory: &Path, claims: &mut Vec<String>) {
+            for entry in fs::read_dir(directory).expect("repository entries") {
+                let entry = entry.expect("repository entry");
+                let path = entry.path();
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".sacho-claim-") {
+                    claims.push(fs::read_to_string(path.join("claimed")).expect("retained claim"));
+                } else if entry.file_type().expect("entry type").is_dir() {
+                    collect(&path, claims);
+                }
+            }
+        }
+
+        let mut claims = Vec::new();
+        collect(root, &mut claims);
+        claims.sort();
+        claims
+    }
+
+    fn assert_mutation_locked<T>(result: Result<T>) {
+        assert!(matches!(result, Err(Error::ReleaseLocked)));
+    }
+
     #[test]
     fn git_root_output_ignores_empty_output() {
         assert_eq!(parse_git_root_output(" \n"), None);
@@ -2791,6 +4456,172 @@ mod tests {
                 .expect("changelog")
                 .contains("To be released.")
         );
+    }
+
+    #[test]
+    fn init_acquires_the_repository_lock_before_creating_configuration() {
+        let temp = TempDir::new().expect("tempdir");
+        let _lock = acquire_mutation_lock_at_root(temp.path()).expect("bootstrap lock");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(PathBuf::from("docs/changes.md")),
+                fragment_directory: Some(PathBuf::from("fragments")),
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("concurrent init lock");
+
+        assert!(matches!(error, Error::ReleaseLocked));
+        assert!(!temp.path().join("sacho.toml").exists());
+        assert!(!temp.path().join("docs/changes.md").exists());
+        assert!(!temp.path().join("fragments").exists());
+    }
+
+    #[test]
+    fn init_rejects_the_mutation_lock_as_the_changelog_path() {
+        let temp = TempDir::new().expect("tempdir");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(PathBuf::from(MUTATION_LOCK_FILE)),
+                fragment_directory: Some(PathBuf::from("fragments")),
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("mutation lock changelog");
+
+        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
+        assert!(!temp.path().join("fragments").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
+            ""
+        );
+    }
+
+    #[test]
+    fn init_rejects_the_git_mutation_lock_as_the_changelog_path() {
+        let temp = TempDir::new().expect("tempdir");
+        git(temp.path(), ["init"]).expect("git init");
+        let lock_path = PathBuf::from(".git/sacho.lock");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(lock_path.clone()),
+                fragment_directory: Some(PathBuf::from("fragments")),
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("Git mutation lock changelog");
+
+        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
+        assert!(!temp.path().join("fragments").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join(lock_path)).expect("mutation lock"),
+            ""
+        );
+    }
+
+    #[test]
+    fn init_rejects_the_configuration_file_as_the_changelog_path() {
+        let temp = TempDir::new().expect("tempdir");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(PathBuf::from(Repository::CONFIG_FILE)),
+                fragment_directory: Some(PathBuf::from("fragments")),
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("configuration changelog alias");
+
+        assert!(matches!(error, Error::InitConflict { .. }));
+        assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
+        assert!(!temp.path().join("fragments").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_does_not_overwrite_configuration_through_a_changelog_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let alias = PathBuf::from("SACHO.TOML");
+        symlink(Repository::CONFIG_FILE, temp.path().join(&alias)).expect("dangling alias");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: Some(alias.clone()),
+                fragment_directory: Some(PathBuf::from("fragments")),
+                materialize: Some(true),
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("configuration changelog alias");
+
+        assert!(matches!(error, Error::InitConflict { .. }));
+        let config = fs::read_to_string(temp.path().join(Repository::CONFIG_FILE))
+            .expect("configuration remains readable");
+        Config::parse(&config).expect("configuration remains valid");
+        assert_eq!(
+            fs::read_link(temp.path().join(alias)).expect("changelog alias"),
+            PathBuf::from(Repository::CONFIG_FILE)
+        );
+    }
+
+    #[test]
+    fn initial_changelog_creation_preserves_a_concurrently_created_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(Repository::CONFIG_FILE);
+        let changelog_path = temp.path().join("CHANGES.md");
+        let config = Config::parse("").expect("default config");
+        fs::write(&config_path, render_init_config(&config)).expect("configuration");
+        fs::write(&changelog_path, "Concurrent changelog.\n").expect("concurrent changelog");
+
+        let created = create_initial_changelog_if_absent(
+            &config_path,
+            &changelog_path,
+            &config.changelog.path,
+            &config,
+        )
+        .expect("preserve concurrent changelog");
+
+        assert!(!created);
+        assert_eq!(
+            fs::read_to_string(changelog_path).expect("changelog"),
+            "Concurrent changelog.\n"
+        );
+    }
+
+    #[test]
+    fn mutation_lock_creation_race_matches_only_an_existing_lock_file() {
+        assert!(mutation_lock_was_created_concurrently(
+            &std::io::Error::from(ErrorKind::AlreadyExists)
+        ));
+        assert!(!mutation_lock_was_created_concurrently(
+            &std::io::Error::from(ErrorKind::PermissionDenied)
+        ));
     }
 
     #[test]
@@ -3492,6 +5323,11 @@ mod tests {
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
             "1.3.0\n"
         );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("post-release check")
+                .is_clean()
+        );
     }
 
     #[test]
@@ -3524,6 +5360,44 @@ mod tests {
         );
         assert!(!temp.path().join("changes.d/add.md").exists());
         assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn release_rejects_a_hand_edit_in_the_retained_changelog_snapshot() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Added release.\n",
+        )
+        .expect("changelog");
+        let hand_edited = "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Hand-edited release.\n";
+        set_release_interference(
+            ReleaseApplyStage::PlanSnapshot,
+            PathBuf::from("CHANGES.md"),
+            PathBuf::from("CHANGES.md"),
+            hand_edited,
+        );
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("retained hand edit");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::SyncNeedsConfirmation { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            hand_edited
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
     }
 
     #[test]
@@ -3799,9 +5673,9 @@ mod tests {
         )
         .expect("stale changelog");
 
-        let error = apply_release(&repo, plan).expect_err("missing unreleased region");
+        let error = apply_release(&repo, plan).expect_err("stale changelog");
 
-        assert!(matches!(error, Error::RegionNotFound { .. }));
+        assert!(matches!(error, Error::StaleReleasePlan { .. }));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
             " -  Added release.\n"
@@ -3813,56 +5687,2157 @@ mod tests {
     }
 
     #[test]
-    fn release_ignores_consumed_fragment_that_is_already_absent() {
+    fn release_prepare_failure_changes_nothing() {
         let (temp, repo) = repo_with_config(
             r#"
             [changelog]
             materialize = false
             "#,
         );
-
-        apply_release(
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
             &repo,
-            ReleasePlan {
-                version: String::from("1.2.0"),
-                date: ReleaseDate::parse("2026-07-08").expect("date"),
-                next: None,
-                released_markdown: String::from(
-                    "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n",
-                ),
-                consumed_fragments: vec![PathBuf::from("changes.d/missing.md")],
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
             },
         )
-        .expect("release");
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Prepare, PathBuf::from("changes.d/next"));
+
+        let error = apply_release(&repo, plan).expect_err("prepare failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::WriteFile { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn release_move_probe_failure_changes_nothing() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Probe, PathBuf::from("CHANGES.md"));
+
+        let error = apply_release(&repo, plan).expect_err("move probe failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseTransactionUnsupported));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn release_changelog_prepare_or_replace_failure_changes_nothing() {
+        for stage in [ReleaseApplyStage::Prepare, ReleaseApplyStage::Apply] {
+            let (temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                materialize = false
+                "#,
+            );
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            let old_changelog = "Changelog\n=========\n";
+            fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+            fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+            fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n")
+                .expect("fragment");
+            let plan = plan_release(
+                &repo,
+                ReleaseOptions {
+                    version: None,
+                    date: Some(String::from("2026-07-08")),
+                    next: Some(String::from("1.3.0")),
+                },
+            )
+            .expect("plan");
+            set_release_failpoint(stage, PathBuf::from("CHANGES.md"));
+
+            apply_release(&repo, plan).expect_err("changelog failure");
+            clear_release_failpoint();
+
+            assert_eq!(
+                fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+                old_changelog
+            );
+            assert_eq!(
+                fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+                "1.2.0\n"
+            );
+            assert!(temp.path().join("changes.d/add.md").exists());
+        }
+    }
+
+    #[test]
+    fn release_does_not_replace_a_changelog_edited_after_validation() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("CHANGES.md"),
+            PathBuf::from("CHANGES.md"),
+            "Concurrent changelog edit.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("concurrent changelog edit");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Concurrent changelog edit.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_failure_removes_directories_created_while_preparing_writes() {
+        for stage in [ReleaseApplyStage::Prepare, ReleaseApplyStage::Apply] {
+            let (temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                path = "generated/changelog/CHANGES.md"
+                materialize = false
+                "#,
+            );
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+            fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n")
+                .expect("fragment");
+            let plan = plan_release(
+                &repo,
+                ReleaseOptions {
+                    version: None,
+                    date: Some(String::from("2026-07-08")),
+                    next: Some(String::from("1.3.0")),
+                },
+            )
+            .expect("plan");
+            set_release_failpoint(stage, PathBuf::from("changes.d/next"));
+
+            apply_release(&repo, plan).expect_err("release failure");
+            clear_release_failpoint();
+
+            assert!(!temp.path().join("generated").exists(), "stage: {stage:?}");
+            assert_eq!(
+                fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+                "1.2.0\n"
+            );
+            assert!(temp.path().join("changes.d/add.md").exists());
+        }
+    }
+
+    #[test]
+    fn release_does_not_delete_a_fragment_edited_after_validation() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/add.md"),
+            " -  Concurrent fragment edit.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("concurrent fragment edit");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Concurrent fragment edit.\n"
+        );
+    }
+
+    #[test]
+    fn release_does_not_replace_an_edit_created_after_claiming_a_path() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::ApplyClaimed,
+            PathBuf::from("CHANGES.md"),
+            PathBuf::from("CHANGES.md"),
+            "Edit created after claim.\n",
+        );
+        set_release_failpoint(ReleaseApplyStage::ApplyClaimed, PathBuf::from("CHANGES.md"));
+
+        let error = apply_release(&repo, plan).expect_err("edit after claim");
+        clear_release_failpoint();
+
+        match error {
+            Error::ReleaseApply {
+                cause,
+                rollback_failures,
+            } => {
+                assert!(cause.contains("injected release I/O failure"));
+                assert_eq!(rollback_failures.len(), 1);
+                assert!(rollback_failures[0].contains("changed after the release wrote it"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Edit created after claim.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_retains_original_when_replacement_destination_is_recreated() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::ApplyClaimed,
+            PathBuf::from("CHANGES.md"),
+            PathBuf::from("CHANGES.md"),
+            "Concurrent changelog.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("replacement collision");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::ReleaseApply {
+                rollback_failures,
+                ..
+            } if rollback_failures.iter().any(|failure| failure.contains("changed after the release wrote it"))
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Concurrent changelog.\n"
+        );
+        assert_eq!(
+            retained_release_claim_contents(temp.path()),
+            [old_changelog]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_retains_original_when_deletion_destination_is_recreated() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        let old_fragment = " -  Added release.\n";
+        fs::write(temp.path().join("changes.d/add.md"), old_fragment).expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::ApplyClaimed,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/add.md"),
+            " -  Concurrent fragment.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("deletion collision");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::ReleaseApply {
+                rollback_failures,
+                ..
+            } if rollback_failures.iter().any(|failure| failure.contains("changed after the release wrote it"))
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Concurrent fragment.\n"
+        );
+        assert_eq!(retained_release_claim_contents(temp.path()), [old_fragment]);
+    }
+
+    #[test]
+    fn release_retains_fragment_apply_error_when_claim_restoration_fails() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::ApplyClaimed,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/add.md"),
+            " -  Concurrent fragment edit.\n",
+        );
+        set_release_failpoint(
+            ReleaseApplyStage::ApplyClaimed,
+            PathBuf::from("changes.d/add.md"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("fragment restore collision");
+        clear_release_failpoint();
+
+        match error {
+            Error::ReleaseApply {
+                cause,
+                rollback_failures,
+            } => {
+                assert!(cause.contains("injected release I/O failure"));
+                assert_eq!(rollback_failures.len(), 1);
+                assert!(rollback_failures[0].contains("changed after the release wrote it"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Concurrent fragment edit.\n"
+        );
+    }
+
+    #[test]
+    fn release_does_not_replace_a_missing_path_created_during_apply() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("changes.d/next"),
+            PathBuf::from("changes.d/next"),
+            "Concurrent next version.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("concurrent next creation");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "Concurrent next version.\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_claim_failure_restores_the_claimed_path() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::ApplyClaimed, PathBuf::from("CHANGES.md"));
+
+        apply_release(&repo, plan).expect_err("failure after claim");
+        clear_release_failpoint();
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+            old_changelog
         );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_next_apply_failure_rolls_back_changelog_and_keeps_fragments() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+
+        let error = apply_release(&repo, plan).expect_err("next apply failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::ReleaseApply {
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_fragment_delete_failure_restores_every_applied_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/a.md"), " -  Added A.\n").expect("fragment a");
+        fs::write(temp.path().join("changes.d/b.md"), " -  Added B.\n").expect("fragment b");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/b.md"));
+
+        let error = apply_release(&repo, plan).expect_err("fragment delete failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/a.md")).expect("fragment a"),
+            " -  Added A.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/b.md")).expect("fragment b"),
+            " -  Added B.\n"
+        );
+    }
+
+    #[test]
+    fn release_changelog_discard_failure_restores_every_applied_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(
+            ReleaseApplyStage::DiscardClaimed,
+            PathBuf::from("CHANGES.md"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("changelog discard failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn release_fragment_discard_failure_restores_every_applied_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(
+            ReleaseApplyStage::DiscardClaimed,
+            PathBuf::from("changes.d/add.md"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("fragment discard failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn release_reports_post_commit_claim_cleanup_without_rolling_back() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(
+            ReleaseApplyStage::CommittedDiscardClaimed,
+            PathBuf::from("changes.d/next"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("committed cleanup failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseCleanup { .. }));
+        assert!(
+            fs::read_to_string(temp.path().join("CHANGES.md"))
+                .expect("released changelog")
+                .contains("Added release.")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.3.0\n"
+        );
+        assert!(!temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_revalidates_applied_changelog_before_committing_claims() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("CHANGES.md"),
+            "Concurrent changelog edit.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("changed applied changelog");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Concurrent changelog edit.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+    }
+
+    #[test]
+    fn release_revalidates_unchanged_next_file_before_committing_claims() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        assert_eq!(plan.next_file.before, ReleaseFileState::Missing);
+        assert_eq!(plan.next_file.after, ReleaseFileState::Missing);
+        set_release_interference(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/next"),
+            "1.3.0\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("concurrently created next file");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.3.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+    }
+
+    #[test]
+    fn release_revalidates_fragment_absence_before_committing_claims() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/add.md"),
+            " -  Concurrent fragment.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("recreated fragment");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Concurrent fragment.\n"
+        );
+    }
+
+    #[test]
+    fn release_revalidates_retained_originals_before_committing_claims() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_claim_interference(
+            PathBuf::from("CHANGES.md"),
+            "Concurrent edit through retained inode.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("changed retained original");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Concurrent edit through retained inode.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+    }
+
+    #[test]
+    fn release_rechecks_for_new_fragments_before_committing_claims() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/add.md"),
+            PathBuf::from("changes.d/concurrent.md"),
+            " -  Concurrent fragment.\n",
+        );
+
+        let error = apply_release(&repo, plan).expect_err("new fragment");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/concurrent.md"))
+                .expect("concurrent fragment"),
+            " -  Concurrent fragment.\n"
+        );
+    }
+
+    #[test]
+    fn release_next_claim_directory_cleanup_failure_restores_the_deleted_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/next"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("next claim cleanup failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_fragment_claim_directory_cleanup_failure_restores_the_deleted_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let old_changelog = "Changelog\n=========\n";
+        fs::write(temp.path().join("CHANGES.md"), old_changelog).expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(
+            ReleaseApplyStage::DiscardClaimDirectory,
+            PathBuf::from("changes.d/add.md"),
+        );
+
+        let error = apply_release(&repo, plan).expect_err("fragment claim cleanup failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::ReleaseApply { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+    }
+
+    #[test]
+    fn materialized_release_failure_restores_exact_changelog_bytes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let old_changelog = format!(
+            "Project changes\n===============\n\n{}\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n\nHistorical  spacing.\n",
+            compiled.markdown
+        );
+        fs::write(temp.path().join("CHANGES.md"), &old_changelog).expect("changelog");
+        apply_sync(
+            &repo,
+            plan_sync(&repo, SyncOptions { force: true }).expect("sync plan"),
+        )
+        .expect("sync");
+        let old_changelog =
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("synced changelog");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+
+        apply_release(&repo, plan).expect_err("next apply failure");
+        clear_release_failpoint();
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            old_changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_rollback_restores_the_original_changelog_inode_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let changelog_path = temp.path().join("CHANGES.md");
+        let changelog_alias = temp.path().join("CHANGES.alias");
+        fs::write(&changelog_path, "Changelog\n=========\n").expect("changelog");
+        let mut permissions = fs::metadata(&changelog_path)
+            .expect("changelog metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&changelog_path, permissions).expect("executable changelog");
+        fs::hard_link(&changelog_path, &changelog_alias).expect("changelog hard link");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let before = fs::metadata(&changelog_path).expect("before metadata");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+
+        apply_release(&repo, plan).expect_err("next apply failure");
+        clear_release_failpoint();
+
+        let after = fs::metadata(&changelog_path).expect("restored metadata");
+        let alias = fs::metadata(&changelog_alias).expect("alias metadata");
+        assert_eq!(after.dev(), before.dev());
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.ino(), alias.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.nlink(), before.nlink());
+    }
+
+    #[test]
+    fn release_reports_original_and_rollback_failures() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+        set_release_failpoint(ReleaseApplyStage::Rollback, PathBuf::from("CHANGES.md"));
+
+        let error = apply_release(&repo, plan).expect_err("apply and rollback failure");
+        clear_release_failpoint();
+
+        match error {
+            Error::ReleaseApply {
+                cause,
+                rollback_failures,
+            } => {
+                assert!(cause.contains("changes.d/next"));
+                assert_eq!(rollback_failures.len(), 1);
+                assert!(rollback_failures[0].contains("CHANGES.md"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn release_rollback_preserves_concurrent_edits_and_reports_conflict() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("changes.d/next"),
+            PathBuf::from("CHANGES.md"),
+            "Concurrent changelog edit.\n",
+        );
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+
+        let error = apply_release(&repo, plan).expect_err("next apply failure");
+        clear_release_failpoint();
+
+        match error {
+            Error::ReleaseApply {
+                rollback_failures, ..
+            } => {
+                assert_eq!(rollback_failures.len(), 1);
+                assert!(rollback_failures[0].contains("changed after the release wrote it"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Concurrent changelog edit.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_rollback_does_not_clobber_edit_created_after_claiming_applied_file() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        set_release_interference(
+            ReleaseApplyStage::RollbackClaimed,
+            PathBuf::from("CHANGES.md"),
+            PathBuf::from("CHANGES.md"),
+            "Edit created during rollback.\n",
+        );
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("changes.d/next"));
+
+        let error = apply_release(&repo, plan).expect_err("next apply failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::ReleaseApply {
+                rollback_failures,
+                ..
+            } if rollback_failures.len() == 1
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("concurrent changelog"),
+            "Edit created during rollback.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_rejects_overlapping_changelog_and_next_paths() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            path = "changes.d/next"
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect_err("overlapping paths");
+
+        assert!(matches!(
+            error,
+            Error::ReleasePathOverlap { first, second }
+                if first == Path::new("changes.d/next")
+                    && second == Path::new("changes.d/next")
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_rejects_ancestor_overlap_between_missing_participants() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            path = "changes.d/next/CHANGES.md"
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect_err("ancestor overlap");
+
+        assert!(matches!(
+            error,
+            Error::ReleasePathOverlap { first, second }
+                if first == Path::new("changes.d/next/CHANGES.md")
+                    && second == Path::new("changes.d/next")
+        ));
+        assert!(!temp.path().join("changes.d/next").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
+            " -  Added release.\n"
+        );
+    }
+
+    #[test]
+    fn release_apply_revalidates_distinct_paths() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let mut plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        plan.next_file.path = plan.changelog.path.clone();
+
+        let error = apply_release(&repo, plan).expect_err("overlapping applied paths");
+
+        assert!(matches!(error, Error::ReleasePathOverlap { .. }));
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_temporary_paths_do_not_collide_with_participants() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            path = "meta/out"
+            materialize = false
+
+            [fragments]
+            directory = "meta"
+            next-file = "out.tmp"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("meta")).expect("fragments dir");
+        fs::write(temp.path().join("meta/out.tmp"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("meta/add.md"), " -  Added release.\n").expect("fragment");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        assert!(
+            fs::read_to_string(temp.path().join("meta/out"))
+                .expect("changelog")
+                .contains("Added release.")
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("meta/out.tmp")).expect("next"),
+            "1.3.0\n"
+        );
+        assert!(!temp.path().join("meta/add.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_accepts_a_read_only_configuration_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        let config_path = temp.path().join("sacho.toml");
+        let mut permissions = fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&config_path, permissions).expect("read-only config");
+
+        apply_release(&repo, plan).expect("release");
+
+        assert!(temp.path().join("CHANGES.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.3.0\n"
+        );
+        assert!(!temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn release_apply_rejects_a_concurrent_repository_release_lock() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: Some(String::from("1.3.0")),
+            },
+        )
+        .expect("plan");
+        let _lock = acquire_mutation_lock_at_root(temp.path()).expect("hold release lock");
+
+        let error = apply_release(&repo, plan).expect_err("concurrent release lock");
+
+        assert!(matches!(error, Error::ReleaseLocked));
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/add.md").exists());
+    }
+
+    #[test]
+    fn every_repository_mutation_honors_the_shared_lock() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let _lock = acquire_mutation_lock_at_root(temp.path()).expect("hold mutation lock");
+
+        assert_mutation_locked(init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        ));
+        assert_mutation_locked(add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("locked"),
+            },
+        ));
+        assert_mutation_locked(set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        ));
+        assert_mutation_locked(format_fragments(&repo, FormatOptions));
+        assert_mutation_locked(apply_sync(
+            &repo,
+            SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled),
+        ));
+        assert_mutation_locked(prepare_check_fix(&repo));
+        assert_mutation_locked(plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        ));
+        assert_mutation_locked(carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.0"),
+            },
+        ));
+
+        assert!(!temp.path().join("changes.d/locked.md").exists());
+        assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn release_path_identity_rejects_non_directory_ancestors() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(temp.path().join("not-a-directory"), "file\n").expect("file");
+
+        let error = release_path_identity(&repo, Path::new("not-a-directory/child"))
+            .expect_err("non-directory ancestor");
+
+        assert!(
+            matches!(error, Error::ReadFile { source, .. } if source.kind() == ErrorKind::NotADirectory)
+        );
+    }
+
+    #[test]
+    fn mutation_lock_identity_does_not_prefix_a_relative_root_twice() {
+        let temp = TempDir::new_in(".").expect("relative tempdir");
+        let current = std::env::current_dir().expect("current directory");
+        let root = temp
+            .path()
+            .strip_prefix(&current)
+            .expect("tempdir below current directory")
+            .to_path_buf();
+        assert!(root.is_relative());
+        let path = root.join(MUTATION_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("mutation lock");
+        let lock = MutationLock { file, path };
+
+        let error = validate_mutation_lock_path(&root, &lock, Path::new(MUTATION_LOCK_FILE))
+            .expect_err("relative mutation lock alias");
+
+        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+    }
+
+    #[test]
+    fn release_path_identity_cancels_a_missing_component_before_parent() {
+        let (temp, repo) = repo_with_config("");
+
+        let identity = release_path_identity(&repo, Path::new("nested/../CHANGES.md"))
+            .expect("missing component followed by parent");
+
+        assert_eq!(
+            identity,
+            fs::canonicalize(temp.path())
+                .expect("repository root")
+                .join("CHANGES.md")
+        );
+    }
+
+    #[test]
+    fn release_path_overlap_respects_filesystem_case_sensitivity() {
+        let upper = Path::new("/repo/Meta/next");
+        let lower = Path::new("/repo/meta/next");
+        let lower_child = Path::new("/repo/meta/next/child");
+
+        assert!(!release_paths_overlap(upper, lower, true));
+        assert!(release_paths_overlap(upper, lower, false));
+        assert!(release_paths_overlap(upper, lower_child, false));
+    }
+
+    #[test]
+    fn release_path_pair_is_case_sensitive_only_when_both_filesystems_are() {
+        assert!(release_path_pair_case_sensitive(true, true));
+        assert!(!release_path_pair_case_sensitive(true, false));
+        assert!(!release_path_pair_case_sensitive(false, true));
+        assert!(!release_path_pair_case_sensitive(false, false));
+    }
+
+    #[test]
+    fn release_path_case_sensitivity_uses_only_the_matching_cached_directory() {
+        let temp = TempDir::new().expect("temporary directory");
+        let directory = fs::canonicalize(temp.path()).expect("canonical temporary directory");
+        let identity = directory.join("missing");
+        let unrelated = directory.join("unrelated");
+        let mut cache = vec![(unrelated, true), (directory.clone(), false)];
+
+        assert!(
+            !release_path_case_sensitivity(&identity, std::slice::from_ref(&identity), &mut cache,)
+                .expect("cached case sensitivity")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_path_identity_resolves_symlinks_before_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("actual/nested")).expect("actual directory");
+        fs::write(temp.path().join("actual/shared"), "shared\n").expect("shared file");
+        symlink(
+            temp.path().join("actual/nested"),
+            temp.path().join("linked"),
+        )
+        .expect("directory symlink");
+
+        let through_symlink =
+            release_path_identity(&repo, Path::new("linked/../shared")).expect("symlink path");
+        let direct = release_path_identity(&repo, Path::new("actual/shared")).expect("direct path");
+
+        assert_eq!(through_symlink, direct);
+    }
+
+    #[test]
+    fn release_claim_error_kind_matching_is_exact() {
+        let not_found = std::io::Error::from(ErrorKind::NotFound);
+        let already_exists = std::io::Error::from(ErrorKind::AlreadyExists);
+
+        assert!(error_has_kind(&not_found, ErrorKind::NotFound));
+        assert!(!error_has_kind(&not_found, ErrorKind::AlreadyExists));
+        assert!(error_has_kind(&already_exists, ErrorKind::AlreadyExists));
+        assert!(!error_has_kind(&already_exists, ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn release_claim_paths_avoid_participants_and_their_ancestors() {
+        let claim = Path::new("/repo/.sacho-claim-1");
+        let exact = vec![claim.to_path_buf()];
+        let nested = vec![claim.join("claimed")];
+        let unrelated = vec![PathBuf::from("/repo/changes.d/add.md")];
+        let containing = vec![PathBuf::from("/repo")];
+
+        assert!(release_claim_path_conflicts(claim, &exact));
+        assert!(release_claim_path_conflicts(claim, &nested));
+        assert!(!release_claim_path_conflicts(claim, &unrelated));
+        assert!(!release_claim_path_conflicts(claim, &containing));
+        assert!(!release_claim_path_conflicts(claim, &[]));
+    }
+
+    #[test]
+    fn release_rollback_classifies_a_missing_applied_file_as_conflict() {
+        let (_temp, repo) = repo_with_config("");
+
+        let error = restore_release_state(
+            &repo,
+            Path::new("CHANGES.md"),
+            &ReleaseFileState::Present(String::from("before\n")),
+            &ReleaseFileState::Present(String::from("applied\n")),
+        )
+        .expect_err("missing applied file");
+
+        assert!(matches!(error, Error::ReleaseRollbackConflict { .. }));
+    }
+
+    #[test]
+    fn release_rollback_can_remove_an_applied_file_conditionally() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(temp.path().join("created-by-release"), "applied\n").expect("applied file");
+
+        restore_release_state(
+            &repo,
+            Path::new("created-by-release"),
+            &ReleaseFileState::Missing,
+            &ReleaseFileState::Present(String::from("applied\n")),
+        )
+        .expect("rollback removal");
+
+        assert!(!temp.path().join("created-by-release").exists());
+    }
+
+    #[test]
+    fn release_rollback_discards_guard_when_concurrent_destination_exists() {
+        let (temp, repo) = repo_with_config("");
+        let absolute = temp.path().join("CHANGES.md");
+        let directory = temp.path().join(".sacho-claim-test");
+        fs::create_dir(&directory).expect("claim directory");
+        let guard = directory.join("claimed");
+        fs::write(&absolute, "concurrent\n").expect("concurrent destination");
+        fs::write(&guard, "applied\n").expect("guard");
+        let claimed = ClaimedReleaseFile {
+            directory,
+            file: guard.clone(),
+            destination: absolute.clone(),
+        };
+
+        preserve_applied_claim(&repo, Path::new("CHANGES.md"), claimed)
+            .expect("preserve concurrent destination");
+
+        assert_eq!(
+            fs::read_to_string(absolute).expect("destination"),
+            "concurrent\n"
+        );
+        assert!(!guard.exists());
+    }
+
+    #[test]
+    fn release_rollback_classifies_conditional_install_collision_as_conflict() {
+        let (temp, repo) = repo_with_config("");
+        fs::write(temp.path().join("CHANGES.md"), "concurrent\n").expect("destination");
+
+        let error = install_rollback_file_if_absent(&repo, Path::new("CHANGES.md"), "before\n")
+            .expect_err("conditional install collision");
+
+        assert!(matches!(error, Error::ReleaseRollbackConflict { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("destination"),
+            "concurrent\n"
+        );
+    }
+
+    #[test]
+    fn release_rollback_classifies_claim_restore_collision_as_conflict() {
+        let (temp, _repo) = repo_with_config("");
+        let absolute = temp.path().join("CHANGES.md");
+        let directory = temp.path().join(".sacho-claim-test");
+        fs::create_dir(&directory).expect("claim directory");
+        let guard = directory.join("claimed");
+        fs::write(&absolute, "new concurrent path\n").expect("destination");
+        fs::write(&guard, "claimed concurrent edit\n").expect("guard");
+        let claimed = ClaimedReleaseFile {
+            directory,
+            file: guard.clone(),
+            destination: absolute.clone(),
+        };
+
+        let error = claimed
+            .restore(Path::new("CHANGES.md"))
+            .expect_err("claim restore collision");
+
+        assert!(matches!(error, Error::ReleaseRollbackConflict { .. }));
+        assert_eq!(
+            fs::read_to_string(absolute).expect("destination"),
+            "new concurrent path\n"
+        );
+        assert_eq!(
+            fs::read_to_string(guard).expect("guard"),
+            "claimed concurrent edit\n"
+        );
+    }
+
+    #[test]
+    fn release_rollback_restores_a_concurrent_directory_replacement() {
+        let (temp, repo) = repo_with_config("");
+        let path = temp.path().join("CHANGES.md");
+        fs::create_dir(&path).expect("concurrent directory");
+        fs::write(path.join("entry"), "concurrent\n").expect("directory entry");
+
+        let error = restore_release_state(
+            &repo,
+            Path::new("CHANGES.md"),
+            &ReleaseFileState::Present(String::from("before\n")),
+            &ReleaseFileState::Present(String::from("applied\n")),
+        )
+        .expect_err("concurrent directory");
+
+        assert!(matches!(error, Error::ReleaseRollbackConflict { .. }));
+        assert!(path.is_dir());
+        assert_eq!(
+            fs::read_to_string(path.join("entry")).expect("directory entry"),
+            "concurrent\n"
+        );
+    }
+
+    #[test]
+    fn release_claim_directories_are_uniquely_reserved() {
+        let (temp, _repo) = repo_with_config("");
+        let destination = temp.path().join("CHANGES.md");
+
+        let first = reserve_release_claim_directory(&destination, &[]).expect("first claim");
+        let second = reserve_release_claim_directory(&destination, &[]).expect("second claim");
+
+        assert_ne!(first, second);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+        fs::remove_dir(first).expect("remove first claim");
+        fs::remove_dir(second).expect("remove second claim");
+    }
+
+    #[test]
+    fn release_compiles_the_exact_fragment_snapshots_it_retains() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let fragment = temp.path().join("changes.d/change.md");
+        fs::write(&fragment, " -  Original entry.\n").expect("fragment");
+        let (snapshots, parsed) = snapshot_release_fragments(&repo).expect("snapshots");
+        fs::write(&fragment, " -  Concurrent replacement.\n").expect("concurrent edit");
+
+        let compiled = compile_parsed_fragments(
+            &repo,
+            CompileOptions::default(),
+            VersionLabel::Unreleased,
+            parsed,
+        )
+        .expect("compile snapshots");
+
+        assert_eq!(snapshots[0].contents, " -  Original entry.\n");
+        assert!(compiled.markdown.contains("Original entry."));
+        assert!(!compiled.markdown.contains("Concurrent replacement."));
+    }
+
+    #[test]
+    fn release_rejects_fragment_added_after_planning() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/planned.md"),
+            " -  Planned entry.\n",
+        )
+        .expect("planned fragment");
+        let changelog = compile_unreleased(&repo, CompileOptions::default())
+            .expect("compile")
+            .markdown;
+        fs::write(temp.path().join("CHANGES.md"), &changelog).expect("changelog");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        fs::write(temp.path().join("changes.d/late.md"), " -  Late entry.\n")
+            .expect("late fragment");
+
+        let error = apply_release(&repo, plan).expect_err("stale fragment set");
+
+        assert!(
+            matches!(error, Error::StaleReleasePlan { path } if path == Path::new("changes.d/late.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert!(temp.path().join("changes.d/planned.md").exists());
+        assert!(temp.path().join("changes.d/late.md").exists());
+    }
+
+    #[test]
+    fn release_fragment_set_difference_reports_additions_removals_and_reordering() {
+        let a = PathBuf::from("changes.d/a.md");
+        let b = PathBuf::from("changes.d/b.md");
+
+        assert_eq!(
+            differing_fragment_path(std::slice::from_ref(&a), std::slice::from_ref(&a)),
+            None
+        );
+        assert_eq!(
+            differing_fragment_path(std::slice::from_ref(&a), &[a.clone(), b.clone()]),
+            Some(b.clone())
+        );
+        assert_eq!(
+            differing_fragment_path(&[a.clone(), b.clone()], std::slice::from_ref(&a)),
+            Some(b.clone())
+        );
+        assert_eq!(
+            differing_fragment_path(&[a.clone(), b.clone()], &[b.clone(), a]),
+            Some(b)
+        );
+    }
+
+    #[test]
+    fn release_rollback_accepts_an_already_missing_path() {
+        let (_temp, repo) = repo_with_config("");
+
+        restore_release_state(
+            &repo,
+            Path::new("changes.d/already-missing"),
+            &ReleaseFileState::Missing,
+            &ReleaseFileState::Missing,
+        )
+        .expect("missing state is already restored");
+    }
+
+    proptest! {
+        #[test]
+        fn release_path_identity_cancels_generated_missing_components(
+            missing in "[a-z]{1,12}",
+            target in "[a-z]{1,12}",
+        ) {
+            let (temp, repo) = repo_with_config("");
+            let path = PathBuf::from(format!("missing-{missing}/../target-{target}"));
+
+            let identity = release_path_identity(&repo, &path)
+                .expect("generated missing component followed by parent");
+
+            prop_assert_eq!(
+                identity,
+                fs::canonicalize(temp.path())
+                    .expect("repository root")
+                    .join(format!("target-{target}"))
+            );
+        }
+
+        #[test]
+        fn release_path_identity_keeps_existing_names_below_a_missing_component(
+            missing in "[a-z]{1,12}",
+            existing in "[a-z]{1,12}",
+        ) {
+            let (temp, repo) = repo_with_config("");
+            let existing = format!("existing-{existing}");
+            fs::write(temp.path().join(&existing), "root file\n").expect("existing root file");
+            let path = PathBuf::from(format!("missing-{missing}/{existing}"));
+
+            let identity = release_path_identity(&repo, &path)
+                .expect("existing name below missing component");
+
+            prop_assert_eq!(
+                identity,
+                fs::canonicalize(temp.path())
+                    .expect("repository root")
+                    .join(format!("missing-{missing}"))
+                    .join(existing)
+            );
+        }
+
+        #[test]
+        fn release_plan_rejects_any_participant_changed_after_planning(
+            participant in 0usize..3,
+            replacement in "[A-Za-z]{1,20}\\n",
+        ) {
+            let (temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                materialize = false
+                "#,
+            );
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            let changelog = temp.path().join("CHANGES.md");
+            let next = temp.path().join("changes.d/next");
+            let fragment = temp.path().join("changes.d/add.md");
+            fs::write(&changelog, "Changelog\n=========\n").expect("changelog");
+            fs::write(&next, "1.2.0\n").expect("next");
+            fs::write(&fragment, " -  Added release.\n").expect("fragment");
+            let plan = plan_release(
+                &repo,
+                ReleaseOptions {
+                    version: None,
+                    date: Some(String::from("2026-07-08")),
+                    next: Some(String::from("1.3.0")),
+                },
+            )
+            .expect("plan");
+            let changed = [&changelog, &next, &fragment][participant];
+            fs::write(changed, &replacement).expect("external change");
+
+            let error = apply_release(&repo, plan).expect_err("stale plan");
+
+            let stale = matches!(error, Error::StaleReleasePlan { .. });
+            prop_assert!(stale);
+            prop_assert_eq!(
+                fs::read_to_string(changed).expect("changed file"),
+                replacement
+            );
+        }
+    }
+
+    #[test]
+    fn release_rejects_consumed_fragment_that_disappeared_after_planning() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let fragment = temp.path().join("changes.d/missing.md");
+        fs::write(&fragment, " -  Fixed release.\n").expect("fragment");
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        fs::remove_file(fragment).expect("remove fragment");
+
+        let error = apply_release(&repo, plan).expect_err("stale fragment");
+
+        assert!(matches!(error, Error::StaleReleasePlan { .. }));
+        assert!(!temp.path().join("CHANGES.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_rejects_symlinked_transaction_paths_during_planning() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("real-next"), "1.2.0\n").expect("real next");
+        symlink(
+            temp.path().join("real-next"),
+            temp.path().join("changes.d/next"),
+        )
+        .expect("next symlink");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect_err("symlink conflict");
+
+        assert!(matches!(error, Error::ReleasePathConflict { .. }));
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert!(temp.path().join("changes.d/add.md").exists());
     }
 
     #[test]
     fn release_rejects_missing_materialized_changelog_without_deleting_fragments() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
-        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
-
-        let error = apply_release(
+        let fragment = temp.path().join("changes.d/add.md");
+        fs::write(&fragment, " -  Added release.\n").expect("fragment");
+        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
+        let changelog = temp.path().join("CHANGES.md");
+        fs::write(
+            &changelog,
+            "Version 1.2.0\n-------------\n\nTo be released.\n\n -  Added release.\n",
+        )
+        .expect("changelog");
+        let plan = plan_release(
             &repo,
-            ReleasePlan {
-                version: String::from("1.2.0"),
-                date: ReleaseDate::parse("2026-07-08").expect("date"),
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
                 next: None,
-                released_markdown: String::from(
-                    "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n",
-                ),
-                consumed_fragments: vec![PathBuf::from("changes.d/add.md")],
             },
         )
-        .expect_err("missing changelog");
+        .expect("plan");
+        fs::remove_file(changelog).expect("remove changelog");
 
-        assert!(matches!(error, Error::ReadFile { .. }));
-        assert!(temp.path().join("changes.d/add.md").exists());
+        let error = apply_release(&repo, plan).expect_err("stale changelog");
+
+        assert!(matches!(error, Error::StaleReleasePlan { .. }));
+        assert!(fragment.exists());
     }
 
     #[test]
@@ -3892,6 +7867,44 @@ mod tests {
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
             "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n\n"
         );
+    }
+
+    #[test]
+    fn release_with_relative_repository_root_creates_missing_changelog() {
+        let temp = TempDir::new_in(".").expect("relative tempdir");
+        let current = std::env::current_dir().expect("current directory");
+        let root = temp
+            .path()
+            .strip_prefix(&current)
+            .expect("tempdir below current directory")
+            .to_path_buf();
+        assert!(root.is_relative());
+        fs::write(
+            temp.path().join(Repository::CONFIG_FILE),
+            r#"
+            [changelog]
+            materialize = false
+            title = "Project changes"
+            "#,
+        )
+        .expect("config");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
+        let repo = Repository::from_root(&root).expect("relative repository");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: Some(String::from("2026-07-08")),
+                next: None,
+            },
+        )
+        .expect("plan");
+        apply_release(&repo, plan).expect("release");
+
+        assert!(temp.path().join("CHANGES.md").is_file());
+        assert!(!temp.path().join("changes.d/add.md").exists());
     }
 
     #[test]
@@ -4181,7 +8194,7 @@ mod tests {
 
     #[test]
     fn sync_skips_when_materialization_is_disabled() {
-        let (_temp, repo) = repo_with_config(
+        let (temp, repo) = repo_with_config(
             r#"
             [changelog]
             materialize = false
@@ -4194,6 +8207,7 @@ mod tests {
             plan,
             SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled)
         ));
+        assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
     }
 
     #[test]
@@ -4449,23 +8463,25 @@ mod tests {
     }
 
     #[test]
-    fn add_removes_created_fragment_when_changelog_sync_fails() {
+    fn add_ignores_a_legacy_temporary_path_collision() {
         let (temp, repo) = repo_with_config("");
         let original = "Unreleased\n----------\n\nTo be released.\n";
         fs::write(temp.path().join("CHANGES.md"), original).expect("changelog");
         fs::create_dir(temp.path().join("CHANGES.md.tmp")).expect("blocking temp path");
 
-        add_fragment(
+        let result = add_fragment(
             &repo,
             AddOptions {
                 section: None,
                 name: String::from("clear-function"),
             },
         )
-        .expect_err("sync failure");
+        .expect("add");
 
-        assert!(!temp.path().join("changes.d/clear-function.md").exists());
-        assert_eq!(
+        assert_eq!(result.path, Path::new("changes.d/clear-function.md"));
+        assert!(temp.path().join("changes.d/clear-function.md").exists());
+        assert!(temp.path().join("CHANGES.md.tmp").is_dir());
+        assert_ne!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
             original
         );
@@ -4523,6 +8539,67 @@ mod tests {
         .expect_err("empty version");
 
         assert!(matches!(error, Error::EmptyNextVersion));
+    }
+
+    #[test]
+    fn next_rejects_the_repository_mutation_lock_as_its_destination() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [fragments]
+            next-file = "../.sacho.lock"
+            "#,
+        );
+
+        let error = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect_err("mutation lock destination");
+
+        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
+            ""
+        );
+    }
+
+    #[test]
+    fn sync_rejects_the_repository_mutation_lock_as_its_destination() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            path = ".sacho.lock"
+            materialize = true
+            "#,
+        );
+        let path = PathBuf::from(MUTATION_LOCK_FILE);
+
+        let error = apply_sync(
+            &repo,
+            SyncPlan::Apply(PendingWrite {
+                path: path.clone(),
+                old_contents: String::new(),
+                new_contents: String::from("replacement\n"),
+            }),
+        )
+        .expect_err("mutation lock destination");
+
+        assert!(matches!(
+            error,
+            Error::MutationLockPathOverlap {
+                path: error_path,
+                ..
+            } if error_path == path
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
+            ""
+        );
     }
 
     #[test]

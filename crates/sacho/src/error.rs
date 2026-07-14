@@ -30,6 +30,26 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A file could not be removed.
+    #[snafu(display("failed to remove file {}: {source}", path.display()))]
+    RemoveFile {
+        /// File path that could not be removed.
+        path: PathBuf,
+
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// A directory could not be removed.
+    #[snafu(display("failed to remove directory {}: {source}", path.display()))]
+    RemoveDirectory {
+        /// Directory path that could not be removed.
+        path: PathBuf,
+
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
     /// A directory could not be created.
     #[snafu(display("failed to create directory {}: {source}", path.display()))]
     CreateDirectory {
@@ -186,6 +206,99 @@ pub enum Error {
     StaleSyncPlan {
         /// Changelog path that changed after the plan was prepared.
         path: PathBuf,
+    },
+
+    /// A release plan no longer matches a file it was built from.
+    #[snafu(display(
+        "refusing to apply stale release plan because {} changed after planning; plan the release again",
+        path.display()
+    ))]
+    StaleReleasePlan {
+        /// Path whose current state differs from the planned state.
+        path: PathBuf,
+    },
+
+    /// A release path is not a regular file.
+    #[snafu(display("release path {} is not a regular file", path.display()))]
+    ReleasePathConflict {
+        /// Path with an unsupported file type, including symbolic links.
+        path: PathBuf,
+    },
+
+    /// Two release transaction entries resolve to overlapping filesystem paths.
+    #[snafu(display(
+        "release paths {} and {} overlap in the filesystem",
+        first.display(),
+        second.display()
+    ))]
+    ReleasePathOverlap {
+        /// First conflicting repository-relative path.
+        first: PathBuf,
+
+        /// Second conflicting repository-relative path.
+        second: PathBuf,
+    },
+
+    /// A configured mutation path overlaps the repository mutation lock.
+    #[snafu(display(
+        "configured mutation path {} overlaps the repository lock at {}",
+        path.display(),
+        lock_path.display()
+    ))]
+    MutationLockPathOverlap {
+        /// Configured repository path that would replace or contain the lock.
+        path: PathBuf,
+
+        /// Resolved path of the repository mutation lock.
+        lock_path: PathBuf,
+    },
+
+    /// Another mutation currently holds the repository mutation lock.
+    #[snafu(display("another Sacho mutation is already running in this repository"))]
+    ReleaseLocked,
+
+    /// The platform cannot provide the no-replace directory move required by
+    /// release transactions.
+    #[snafu(display(
+        "release transactions are unsupported because this platform has no atomic no-replace directory move"
+    ))]
+    ReleaseTransactionUnsupported,
+
+    /// Rollback found that another writer changed an applied release path.
+    #[snafu(display(
+        "refusing to roll back {} because it changed after the release wrote it",
+        path.display()
+    ))]
+    ReleaseRollbackConflict {
+        /// Path whose concurrent state was preserved.
+        path: PathBuf,
+    },
+
+    /// Applying a release failed, possibly followed by rollback failures.
+    #[snafu(display(
+        "release apply failed: {cause}{rollback_summary}",
+        rollback_summary = if rollback_failures.is_empty() {
+            String::from("; all applied changes were rolled back")
+        } else {
+            format!("; rollback also failed: {}", rollback_failures.join("; "))
+        }
+    ))]
+    ReleaseApply {
+        /// Original apply failure.
+        cause: String,
+
+        /// Failures encountered while restoring already-applied changes.
+        rollback_failures: Vec<String>,
+    },
+
+    /// A release committed, but removing retained transaction claims failed.
+    #[snafu(display(
+        "release committed, but transaction cleanup failed: {}",
+        failures.join("; ")
+    ))]
+    ReleaseCleanup {
+        /// Failures encountered while deleting committed claim files.
+        failures: Vec<String>,
     },
 
     /// A changelog file could not be parsed or updated.

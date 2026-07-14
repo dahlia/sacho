@@ -7,11 +7,11 @@ use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment,
-    apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
-    format_fragments, init_repository, plan_release, plan_sync, prepare_check_fix,
-    reference_transaction_hook, set_next_version,
+    apply_merge_driver, apply_release, apply_sync, carry, check, commit_message_hook,
+    compile_unreleased, format_fragments, init_repository, plan_release, plan_sync,
+    prepare_check_fix, reference_transaction_hook, set_next_version,
 };
-use sacho::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
+use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
 
 #[derive(Debug, Parser)]
@@ -333,40 +333,22 @@ fn run_merge_driver(
     path: String,
 ) -> Result<ExitCode, CliReport> {
     let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-    let current_path = PathBuf::from(&current);
-    match merge_driver(
+    match apply_merge_driver(
         &repo,
         MergeDriverOptions {
             ancestor: PathBuf::from(original),
-            current: current_path.clone(),
+            current: PathBuf::from(current),
             other: PathBuf::from(other),
             path: PathBuf::from(path),
         },
     ) {
-        Ok(MergeDriverResult::Clean { output, hints }) => {
-            std::fs::write(&current_path, output).map_err(|source| {
-                CliReport::from(Error::WriteFile {
-                    path: current_path.clone(),
-                    source,
-                })
-            })?;
+        Ok(MergeDriverResult::Clean { hints, .. }) => {
             for hint in hints {
                 eprintln!("{hint}");
             }
             Ok(ExitCode::SUCCESS)
         }
-        Ok(MergeDriverResult::Conflict {
-            output_with_markers,
-            reason: _,
-        }) => {
-            std::fs::write(&current_path, output_with_markers).map_err(|source| {
-                CliReport::from(Error::WriteFile {
-                    path: current_path.clone(),
-                    source,
-                })
-            })?;
-            Ok(ExitCode::from(1))
-        }
+        Ok(MergeDriverResult::Conflict { .. }) => Ok(ExitCode::from(1)),
         Err(error) => {
             eprintln!("{error}");
             Ok(ExitCode::from(1))

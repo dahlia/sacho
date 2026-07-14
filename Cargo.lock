@@ -1265,6 +1265,7 @@ dependencies = [
  "portable-pty",
  "predicates",
  "proptest",
+ "rustix",
  "semver",
  "serde",
  "serde_yaml_ng",

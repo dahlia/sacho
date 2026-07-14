@@ -126,12 +126,22 @@ struct SortableItem {
 
 /// Compiles the current fragments into an unreleased changelog region.
 pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<CompiledRegion> {
+    let discovered = discover_fragments(repo)?;
+    let version_label = read_version_label(repo)?;
+    compile_parsed_fragments(repo, options, version_label, discovered.fragments)
+}
+
+/// Compiles fragment values already read and parsed by a command plan.
+pub(crate) fn compile_parsed_fragments(
+    repo: &Repository,
+    options: CompileOptions,
+    version_label: VersionLabel,
+    fragments: Vec<Fragment>,
+) -> Result<CompiledRegion> {
     let config = repo.config();
 
-    let discovered = discover_fragments(repo)?;
-    validate_requested_section(repo, options.section.as_deref(), &discovered.fragments)?;
-    let version_label = read_version_label(repo)?;
-    let mut items = sortable_items(discovered.fragments);
+    validate_requested_section(repo, options.section.as_deref(), &fragments)?;
+    let mut items = sortable_items(fragments);
     if let Some(section) = &options.section {
         items.retain(|item| item.section.as_deref() == Some(section.as_str()));
     }
