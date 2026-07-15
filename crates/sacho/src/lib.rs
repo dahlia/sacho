@@ -33,7 +33,7 @@ pub mod vcs;
 
 pub use crate::config::{
     ChangelogConfig, CheckConfig, Config, FragmentsConfig, ReferenceSigil, RegionDetection,
-    SectionConfig, UrlTemplate, VcsConfig, VcsPreset,
+    SectionConfig, UrlTemplate, VcsCommand, VcsCommandOverrides, VcsConfig, VcsPreset, VcsQuery,
 };
 pub use crate::error::{ConfigError, Error, FragmentError, Result};
 pub use crate::repo::Repository;

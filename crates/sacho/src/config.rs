@@ -61,6 +61,7 @@ impl Config {
                 });
             }
         }
+        self.vcs.validate()?;
         Ok(())
     }
 }
@@ -182,13 +183,155 @@ impl UrlTemplate {
 pub struct VcsConfig {
     /// Selected VCS preset.
     pub preset: VcsPreset,
+
+    /// Per-query command overrides layered on top of the selected preset.
+    #[serde(default)]
+    pub commands: VcsCommandOverrides,
 }
 
 impl Default for VcsConfig {
     fn default() -> Self {
         Self {
             preset: VcsPreset::Git,
+            commands: VcsCommandOverrides::default(),
         }
+    }
+}
+
+impl VcsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.preset == VcsPreset::None && !self.commands.is_empty() {
+            return Err(ConfigError::VcsCommandsWithNonePreset);
+        }
+        for (query, command) in self.commands.iter() {
+            command.validate(query, self.preset)?;
+        }
+        Ok(())
+    }
+}
+
+/// A VCS command represented as a program followed by literal arguments.
+///
+/// Commands are executed directly without a shell. Supported placeholders are
+/// expanded within arguments, but never within the program name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct VcsCommand(Vec<String>);
+
+impl VcsCommand {
+    /// Creates a command from a program and its arguments.
+    pub fn new(argv: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self(argv.into_iter().map(Into::into).collect())
+    }
+
+    /// Returns the program and arguments in configured order.
+    pub fn argv(&self) -> &[String] {
+        &self.0
+    }
+
+    fn validate(&self, query: VcsQuery, preset: VcsPreset) -> Result<(), ConfigError> {
+        let Some(program) = self.0.first() else {
+            return Err(ConfigError::EmptyVcsCommand { query });
+        };
+        if program.is_empty() {
+            return Err(ConfigError::EmptyVcsProgram { query });
+        }
+        if program.contains("${") {
+            return Err(ConfigError::VcsPlaceholderInProgram { query });
+        }
+
+        let mut found = Vec::new();
+        for argument in &self.0[1..] {
+            let mut rest = argument.as_str();
+            while let Some(start) = rest.find("${") {
+                let tail = &rest[start + 2..];
+                let Some((placeholder, suffix)) = tail.split_once('}') else {
+                    return Err(ConfigError::MalformedVcsPlaceholder { query });
+                };
+                if !query.allowed_placeholders(preset).contains(&placeholder) {
+                    return Err(ConfigError::UnknownVcsPlaceholder {
+                        query,
+                        placeholder: placeholder.to_owned(),
+                    });
+                }
+                found.push(placeholder);
+                rest = suffix;
+            }
+        }
+        for required in query.required_placeholders(preset) {
+            if !found.contains(required) {
+                return Err(ConfigError::MissingVcsPlaceholder {
+                    query,
+                    placeholder: (*required).to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional command overrides for the three VCS queries Sacho performs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct VcsCommandOverrides {
+    /// Command that lists commits after `${base}`, oldest first.
+    pub commits: Option<VcsCommand>,
+
+    /// Command that emits NUL-delimited changed-path records for `${commit}`.
+    pub changed_paths: Option<VcsCommand>,
+
+    /// Command that emits the raw message for `${commit}`.
+    pub message: Option<VcsCommand>,
+}
+
+impl VcsCommandOverrides {
+    /// Returns true when no query command is overridden.
+    pub fn is_empty(&self) -> bool {
+        self.commits.is_none() && self.changed_paths.is_none() && self.message.is_none()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (VcsQuery, &VcsCommand)> {
+        [
+            (VcsQuery::Commits, self.commits.as_ref()),
+            (VcsQuery::ChangedPaths, self.changed_paths.as_ref()),
+            (VcsQuery::Message, self.message.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(query, command)| command.map(|command| (query, command)))
+    }
+}
+
+/// A configurable VCS query performed by Sacho.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsQuery {
+    /// List commits between the configured base and the working revision.
+    Commits,
+    /// List paths changed by one commit.
+    ChangedPaths,
+    /// Read one commit's raw message.
+    Message,
+}
+
+impl VcsQuery {
+    fn allowed_placeholders(self, _preset: VcsPreset) -> &'static [&'static str] {
+        match self {
+            Self::Commits => &["base"],
+            Self::ChangedPaths | Self::Message => &["commit"],
+        }
+    }
+
+    fn required_placeholders(self, preset: VcsPreset) -> &'static [&'static str] {
+        self.allowed_placeholders(preset)
+    }
+}
+
+impl fmt::Display for VcsQuery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Commits => "commits",
+            Self::ChangedPaths => "changed-paths",
+            Self::Message => "message",
+        })
     }
 }
 
@@ -295,6 +438,106 @@ mod tests {
         assert_eq!(config.changelog.path, PathBuf::from("CHANGES.md"));
         assert_eq!(config.fragments.directory, PathBuf::from("changes.d"));
         assert_eq!(config.vcs.preset, VcsPreset::Git);
+        assert!(config.vcs.commands.is_empty());
+    }
+
+    #[test]
+    fn parses_partial_vcs_command_overrides() {
+        let config = Config::parse(
+            r#"
+            [vcs]
+            preset = "jj"
+
+            [vcs.commands]
+            message = ["my-jj", "show", "${commit}"]
+            "#,
+        )
+        .expect("valid command override");
+
+        assert_eq!(
+            config.vcs.commands.message,
+            Some(VcsCommand::new(["my-jj", "show", "${commit}"]))
+        );
+        assert!(config.vcs.commands.commits.is_none());
+    }
+
+    #[test]
+    fn rejects_commands_for_none_preset() {
+        let error = Config::parse(
+            r#"
+            [vcs]
+            preset = "none"
+            [vcs.commands]
+            commits = ["vcs", "${base}"]
+            "#,
+        )
+        .expect_err("disabled VCS must reject command overrides");
+
+        assert!(matches!(error, ConfigError::VcsCommandsWithNonePreset));
+    }
+
+    #[test]
+    fn validates_query_placeholders() {
+        let cases = [
+            (
+                "[vcs.commands]\ncommits = [\"vcs\", \"log\"]\n",
+                "must contain placeholder ${base}",
+            ),
+            (
+                "[vcs.commands]\nmessage = [\"${commit}\"]\n",
+                "placeholders are not allowed in the program name",
+            ),
+            (
+                "[vcs.commands]\nmessage = [\"vcs\", \"${base}\"]\n",
+                "does not support placeholder ${base}",
+            ),
+            (
+                "[vcs.commands]\nmessage = [\"vcs\", \"${commit\"]\n",
+                "contains an unclosed placeholder",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let error = Config::parse(input).expect_err("invalid placeholder contract");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn mercurial_changed_paths_override_uses_only_the_commit() {
+        let config = Config::parse(
+            r#"
+            [vcs]
+            preset = "hg"
+            [vcs.commands]
+            changed-paths = ["custom-hg-query", "changed-paths", "${commit}"]
+            "#,
+        )
+        .expect("self-contained Mercurial query");
+
+        assert_eq!(
+            config.vcs.commands.changed_paths.expect("override").argv(),
+            ["custom-hg-query", "changed-paths", "${commit}"]
+        );
+    }
+
+    #[test]
+    fn mercurial_changed_paths_rejects_the_internal_parent_placeholder() {
+        let error = Config::parse(
+            r#"
+            [vcs]
+            preset = "hg"
+            [vcs.commands]
+            changed-paths = ["custom-hg-query", "${commit}", "${parent}"]
+            "#,
+        )
+        .expect_err("override cannot receive an internally discovered parent");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support placeholder ${parent}")
+        );
     }
 
     #[test]

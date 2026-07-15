@@ -386,6 +386,70 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A configured VCS query command could not be started.
+    #[snafu(display("failed to run VCS {query} command {command:?}: {source}"))]
+    VcsQueryCommandIo {
+        /// Query being evaluated.
+        query: crate::config::VcsQuery,
+
+        /// Expanded program and argument vector.
+        command: Vec<String>,
+
+        /// Underlying I/O error.
+        source: std::io::Error,
+    },
+
+    /// A configured VCS query command exited unsuccessfully.
+    #[snafu(display(
+        "VCS {query} command {command:?} failed with status {status}: {stderr}",
+        stderr = String::from_utf8_lossy(stderr)
+    ))]
+    VcsQueryCommandFailed {
+        /// Query being evaluated.
+        query: crate::config::VcsQuery,
+
+        /// Expanded program and argument vector.
+        command: Vec<String>,
+
+        /// Process exit status.
+        status: std::process::ExitStatus,
+
+        /// Exact standard error bytes emitted by the command.
+        stderr: Vec<u8>,
+    },
+
+    /// A configured VCS query emitted text that was not UTF-8.
+    #[snafu(display("VCS {query} command {command:?} emitted invalid UTF-8 in {stream}"))]
+    VcsQueryInvalidUtf8 {
+        /// Query being evaluated.
+        query: crate::config::VcsQuery,
+
+        /// Expanded program and argument vector.
+        command: Vec<String>,
+
+        /// Stream containing invalid text.
+        stream: &'static str,
+
+        /// Invalid stream bytes.
+        bytes: Vec<u8>,
+    },
+
+    /// A configured VCS query emitted records outside its output contract.
+    #[snafu(display("VCS {query} command {command:?} emitted malformed output: {reason}"))]
+    VcsQueryMalformedOutput {
+        /// Query being evaluated.
+        query: crate::config::VcsQuery,
+
+        /// Expanded program and argument vector.
+        command: Vec<String>,
+
+        /// Human-readable contract violation.
+        reason: String,
+
+        /// Exact standard output bytes emitted by the command.
+        stdout: Vec<u8>,
+    },
+
     /// A fragment file could not be merged while reconstructing merge inputs.
     #[snafu(display("failed to merge fragment {}: {stderr}", path.display()))]
     MergeFragment {
@@ -422,6 +486,56 @@ pub enum ConfigError {
     LinkTemplateMissingNumber {
         /// Sigil whose template is invalid.
         sigil: String,
+    },
+
+    /// Query commands cannot be combined with the disabled VCS preset.
+    #[snafu(display("vcs.commands cannot be configured when vcs.preset = \"none\""))]
+    VcsCommandsWithNonePreset,
+
+    /// A VCS query command contains no program.
+    #[snafu(display("vcs.commands.{query} must contain a program"))]
+    EmptyVcsCommand {
+        /// Query whose command is empty.
+        query: crate::config::VcsQuery,
+    },
+
+    /// A VCS query command has an empty program name.
+    #[snafu(display("vcs.commands.{query} program must not be empty"))]
+    EmptyVcsProgram {
+        /// Query whose program name is empty.
+        query: crate::config::VcsQuery,
+    },
+
+    /// A placeholder appeared in a command's program name.
+    #[snafu(display("vcs.commands.{query} placeholders are not allowed in the program name"))]
+    VcsPlaceholderInProgram {
+        /// Query whose program contains a placeholder.
+        query: crate::config::VcsQuery,
+    },
+
+    /// A command argument contains an unclosed placeholder.
+    #[snafu(display("vcs.commands.{query} contains an unclosed placeholder"))]
+    MalformedVcsPlaceholder {
+        /// Query whose argument contains the malformed placeholder.
+        query: crate::config::VcsQuery,
+    },
+
+    /// A command uses a placeholder unavailable to its query.
+    #[snafu(display("vcs.commands.{query} does not support placeholder ${{{placeholder}}}"))]
+    UnknownVcsPlaceholder {
+        /// Query whose command contains the placeholder.
+        query: crate::config::VcsQuery,
+        /// Unsupported placeholder name.
+        placeholder: String,
+    },
+
+    /// A command omits a placeholder required to evaluate its query.
+    #[snafu(display("vcs.commands.{query} must contain placeholder ${{{placeholder}}}"))]
+    MissingVcsPlaceholder {
+        /// Query whose command omits the placeholder.
+        query: crate::config::VcsQuery,
+        /// Required placeholder name.
+        placeholder: String,
     },
 }
 

@@ -8,8 +8,8 @@ use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment,
     apply_merge_driver, apply_release, apply_sync, carry, check, commit_message_hook,
-    compile_unreleased, format_fragments, init_repository, plan_release, plan_sync,
-    prepare_check_fix, reference_transaction_hook, set_next_version,
+    compile_unreleased, format_fragments, init_repository, mercurial_update_hook, plan_release,
+    plan_sync, prepare_check_fix, reference_transaction_hook, set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
@@ -148,6 +148,10 @@ enum Command {
     /// Check the final commit from Git's reference-transaction hook.
     #[command(hide = true)]
     HookReferenceTransaction { phase: String },
+
+    /// Synchronize the changelog after a successful Mercurial merge update.
+    #[command(hide = true)]
+    HookHgUpdate,
 }
 
 impl Cli {
@@ -272,8 +276,26 @@ impl Cli {
                     None => Ok(ExitCode::SUCCESS),
                 }
             }
+            Command::HookHgUpdate => {
+                let parent2 = std::env::var("HG_PARENT2").ok();
+                let hook_error = std::env::var("HG_ERROR").ok();
+                if !mercurial_update_needs_repository(parent2.as_deref(), hook_error.as_deref()) {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                let repo = match Repository::open_existing(".") {
+                    Ok(repo) => repo,
+                    Err(Error::ConfigNotFound { .. }) => return Ok(ExitCode::SUCCESS),
+                    Err(error) => return Err(CliReport::from(error)),
+                };
+                mercurial_update_hook(&repo, parent2.as_deref(), hook_error.as_deref())?;
+                Ok(ExitCode::SUCCESS)
+            }
         }
     }
+}
+
+fn mercurial_update_needs_repository(parent2: Option<&str>, hook_error: Option<&str>) -> bool {
+    hook_error == Some("0") && parent2.is_some_and(|parent| !parent.trim().is_empty())
 }
 
 fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
@@ -512,6 +534,9 @@ fn print_init_result(result: &InitResult) {
     for key in &result.local_git_config_changes {
         println!("configured {key}");
     }
+    for key in &result.local_hg_config_changes {
+        println!("configured {key}");
+    }
     for action in &result.manual_actions_required {
         println!("manual {action}");
     }
@@ -524,6 +549,7 @@ fn init_result_has_no_actions(result: &InitResult) -> bool {
     result.created_files.is_empty()
         && result.modified_files.is_empty()
         && result.local_git_config_changes.is_empty()
+        && result.local_hg_config_changes.is_empty()
         && result.manual_actions_required.is_empty()
 }
 
@@ -586,6 +612,15 @@ mod tests {
         assert!(!sync_should_prompt(true, false));
         assert!(!sync_should_prompt(false, true));
         assert!(!sync_should_prompt(false, false));
+    }
+
+    #[test]
+    fn mercurial_update_needs_repository_only_for_successful_merges() {
+        assert!(mercurial_update_needs_repository(Some("other"), Some("0")));
+        assert!(!mercurial_update_needs_repository(None, Some("0")));
+        assert!(!mercurial_update_needs_repository(Some(" "), Some("0")));
+        assert!(!mercurial_update_needs_repository(Some("other"), Some("1")));
+        assert!(!mercurial_update_needs_repository(Some("other"), None));
     }
 
     #[test]

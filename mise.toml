@@ -54,6 +54,10 @@ run = "cargo build --workspace"
 description = "Run the Rust tests"
 run = "cargo test --workspace"
 
+[tasks."test:vcs"]
+description = "Run live VCS adapter smoke tests"
+run = "cargo test --workspace vcs::tests:: -- --ignored"
+
 [tasks.mutants]
 description = "Run mutation tests"
 run = "cargo mutants --workspace"

@@ -86,6 +86,13 @@ Run tests:
 mise run test
 ~~~~
 
+Run the ignored smoke tests against locally installed Jujutsu and Mercurial
+executables (Git is exercised by the regular test suite):
+
+~~~~ sh
+mise run test:vcs
+~~~~
+
 Run mutation tests:
 
 ~~~~ sh

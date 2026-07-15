@@ -34,6 +34,32 @@ fn check_rejects_base_with_staged_mode() {
 }
 
 #[test]
+fn mercurial_update_hook_tolerates_irrelevant_updates_and_absent_configuration() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(temp.path())
+        .env("HG_PARENT2", "other")
+        .env("HG_ERROR", "0")
+        .arg("hook-hg-update")
+        .assert()
+        .success();
+
+    std::fs::write(temp.path().join("sacho.toml"), "[").expect("malformed configuration");
+    for (parent2, hook_error) in [(None, "0"), (Some("other"), "1"), (Some(" "), "0")] {
+        let mut command = Command::cargo_bin("sacho").expect("binary");
+        command.current_dir(temp.path()).env("HG_ERROR", hook_error);
+        if let Some(parent2) = parent2 {
+            command.env("HG_PARENT2", parent2);
+        } else {
+            command.env_remove("HG_PARENT2");
+        }
+        command.arg("hook-hg-update").assert().success();
+    }
+}
+
+#[test]
 fn init_scaffolds_empty_git_repository() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     git(temp.path(), ["init"]);
@@ -74,6 +100,102 @@ fn init_scaffolds_empty_git_repository() {
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
         "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_discovers_a_markerless_git_worktree_from_the_environment() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let metadata_worktree = temp.path().join("metadata-worktree");
+    let worktree = temp.path().join("selected-worktree");
+    let nested = worktree.join("one/two");
+    std::fs::create_dir_all(&nested).expect("nested worktree directory");
+    git(
+        temp.path(),
+        ["init", metadata_worktree.to_str().expect("UTF-8 path")],
+    );
+    let git_dir = metadata_worktree.join(".git");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(&nested)
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_WORK_TREE", &worktree)
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert!(worktree.join("sacho.toml").is_file());
+    assert!(!nested.join("sacho.toml").exists());
+    assert!(
+        std::fs::read_to_string(worktree.join("sacho.toml"))
+            .expect("configuration")
+            .contains("preset = \"git\"")
+    );
+}
+
+#[test]
+fn init_prefers_a_git_worktree_selected_by_the_environment_over_an_ambient_git_marker() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let ambient_worktree = temp.path().join("ambient-worktree");
+    let selected_worktree = temp.path().join("selected-worktree");
+    let nested = ambient_worktree.join("one/two");
+    std::fs::create_dir_all(&nested).expect("nested ambient directory");
+    std::fs::create_dir(&selected_worktree).expect("selected worktree directory");
+    git(
+        temp.path(),
+        ["init", ambient_worktree.to_str().expect("UTF-8 path")],
+    );
+    git(
+        temp.path(),
+        ["init", selected_worktree.to_str().expect("UTF-8 path")],
+    );
+    let git_dir = selected_worktree.join(".git");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(&nested)
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_WORK_TREE", &selected_worktree)
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert!(selected_worktree.join("sacho.toml").is_file());
+    assert!(!ambient_worktree.join("sacho.toml").exists());
+}
+
+#[test]
+fn init_prefers_a_mercurial_marker_over_the_git_environment() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let metadata_worktree = temp.path().join("metadata-worktree");
+    let selected_worktree = temp.path().join("selected-worktree");
+    let hg_worktree = temp.path().join("hg-worktree");
+    let nested = hg_worktree.join("one/two");
+    std::fs::create_dir_all(&nested).expect("nested worktree directory");
+    std::fs::create_dir(hg_worktree.join(".hg")).expect("Mercurial marker");
+    std::fs::create_dir(&selected_worktree).expect("selected Git worktree");
+    git(
+        temp.path(),
+        ["init", metadata_worktree.to_str().expect("UTF-8 path")],
+    );
+    let git_dir = metadata_worktree.join(".git");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(&nested)
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_WORK_TREE", &selected_worktree)
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+
+    assert!(hg_worktree.join("sacho.toml").is_file());
+    assert!(!selected_worktree.join("sacho.toml").exists());
+    assert!(
+        std::fs::read_to_string(hg_worktree.join("sacho.toml"))
+            .expect("configuration")
+            .contains("preset = \"hg\"")
     );
 }
 

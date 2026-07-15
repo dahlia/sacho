@@ -25,7 +25,7 @@ use crate::fragment::{
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::carry_release;
 use crate::repo::{PreparedAtomicWrite, Repository, move_path_if_absent};
-use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, Vcs};
+use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, HgVcs, JjVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
 
@@ -37,7 +37,7 @@ pub struct CommandContext {
 }
 
 /// Options for bootstrapping Sacho in a repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InitOptions {
     /// Changelog path for newly generated configuration.
     pub changelog_path: Option<PathBuf>,
@@ -72,6 +72,9 @@ pub struct InitResult {
 
     /// Local Git configuration keys written by the operation.
     pub local_git_config_changes: Vec<String>,
+
+    /// Local Mercurial configuration keys written by the operation.
+    pub local_hg_config_changes: Vec<String>,
 
     /// Manual actions the user still needs to perform.
     pub manual_actions_required: Vec<String>,
@@ -517,8 +520,13 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
             .push(config.changelog.path.clone());
     }
 
-    if created_config || config.vcs.preset == VcsPreset::Git {
-        apply_git_integration(&root, &config, &mut result)?;
+    match config.vcs.preset {
+        VcsPreset::Git => apply_git_integration(&root, &config, &mut result)?,
+        VcsPreset::Hg => apply_hg_integration(&root, &config, &mut result)?,
+        VcsPreset::Jj => result.manual_actions_required.push(String::from(
+            "Jujutsu does not support per-path merge drivers; after resolving concurrent fragment changes, run `sacho sync --force`",
+        )),
+        VcsPreset::None => {}
     }
     if options.install_hook {
         if config.vcs.preset == VcsPreset::Git && is_git_repository(&root) {
@@ -1165,7 +1173,7 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
 
 /// Arms the final commit check from Git's `commit-msg` hook.
 pub fn commit_message_hook(repo: &Repository, _message_path: &Path) -> Result<()> {
-    let vcs = GitVcs::new(repo.root());
+    let vcs = GitVcs::configured(repo.root(), &repo.config().vcs);
     let state = CommitHookState {
         head: vcs.head()?,
         tree: vcs.index_tree()?,
@@ -1198,7 +1206,7 @@ pub fn reference_transaction_hook(
         path: state_path,
         source,
     })?;
-    let vcs = GitVcs::new(repo.root());
+    let vcs = GitVcs::configured(repo.root(), &repo.config().vcs);
     let Some(commit) = reference_transaction_commit(&vcs, &state, updates)? else {
         return Ok(None);
     };
@@ -1308,7 +1316,7 @@ fn run_missing_fragment_check(
     }
     match repo.config().vcs.preset {
         VcsPreset::Git => {
-            let vcs = GitVcs::new(repo.root());
+            let vcs = GitVcs::configured(repo.root(), &repo.config().vcs);
             let report = if options.staged {
                 staged_missing_fragment_violations(repo, &vcs)?
             } else {
@@ -1321,14 +1329,50 @@ fn run_missing_fragment_check(
             violations.extend(report.violations);
             skipped.extend(report.skipped);
         }
+        VcsPreset::Jj => {
+            if options.staged {
+                return Err(Error::Usage {
+                    message: String::from("--staged is supported only with vcs.preset = \"git\""),
+                });
+            }
+            let vcs = JjVcs::with_fragment_directory(
+                repo.root(),
+                &repo.config().vcs,
+                &repo.config().fragments.directory,
+            );
+            let report = missing_fragment_violations(
+                repo,
+                &vcs,
+                options.base.as_deref().expect("base mode has a revision"),
+            )?;
+            violations.extend(report.violations);
+            skipped.extend(report.skipped);
+        }
+        VcsPreset::Hg => {
+            if options.staged {
+                return Err(Error::Usage {
+                    message: String::from("--staged is supported only with vcs.preset = \"git\""),
+                });
+            }
+            let vcs = HgVcs::with_fragment_layout(
+                repo.root(),
+                &repo.config().vcs,
+                &repo.config().fragments.directory,
+                repo.config()
+                    .sections
+                    .iter()
+                    .map(|section| &section.directory),
+            );
+            let report = missing_fragment_violations(
+                repo,
+                &vcs,
+                options.base.as_deref().expect("base mode has a revision"),
+            )?;
+            violations.extend(report.violations);
+            skipped.extend(report.skipped);
+        }
         VcsPreset::None => skipped.push(SkippedCheck {
             message: String::from("missing-fragment check skipped because vcs.preset = \"none\""),
-        }),
-        VcsPreset::Jj | VcsPreset::Hg => skipped.push(SkippedCheck {
-            message: format!(
-                "missing-fragment check skipped because vcs.preset = {:?} is not implemented",
-                repo.config().vcs.preset
-            ),
         }),
     }
     Ok(())
@@ -1409,7 +1453,7 @@ fn staged_missing_fragment_violations(
 
 fn commit_missing_fragment_violations(
     repo: &Repository,
-    vcs: &GitVcs,
+    vcs: &impl Vcs,
     commit: &CommitId,
 ) -> Result<MissingFragmentReport> {
     if repo.config().check.paths.is_empty() {
@@ -1526,11 +1570,7 @@ fn fragment_content_changed(path: &ChangedPath) -> bool {
 }
 
 fn policy_paths(path: &ChangedPath) -> impl Iterator<Item = &PathBuf> {
-    std::iter::once(&path.path).chain(
-        path.old_path
-            .as_ref()
-            .filter(|_| path.kind == ChangeKind::Renamed),
-    )
+    std::iter::once(&path.path).chain(&path.rename_origins)
 }
 
 fn final_fragment_paths(repo: &Repository) -> Result<IndexSet<PathBuf>> {
@@ -1992,6 +2032,12 @@ fn validate_mutation_lock_path(root: &Path, lock: &MutationLock, path: &Path) ->
 }
 
 fn mutation_lock_path(root: &Path) -> PathBuf {
+    if root.join(".jj").is_dir() {
+        return root.join(".jj/sacho.lock");
+    }
+    if root.join(".hg").is_dir() {
+        return root.join(".hg/sacho.lock");
+    }
     git_output(root, ["rev-parse", "--git-path", "sacho.lock"])
         .ok()
         .and_then(|output| parse_git_root_output(&output))
@@ -2003,6 +2049,11 @@ fn mutation_lock_path(root: &Path) -> PathBuf {
             }
         })
         .unwrap_or_else(|| root.join(MUTATION_LOCK_FILE))
+}
+
+fn parse_git_root_output(output: &str) -> Option<PathBuf> {
+    let path = output.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn mutation_lock_was_created_concurrently(error: &std::io::Error) -> bool {
@@ -3655,19 +3706,43 @@ fn next_file_whitespace_warning(repo: &Repository) -> Result<Option<CheckWarning
 }
 
 fn init_root(start: &Path) -> PathBuf {
-    git_output(start, ["rev-parse", "--show-toplevel"])
+    let absolute = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(start))
+            .unwrap_or_else(|_| start.to_path_buf())
+    };
+    let start = fs::canonicalize(&absolute).unwrap_or_else(|_| normalize_absolute_path(&absolute));
+    let marker = start.ancestors().find_map(|candidate| {
+        repository_preset(candidate).map(|preset| (candidate.to_path_buf(), preset))
+    });
+    if let Some((root, VcsPreset::Jj | VcsPreset::Hg)) = &marker {
+        return root.clone();
+    }
+    if let Some(root) = git_output(&start, ["rev-parse", "--show-toplevel"])
         .ok()
         .and_then(|output| parse_git_root_output(&output))
-        .unwrap_or_else(|| start.to_path_buf())
+    {
+        return root;
+    }
+    marker.map_or(start, |(root, _)| root)
 }
 
-fn parse_git_root_output(output: &str) -> Option<PathBuf> {
-    let path = output.trim();
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
     }
+    normalized
 }
 
 fn default_init_config(root: &Path, options: &InitOptions) -> Config {
@@ -3684,11 +3759,9 @@ fn default_init_config(root: &Path, options: &InitOptions) -> Config {
     if let Some(materialize) = options.materialize {
         config.changelog.materialize = materialize;
     }
-    config.vcs.preset = if is_git_repository(root) {
-        VcsPreset::Git
-    } else {
-        VcsPreset::None
-    };
+    config.vcs.preset = repository_preset(root)
+        .or_else(|| is_git_repository(root).then_some(VcsPreset::Git))
+        .unwrap_or(VcsPreset::None);
     if let Some(url) = options
         .repository_url
         .as_deref()
@@ -3903,6 +3976,216 @@ fn apply_git_integration(root: &Path, config: &Config, result: &mut InitResult) 
         set_git_config(root, "merge.ours.driver", "true", result)?;
     }
     Ok(())
+}
+
+const HG_INTEGRATION_BEGIN: &str = "# sacho integration begin";
+const HG_INTEGRATION_END: &str = "# sacho integration end";
+
+fn apply_hg_integration(root: &Path, config: &Config, result: &mut InitResult) -> Result<()> {
+    let hg_dir = root.join(".hg");
+    if !hg_dir.is_dir() {
+        result.manual_actions_required.push(String::from(
+            "Mercurial integration not installed: .hg directory was not found",
+        ));
+        return Ok(());
+    }
+    let Some(next) = hg_config_path(&config.fragments.directory.join(&config.fragments.next_file))
+    else {
+        result.manual_actions_required.push(String::from(
+            "Mercurial integration not installed: the next-version path must not contain newlines or `=`, or end in whitespace",
+        ));
+        return Ok(());
+    };
+    let changelog = if config.changelog.materialize {
+        let Some(changelog) = hg_config_path(&config.changelog.path) else {
+            result.manual_actions_required.push(String::from(
+                "Mercurial integration not installed: the changelog path must not contain newlines or `=`, or end in whitespace",
+            ));
+            return Ok(());
+        };
+        Some(changelog)
+    } else {
+        None
+    };
+    let block = if let Some(changelog) = &changelog {
+        format!(
+            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{changelog} = sacho\nfilepath:{next} = :local\n\n[merge-tools]\nsacho.executable = sacho\nsacho.args = merge-driver $base $output $other $output\nsacho.premerge = false\nsacho.priority = -100\n\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+        )
+    } else {
+        format!(
+            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{next} = :local\n\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+        )
+    };
+    let hgrc = hg_dir.join("hgrc");
+    let old = match fs::read_to_string(&hgrc) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(source) => return Err(Error::ReadFile { path: hgrc, source }),
+    };
+    let edited = match edit_hgrc(&old, &block, changelog.as_deref(), &next) {
+        Ok(edited) => edited,
+        Err(reason) => {
+            result.manual_actions_required.push(format!(
+                "Mercurial integration not installed: {reason}; add this block to .hg/hgrc manually:\n{block}"
+            ));
+            return Ok(());
+        }
+    };
+    if edited != old {
+        fs::write(&hgrc, edited).map_err(|source| Error::WriteFile { path: hgrc, source })?;
+        if let Some(changelog) = changelog {
+            result.local_hg_config_changes.extend([
+                format!("merge-patterns.filepath:{changelog}"),
+                format!("merge-patterns.filepath:{next}"),
+                String::from("merge-tools.sacho"),
+                String::from("hooks.update.sacho"),
+            ]);
+        } else {
+            result.local_hg_config_changes.extend([
+                format!("merge-patterns.filepath:{next}"),
+                String::from("hooks.update.sacho"),
+            ]);
+        }
+    }
+    Ok(())
+}
+
+fn hg_config_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    (!path.contains(['\n', '\r', '=']) && path.trim_end() == path).then_some(path)
+}
+
+fn edit_hgrc(
+    source: &str,
+    block: &str,
+    changelog: Option<&str>,
+    next: &str,
+) -> std::result::Result<String, String> {
+    match (
+        source.find(HG_INTEGRATION_BEGIN),
+        source.find(HG_INTEGRATION_END),
+    ) {
+        (Some(begin), Some(end)) if begin <= end => {
+            let end = end + HG_INTEGRATION_END.len();
+            let mut output = String::new();
+            output.push_str(&source[..begin]);
+            output.push_str(block.trim_end());
+            output.push_str(&source[end..]);
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            validate_hgrc_integration_settings(&output, changelog, next)?;
+            Ok(output)
+        }
+        (None, None) => {
+            validate_hgrc_integration_settings(source, changelog, next)?;
+            let mut output = source.to_owned();
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(block);
+            Ok(output)
+        }
+        _ => Err(String::from("existing Sacho marker block is malformed")),
+    }
+}
+
+fn validate_hgrc_integration_settings(
+    source: &str,
+    changelog: Option<&str>,
+    next: &str,
+) -> std::result::Result<(), String> {
+    let mut settings = Vec::new();
+    if let Some(changelog) = changelog {
+        settings.extend([
+            ("merge-patterns", format!("filepath:{changelog}"), "sacho"),
+            ("merge-tools", String::from("sacho.executable"), "sacho"),
+            (
+                "merge-tools",
+                String::from("sacho.args"),
+                "merge-driver $base $output $other $output",
+            ),
+            ("merge-tools", String::from("sacho.premerge"), "false"),
+            ("merge-tools", String::from("sacho.priority"), "-100"),
+        ]);
+    }
+    settings.extend([
+        ("merge-patterns", format!("filepath:{next}"), ":local"),
+        (
+            "hooks",
+            String::from("update.sacho"),
+            "sacho hook-hg-update",
+        ),
+    ]);
+    for (section, key, value) in settings {
+        if let Some(existing) = hgrc_value(source, section, &key)
+            && existing != value
+        {
+            return Err(format!(
+                "[{section}] {key} already has incompatible value {existing:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hgrc_value<'a>(source: &'a str, wanted_section: &str, wanted_key: &str) -> Option<&'a str> {
+    let mut section = "";
+    let mut found = None;
+    for line in source.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = &line[1..line.len() - 1];
+        } else if section == wanted_section
+            && !line.starts_with(['#', ';'])
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == wanted_key
+        {
+            found = Some(value.trim());
+        }
+    }
+    found
+}
+
+fn repository_preset(root: &Path) -> Option<VcsPreset> {
+    if root.join(".jj").is_dir() {
+        Some(VcsPreset::Jj)
+    } else if root.join(".hg").is_dir() {
+        Some(VcsPreset::Hg)
+    } else if root.join(".git").exists() {
+        Some(VcsPreset::Git)
+    } else {
+        None
+    }
+}
+
+/// Applies the post-merge synchronization requested by Mercurial's update hook.
+///
+/// The hook is a no-op for ordinary updates and failed or unresolved merges.
+pub fn mercurial_update_hook(
+    repo: &Repository,
+    parent2: Option<&str>,
+    hook_error: Option<&str>,
+) -> Result<bool> {
+    if hook_error != Some("0") || parent2.is_none_or(|parent| parent.trim().is_empty()) {
+        return Ok(false);
+    }
+    let plan = plan_sync(repo, SyncOptions { force: true })?;
+    match plan {
+        SyncPlan::Apply(plan) => {
+            apply_sync(repo, SyncPlan::Apply(plan))?;
+            Ok(true)
+        }
+        SyncPlan::Skipped(_) | SyncPlan::NeedsConfirmation { .. } => Ok(false),
+    }
 }
 
 fn edit_gitattributes(source: &str, required: &[&str]) -> Result<String> {
@@ -4403,15 +4686,6 @@ mod tests {
     }
 
     #[test]
-    fn git_root_output_ignores_empty_output() {
-        assert_eq!(parse_git_root_output(" \n"), None);
-        assert_eq!(
-            parse_git_root_output("/tmp/repo\n"),
-            Some(PathBuf::from("/tmp/repo"))
-        );
-    }
-
-    #[test]
     fn init_config_omits_blank_repository_url() {
         let config = default_init_config(
             Path::new("project"),
@@ -4427,6 +4701,270 @@ mod tests {
 
         assert!(config.links.is_empty());
         assert!(!render_init_config(&config).contains("[links]"));
+    }
+
+    #[test]
+    fn colocated_jujutsu_repository_wins_over_git_detection() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        fs::create_dir(temp.path().join(".jj")).expect("jj marker");
+
+        assert_eq!(repository_preset(temp.path()), Some(VcsPreset::Jj));
+        assert_eq!(
+            default_init_config(temp.path(), &InitOptions::default())
+                .vcs
+                .preset,
+            VcsPreset::Jj
+        );
+    }
+
+    #[test]
+    fn repository_preset_requires_directories_for_nongit_markers() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join(".git"), "gitdir: elsewhere\n").expect("git marker");
+        fs::write(temp.path().join(".jj"), "ordinary file\n").expect("jj file");
+        fs::write(temp.path().join(".hg"), "ordinary file\n").expect("hg file");
+
+        assert_eq!(repository_preset(temp.path()), Some(VcsPreset::Git));
+    }
+
+    #[test]
+    fn non_git_mutation_locks_live_in_vcs_metadata() {
+        let jj = TempDir::new().expect("jj tempdir");
+        fs::create_dir(jj.path().join(".jj")).expect("jj marker");
+        let jj_lock = acquire_mutation_lock_at_root(jj.path()).expect("jj lock");
+        assert_eq!(jj_lock.path, jj.path().join(".jj/sacho.lock"));
+        assert!(!jj.path().join(MUTATION_LOCK_FILE).exists());
+
+        let hg = TempDir::new().expect("hg tempdir");
+        fs::create_dir(hg.path().join(".hg")).expect("hg marker");
+        let hg_lock = acquire_mutation_lock_at_root(hg.path()).expect("hg lock");
+        assert_eq!(hg_lock.path, hg.path().join(".hg/sacho.lock"));
+        assert!(!hg.path().join(MUTATION_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn init_discovers_the_marker_root_from_a_nested_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        let nested = temp.path().join("one/two");
+        fs::create_dir_all(&nested).expect("nested directory");
+
+        assert_eq!(init_root(&nested), temp.path());
+    }
+
+    #[test]
+    fn init_ignores_nongit_marker_files_in_nested_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".git")).expect("git marker");
+        let nested = temp.path().join("one/two");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::write(temp.path().join("one/.jj"), "ordinary file\n").expect("jj file");
+        fs::write(nested.join(".hg"), "ordinary file\n").expect("hg file");
+
+        assert_eq!(init_root(&nested), temp.path());
+    }
+
+    #[test]
+    fn init_normalizes_parent_components_before_discovering_markers() {
+        let temp = TempDir::new().expect("tempdir");
+        let sibling_a = temp.path().join("a");
+        let sibling_b = temp.path().join("b");
+        fs::create_dir_all(sibling_a.join(".git")).expect("Git marker");
+        fs::create_dir(&sibling_b).expect("sibling directory");
+
+        assert_eq!(init_root(&sibling_a.join("../b")), sibling_b);
+    }
+
+    #[test]
+    fn init_installs_idempotent_mercurial_merge_integration() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".hg")).expect("hg marker");
+
+        let first = init_repository(temp.path(), InitOptions::default()).expect("first init");
+        let second = init_repository(temp.path(), InitOptions::default()).expect("second init");
+        let hgrc = fs::read_to_string(temp.path().join(".hg/hgrc")).expect("hgrc");
+
+        assert_eq!(hgrc.matches(HG_INTEGRATION_BEGIN).count(), 1);
+        assert!(hgrc.contains("filepath:CHANGES.md = sacho"));
+        assert!(hgrc.contains("filepath:changes.d/next = :local"));
+        assert!(hgrc.contains("update.sacho = sacho hook-hg-update"));
+        assert!(!first.local_hg_config_changes.is_empty());
+        assert!(second.local_hg_config_changes.is_empty());
+    }
+
+    #[test]
+    fn init_skips_the_mercurial_changelog_driver_in_fragments_only_mode() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join(".hg")).expect("hg marker");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nmaterialize = false\n\n[vcs]\npreset = \"hg\"\n",
+        )
+        .expect("config");
+
+        let result = init_repository(temp.path(), InitOptions::default()).expect("init");
+        let hgrc = fs::read_to_string(temp.path().join(".hg/hgrc")).expect("hgrc");
+
+        assert!(!hgrc.contains("filepath:CHANGES.md = sacho"));
+        assert!(!hgrc.contains("[merge-tools]"));
+        assert!(!hgrc.contains("sacho.executable"));
+        assert!(hgrc.contains("filepath:changes.d/next = :local"));
+        assert!(hgrc.contains("update.sacho = sacho hook-hg-update"));
+        assert_eq!(
+            result.local_hg_config_changes,
+            vec![
+                String::from("merge-patterns.filepath:changes.d/next"),
+                String::from("hooks.update.sacho"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mercurial_integration_preserves_conflicting_unmarked_config() {
+        let source = "[hooks]\nupdate.sacho = other-command\n";
+        let block = format!(
+            "{HG_INTEGRATION_BEGIN}\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+        );
+
+        let error = edit_hgrc(source, &block, Some("CHANGES.md"), "changes.d/next")
+            .expect_err("conflicting hook must not be overwritten");
+
+        assert!(error.contains("incompatible value"));
+        assert_eq!(source, "[hooks]\nupdate.sacho = other-command\n");
+    }
+
+    #[test]
+    fn mercurial_integration_rejects_incompatible_merge_tool_controls() {
+        let block = format!(
+            "{HG_INTEGRATION_BEGIN}\n[merge-tools]\nsacho.premerge = false\nsacho.priority = -100\n{HG_INTEGRATION_END}\n"
+        );
+        for (key, value) in [("sacho.premerge", "true"), ("sacho.priority", "0")] {
+            let source = format!("[merge-tools]\n{key} = {value}\n");
+
+            let error = edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next")
+                .expect_err("incompatible merge-tool setting must not be overwritten");
+
+            assert!(error.contains(key), "{error}");
+            assert!(error.contains("incompatible value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn mercurial_integration_rejects_effective_settings_after_its_block() {
+        let block = format!(
+            "{HG_INTEGRATION_BEGIN}\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+        );
+        let source = format!("{block}update.sacho = false\n");
+
+        let error = edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next")
+            .expect_err("later conflicting hook must remain visible");
+
+        assert!(error.contains("update.sacho"), "{error}");
+        assert!(error.contains("incompatible value"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mercurial_config_paths_preserve_literal_backslashes() {
+        assert_eq!(
+            hg_config_path(Path::new(r"changes\directory/next")),
+            Some(String::from(r"changes\directory/next"))
+        );
+    }
+
+    #[test]
+    fn mercurial_config_paths_reject_trailing_whitespace() {
+        for path in ["CHANGES.md ", "changes.d/next\t"] {
+            assert_eq!(hg_config_path(Path::new(path)), None, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn hgrc_edit_rejects_missing_and_reversed_markers() {
+        let block = format!("{HG_INTEGRATION_BEGIN}\nvalue\n{HG_INTEGRATION_END}\n");
+        for source in [
+            format!("{HG_INTEGRATION_BEGIN}\n"),
+            format!("{HG_INTEGRATION_END}\n"),
+            format!("{HG_INTEGRATION_END}\n{HG_INTEGRATION_BEGIN}\n"),
+        ] {
+            assert_eq!(
+                edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next"),
+                Err(String::from("existing Sacho marker block is malformed"))
+            );
+        }
+    }
+
+    #[test]
+    fn hgrc_edit_appends_with_canonical_spacing() {
+        let block = format!("{HG_INTEGRATION_BEGIN}\nvalue\n{HG_INTEGRATION_END}\n");
+
+        assert_eq!(
+            edit_hgrc("", &block, Some("CHANGES.md"), "changes.d/next"),
+            Ok(block.clone())
+        );
+        assert_eq!(
+            edit_hgrc("[ui]\n", &block, Some("CHANGES.md"), "changes.d/next",),
+            Ok(format!("[ui]\n\n{block}"))
+        );
+        assert_eq!(
+            edit_hgrc("[ui]", &block, Some("CHANGES.md"), "changes.d/next"),
+            Ok(format!("[ui]\n\n{block}"))
+        );
+    }
+
+    #[test]
+    fn hgrc_edit_replaces_an_existing_marked_block() {
+        let source =
+            format!("[ui]\n{HG_INTEGRATION_BEGIN}\nold\n{HG_INTEGRATION_END}\n[extensions]\n");
+        let block = format!("{HG_INTEGRATION_BEGIN}\nnew\n{HG_INTEGRATION_END}\n");
+
+        assert_eq!(
+            edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next",),
+            Ok(format!("[ui]\n{block}[extensions]\n"))
+        );
+    }
+
+    #[test]
+    fn hgrc_value_requires_complete_section_headers_and_exact_keys() {
+        assert_eq!(
+            hgrc_value(
+                "[hooksX\nupdate.sacho = wrong\n[hooks]\n# update.sacho = commented\n; update.sacho = commented\nupdate.other = other\nupdate.sacho = expected\n",
+                "hooks",
+                "update.sacho",
+            ),
+            Some("expected")
+        );
+        assert_eq!(
+            hgrc_value("[hooksX\nupdate.sacho = wrong\n", "hooks", "update.sacho",),
+            None
+        );
+    }
+
+    #[test]
+    fn mercurial_update_hook_syncs_only_successful_merges() {
+        let (temp, repo) =
+            repo_with_config("[vcs]\npreset = \"hg\"\n[changelog]\nmaterialize = true\n");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("changes.d/feature.md"),
+            " -  Added a feature.\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            initial_materialized_changelog(repo.config()),
+        )
+        .expect("initial changelog");
+
+        assert!(!mercurial_update_hook(&repo, None, Some("0")).expect("ordinary update"));
+        assert!(!mercurial_update_hook(&repo, Some("other"), Some("1")).expect("failed merge"));
+        assert!(mercurial_update_hook(&repo, Some("other"), Some("0")).expect("merge sync"));
+        assert!(
+            fs::read_to_string(temp.path().join("CHANGES.md"))
+                .expect("synced changelog")
+                .contains("Added a feature.")
+        );
     }
 
     #[test]
@@ -9419,6 +9957,34 @@ priority: 0
 
         assert_eq!(report.violations.len(), 1);
         assert!(report.violations[0].message.contains("src/api.rs"));
+    }
+
+    #[test]
+    fn layer_three_checks_rename_origins_from_every_merge_parent() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["src/**"]
+            "#,
+        );
+        let mut merged =
+            ChangedPath::with_old_path_and_similarity("docs/c", ChangeKind::Renamed, "docs/b", 100);
+        merged.rename_origins.push(PathBuf::from("src/a"));
+        let vcs = FakeVcs {
+            commits: vec![fake_commit_with_paths(
+                "a1",
+                vec![merged],
+                "Resolve moved files",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.contains("src/a"));
     }
 
     #[test]
