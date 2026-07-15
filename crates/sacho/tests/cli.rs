@@ -1977,6 +1977,7 @@ materialize = false
 
     command
         .current_dir(temp.path())
+        .env("TZ", "Invalid/Timezone")
         .args(["release", "0.2.0", "--date", "2026-07-08"])
         .assert()
         .success();
@@ -1985,6 +1986,37 @@ materialize = false
     assert!(changelog.contains("Version 0.2.0\n-------------"));
     assert!(changelog.contains("Released on July 8, 2026."));
     assert!(!temp.path().join("changes.d/release.md").exists());
+}
+
+#[test]
+fn release_command_does_not_fall_back_to_utc_when_local_timezone_is_invalid() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/release.md"),
+        " -  Fixed release.\n",
+    )
+    .expect("fragment");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .env("TZ", "Invalid/Timezone")
+        .args(["release", "0.2.0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not determine the local calendar date",
+        ))
+        .stderr(predicate::str::contains("--date YYYY-MM-DD"));
+
+    assert!(temp.path().join("changes.d/release.md").exists());
+    assert!(!temp.path().join("CHANGES.md").exists());
 }
 
 #[test]

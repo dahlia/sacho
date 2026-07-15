@@ -1,13 +1,16 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use clap::{Parser, Subcommand};
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, civil};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
-    InitOptions, InitResult, NextOptions, ReleaseOptions, SyncOptions, SyncPlan, add_fragment,
-    apply_merge_driver, apply_release, apply_sync, carry, check, commit_message_hook,
+    InitOptions, InitResult, NextOptions, ReleaseDate, ReleaseOptions, SyncOptions, SyncPlan,
+    add_fragment, apply_merge_driver, apply_release, apply_sync, carry, check, commit_message_hook,
     compile_unreleased, format_fragments, init_repository, mercurial_update_hook, plan_release,
     plan_sync, prepare_check_fix, reference_transaction_hook, set_next_version,
 };
@@ -102,8 +105,11 @@ enum Command {
         #[arg(help = "Version to release; defaults to the next-version file")]
         version: Option<String>,
 
-        /// Release date in YYYY-MM-DD form.
-        #[arg(long, help = "Release date in YYYY-MM-DD form")]
+        /// Release date in YYYY-MM-DD form; defaults to the current local calendar date.
+        #[arg(
+            long,
+            help = "Release date in YYYY-MM-DD form; defaults to the current local calendar date"
+        )]
         date: Option<String>,
 
         /// Next unreleased version to write after release.
@@ -230,6 +236,7 @@ impl Cli {
                 next,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let date = resolve_release_date(date)?;
                 let plan = plan_release(
                     &repo,
                     ReleaseOptions {
@@ -292,6 +299,32 @@ impl Cli {
             }
         }
     }
+}
+
+fn resolve_release_date(date: Option<String>) -> Result<ReleaseDate, CliReport> {
+    match date {
+        Some(date) => Ok(ReleaseDate::parse(&date)?),
+        None => local_release_date(),
+    }
+}
+
+fn local_release_date() -> Result<ReleaseDate, CliReport> {
+    let timestamp = Timestamp::try_from(SystemTime::now()).map_err(local_release_date_error)?;
+    let time_zone = TimeZone::try_system().map_err(local_release_date_error)?;
+    Ok(release_date_at(timestamp, &time_zone))
+}
+
+fn release_date_at(timestamp: Timestamp, time_zone: &TimeZone) -> ReleaseDate {
+    let date: civil::Date = time_zone.to_datetime(timestamp).date();
+    ReleaseDate {
+        year: i32::from(date.year()),
+        month: date.month() as u8,
+        day: date.day() as u8,
+    }
+}
+
+fn local_release_date_error(source: jiff::Error) -> CliReport {
+    CliReport::LocalReleaseDate { source }
 }
 
 fn mercurial_update_needs_repository(parent2: Option<&str>, hook_error: Option<&str>) -> bool {
@@ -554,9 +587,18 @@ fn init_result_has_no_actions(result: &InitResult) -> bool {
 }
 
 #[derive(Debug, Diagnostic, thiserror::Error)]
-#[error("{0}")]
-#[diagnostic(code(sacho::error))]
-pub struct CliReport(#[from] Error);
+pub enum CliReport {
+    #[error("{0}")]
+    #[diagnostic(code(sacho::error))]
+    Sacho(#[from] Error),
+
+    #[error("could not determine the local calendar date; pass `--date YYYY-MM-DD`: {source}")]
+    #[diagnostic(code(sacho::local_release_date))]
+    LocalReleaseDate {
+        #[source]
+        source: jiff::Error,
+    },
+}
 
 pub fn render_report(report: CliReport) {
     let mut output = String::new();
@@ -572,6 +614,38 @@ pub fn render_report(report: CliReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_date_at_uses_the_timezone_calendar_date_across_boundaries() {
+        use jiff::Timestamp;
+        use jiff::tz::{TimeZone, offset};
+
+        let cases = [
+            (
+                "2026-12-31T15:30:00Z",
+                TimeZone::fixed(offset(9)),
+                "2027-01-01",
+            ),
+            (
+                "2027-01-01T03:30:00Z",
+                TimeZone::fixed(offset(-8)),
+                "2026-12-31",
+            ),
+            (
+                "2024-02-28T15:30:00Z",
+                TimeZone::fixed(offset(9)),
+                "2024-02-29",
+            ),
+        ];
+
+        for (timestamp, time_zone, expected) in cases {
+            let timestamp = timestamp.parse::<Timestamp>().expect("timestamp");
+            assert_eq!(
+                release_date_at(timestamp, &time_zone),
+                expected.parse::<ReleaseDate>().expect("release date")
+            );
+        }
+    }
 
     #[test]
     fn init_prompt_mode_rejects_conflicting_flags() {

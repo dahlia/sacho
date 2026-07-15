@@ -3,8 +3,8 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use hongdown::{
@@ -191,12 +191,12 @@ pub struct SyncResult {
 }
 
 /// Options for planning a release.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseOptions {
     /// Explicit version to release.
     pub version: Option<String>,
-    /// Release date in `YYYY-MM-DD` form.
-    pub date: Option<String>,
+    /// Calendar date to record for the release.
+    pub date: ReleaseDate,
     /// Next unreleased version to write after releasing.
     pub next: Option<String>,
 }
@@ -273,9 +273,17 @@ pub struct ReleaseDate {
 }
 
 impl ReleaseDate {
-    fn parse(source: &str) -> Result<Self> {
+    /// Parses a calendar date in strict `YYYY-MM-DD` form.
+    pub fn parse(source: &str) -> Result<Self> {
         let parts = source.split('-').collect::<Vec<_>>();
-        if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        if parts.len() != 3
+            || parts[0].len() != 4
+            || parts[1].len() != 2
+            || parts[2].len() != 2
+            || parts
+                .iter()
+                .any(|part| !part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
             return Err(Error::InvalidReleaseDate {
                 date: source.to_owned(),
             });
@@ -304,22 +312,23 @@ impl ReleaseDate {
         Ok(date)
     }
 
-    fn today_utc() -> Self {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_secs();
-        civil_from_days((seconds / 86_400) as i64)
-    }
-
     fn long_form(self) -> String {
         format!("{} {}, {}", month_name(self.month), self.day, self.year)
     }
 
     fn is_valid(self) -> bool {
-        (1..=12).contains(&self.month)
+        (0..=9_999).contains(&self.year)
+            && (1..=12).contains(&self.month)
             && self.day >= 1
             && self.day <= days_in_month(self.year, self.month)
+    }
+}
+
+impl FromStr for ReleaseDate {
+    type Err = Error;
+
+    fn from_str(source: &str) -> Result<Self> {
+        Self::parse(source)
     }
 }
 
@@ -799,10 +808,12 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
         (None, Some(next_version)) => next_version.to_owned(),
         (None, None) => return Err(Error::MissingReleaseVersion),
     };
-    let date = match options.date {
-        Some(date) => ReleaseDate::parse(&date)?,
-        None => ReleaseDate::today_utc(),
-    };
+    let date = options.date;
+    if !date.is_valid() {
+        return Err(Error::InvalidReleaseDate {
+            date: format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
+        });
+    }
     let (consumed_fragments, parsed_fragments) = snapshot_release_fragments(repo)?;
     let version_label = next_version
         .as_ref()
@@ -3425,25 +3436,6 @@ fn is_setext_title_underline(text: &str) -> bool {
     text.starts_with('=') && text.trim_matches('=').is_empty()
 }
 
-fn civil_from_days(days_since_epoch: i64) -> ReleaseDate {
-    let days = days_since_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    ReleaseDate {
-        year: year as i32,
-        month: month as u8,
-        day: day as u8,
-    }
-}
-
 fn month_name(month: u8) -> &'static str {
     match month {
         1 => "January",
@@ -4631,6 +4623,10 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    fn release_date() -> ReleaseDate {
+        ReleaseDate::parse("2026-07-08").expect("release date")
     }
 
     fn normalize_separators(value: impl AsRef<str>) -> String {
@@ -5844,7 +5840,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -5884,7 +5880,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -5923,7 +5919,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -5951,7 +5947,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -5986,7 +5982,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -6019,7 +6015,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -6060,7 +6056,7 @@ mod tests {
                 &repo,
                 ReleaseOptions {
                     version: Some(String::from("1.2.0")),
-                    date: Some(String::from("2026-07-08")),
+                    date: release_date(),
                     next: None,
                 },
             )
@@ -6096,7 +6092,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -6131,7 +6127,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("  ")),
             },
         )
@@ -6170,7 +6166,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -6200,7 +6196,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -6240,7 +6236,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6280,7 +6276,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6322,7 +6318,7 @@ mod tests {
                 &repo,
                 ReleaseOptions {
                     version: None,
-                    date: Some(String::from("2026-07-08")),
+                    date: release_date(),
                     next: Some(String::from("1.3.0")),
                 },
             )
@@ -6360,7 +6356,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6405,7 +6401,7 @@ mod tests {
                 &repo,
                 ReleaseOptions {
                     version: None,
-                    date: Some(String::from("2026-07-08")),
+                    date: release_date(),
                     next: Some(String::from("1.3.0")),
                 },
             )
@@ -6441,7 +6437,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6487,7 +6483,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6542,7 +6538,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6597,7 +6593,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6650,7 +6646,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6702,7 +6698,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6746,7 +6742,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6784,7 +6780,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6830,7 +6826,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6876,7 +6872,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6919,7 +6915,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -6964,7 +6960,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7006,7 +7002,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7052,7 +7048,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -7101,7 +7097,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7147,7 +7143,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7192,7 +7188,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7244,7 +7240,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -7286,7 +7282,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7337,7 +7333,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7386,7 +7382,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7421,7 +7417,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7461,7 +7457,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7513,7 +7509,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7564,7 +7560,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7599,7 +7595,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7633,7 +7629,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7672,7 +7668,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7709,7 +7705,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7746,7 +7742,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: Some(String::from("1.3.0")),
             },
         )
@@ -7809,7 +7805,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         ));
@@ -8141,7 +8137,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8266,7 +8262,7 @@ mod tests {
                 &repo,
                 ReleaseOptions {
                     version: None,
-                    date: Some(String::from("2026-07-08")),
+                    date: release_date(),
                     next: Some(String::from("1.3.0")),
                 },
             )
@@ -8300,7 +8296,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8337,7 +8333,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8365,7 +8361,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8394,7 +8390,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8434,7 +8430,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8461,7 +8457,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.1")),
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8486,7 +8482,7 @@ mod tests {
             &repo,
             ReleaseOptions {
                 version: None,
-                date: Some(String::from("2026-07-08")),
+                date: release_date(),
                 next: None,
             },
         )
@@ -8505,6 +8501,11 @@ mod tests {
             "2026-02-29",
             "2026-00-08",
             "2026-07-00",
+            "-001-01-01",
+            "+001-01-01",
+            "2026-+1-01",
+            "2026-01-+1",
+            "10000-01-01",
         ] {
             assert!(
                 matches!(
@@ -8523,6 +8524,55 @@ mod tests {
                 day: 29,
             }
         );
+        assert_eq!(
+            ReleaseDate::parse("0000-01-01")
+                .expect("minimum four-digit year")
+                .year,
+            0
+        );
+        assert_eq!(
+            ReleaseDate::parse("9999-12-31")
+                .expect("maximum four-digit year")
+                .year,
+            9999
+        );
+    }
+
+    #[test]
+    fn release_plan_rejects_an_invalid_constructed_date() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fix.md"), " -  Fixed release.\n").expect("fragment");
+
+        for date in [
+            ReleaseDate {
+                year: -1,
+                month: 1,
+                day: 1,
+            },
+            ReleaseDate {
+                year: 10_000,
+                month: 1,
+                day: 1,
+            },
+            ReleaseDate {
+                year: 2026,
+                month: 13,
+                day: 8,
+            },
+        ] {
+            let error = plan_release(
+                &repo,
+                ReleaseOptions {
+                    version: Some(String::from("1.2.0")),
+                    date,
+                    next: None,
+                },
+            )
+            .expect_err("invalid date");
+
+            assert!(matches!(error, Error::InvalidReleaseDate { .. }));
+        }
     }
 
     #[test]
@@ -8550,17 +8600,6 @@ mod tests {
 
             assert_eq!(date.long_form(), format!("{name} 8, 2026"));
         }
-    }
-
-    #[test]
-    fn release_today_utc_matches_system_day() {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_secs();
-        let expected = civil_from_days((seconds / 86_400) as i64);
-
-        assert_eq!(ReleaseDate::today_utc(), expected);
     }
 
     #[test]
@@ -8606,128 +8645,6 @@ mod tests {
         assert_eq!(days_in_month(2026, 4), 30);
         assert_eq!(days_in_month(2024, 2), 29);
         assert_eq!(days_in_month(2026, 2), 28);
-    }
-
-    #[test]
-    fn civil_from_days_matches_known_utc_dates() {
-        let cases = [
-            (
-                -1,
-                ReleaseDate {
-                    year: 1969,
-                    month: 12,
-                    day: 31,
-                },
-            ),
-            (
-                0,
-                ReleaseDate {
-                    year: 1970,
-                    month: 1,
-                    day: 1,
-                },
-            ),
-            (
-                31,
-                ReleaseDate {
-                    year: 1970,
-                    month: 2,
-                    day: 1,
-                },
-            ),
-            (
-                365,
-                ReleaseDate {
-                    year: 1971,
-                    month: 1,
-                    day: 1,
-                },
-            ),
-            (
-                789,
-                ReleaseDate {
-                    year: 1972,
-                    month: 2,
-                    day: 29,
-                },
-            ),
-            (
-                10_957,
-                ReleaseDate {
-                    year: 2000,
-                    month: 1,
-                    day: 1,
-                },
-            ),
-            (
-                11_016,
-                ReleaseDate {
-                    year: 2000,
-                    month: 2,
-                    day: 29,
-                },
-            ),
-            (
-                -719_162,
-                ReleaseDate {
-                    year: 1,
-                    month: 1,
-                    day: 1,
-                },
-            ),
-            (
-                -719_469,
-                ReleaseDate {
-                    year: 0,
-                    month: 2,
-                    day: 29,
-                },
-            ),
-            (
-                -800_000,
-                ReleaseDate {
-                    year: -221,
-                    month: 9,
-                    day: 4,
-                },
-            ),
-            (
-                -135_080,
-                ReleaseDate {
-                    year: 1600,
-                    month: 3,
-                    day: 1,
-                },
-            ),
-            (
-                -25_508,
-                ReleaseDate {
-                    year: 1900,
-                    month: 3,
-                    day: 1,
-                },
-            ),
-            (
-                20_272,
-                ReleaseDate {
-                    year: 2025,
-                    month: 7,
-                    day: 3,
-                },
-            ),
-            (
-                157_113,
-                ReleaseDate {
-                    year: 2400,
-                    month: 2,
-                    day: 29,
-                },
-            ),
-        ];
-
-        for (days, date) in cases {
-            assert_eq!(civil_from_days(days), date, "{days}");
-        }
     }
 
     #[test]
