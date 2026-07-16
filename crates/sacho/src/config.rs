@@ -1,6 +1,6 @@
 use std::fmt;
 use std::hash::Hash;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use indexmap::IndexMap;
@@ -47,6 +47,22 @@ impl Config {
 
     /// Validates semantic configuration constraints that TOML cannot express.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_config_path("changelog.path", &self.changelog.path)?;
+        validate_config_path("fragments.directory", &self.fragments.directory)?;
+        validate_config_path("fragments.next-file", &self.fragments.next_file)?;
+        if self
+            .fragments
+            .next_file
+            .extension()
+            .is_some_and(|extension| extension == "md")
+        {
+            return Err(ConfigError::InvalidPath {
+                key: String::from("fragments.next-file"),
+                path: self.fragments.next_file.clone(),
+                reason: "must not name a Markdown fragment",
+            });
+        }
+
         for (sigil, template) in &self.links {
             if !template.as_str().contains("{n}") {
                 return Err(ConfigError::LinkTemplateMissingNumber {
@@ -54,16 +70,86 @@ impl Config {
                 });
             }
         }
-        for section in &self.sections {
-            if section.directory.as_os_str().is_empty() {
-                return Err(ConfigError::EmptySectionDirectory {
-                    section: section.id.clone(),
+        let mut section_ids = Vec::<(&str, String)>::new();
+        let mut section_directories = Vec::<(PathBuf, String)>::new();
+        for (index, section) in self.sections.iter().enumerate() {
+            let id_key = format!("sections[{index}].id");
+            if section.id.trim().is_empty() {
+                return Err(ConfigError::EmptySectionId { key: id_key });
+            }
+            if let Some((_, first_key)) = section_ids
+                .iter()
+                .find(|(configured, _)| *configured == section.id)
+            {
+                return Err(ConfigError::DuplicateSectionId {
+                    id: section.id.clone(),
+                    first_key: first_key.clone(),
+                    second_key: id_key,
                 });
             }
+            section_ids.push((&section.id, id_key));
+
+            let directory_key = format!("sections[{index}].directory");
+            let comparison_path = validate_config_path(&directory_key, &section.directory)?;
+            if let Some((_, first_key)) = section_directories
+                .iter()
+                .find(|(configured, _)| *configured == comparison_path)
+            {
+                return Err(ConfigError::DuplicateSectionDirectory {
+                    path: section.directory.clone(),
+                    first_key: first_key.clone(),
+                    second_key: directory_key,
+                });
+            }
+            section_directories.push((comparison_path, directory_key));
         }
         self.vcs.validate()?;
         Ok(())
     }
+}
+
+fn validate_config_path(key: &str, path: &Path) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidPath {
+            key: key.to_owned(),
+            path: path.to_path_buf(),
+            reason: "must not be empty",
+        });
+    }
+
+    let mut comparison_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(ConfigError::InvalidPath {
+                    key: key.to_owned(),
+                    path: path.to_path_buf(),
+                    reason: "must be relative to its anchor",
+                });
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !comparison_path.pop() {
+                    return Err(ConfigError::InvalidPath {
+                        key: key.to_owned(),
+                        path: path.to_path_buf(),
+                        reason: "escapes its anchor",
+                    });
+                }
+            }
+            Component::Normal(name) => {
+                comparison_path.push(name);
+            }
+        }
+    }
+    if comparison_path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidPath {
+            key: key.to_owned(),
+            path: path.to_path_buf(),
+            reason: "must not resolve to its anchor",
+        });
+    }
+    Ok(comparison_path)
 }
 
 /// Changelog file configuration.
@@ -407,6 +493,21 @@ mod tests {
                     );
                 }
 
+                let mut unique_sections = Vec::<SectionConfig>::new();
+                for (id, directory) in sections {
+                    if unique_sections
+                        .iter()
+                        .any(|section| section.id == id || section.directory == directory)
+                    {
+                        continue;
+                    }
+                    unique_sections.push(SectionConfig {
+                        id,
+                        directory,
+                        paths: Vec::new(),
+                    });
+                }
+
                 Config {
                     changelog: ChangelogConfig {
                         path: changelog_path,
@@ -419,14 +520,7 @@ mod tests {
                     links: link_map,
                     vcs: VcsConfig::default(),
                     check: CheckConfig::default(),
-                    sections: sections
-                        .into_iter()
-                        .map(|(id, directory)| SectionConfig {
-                            id,
-                            directory,
-                            paths: Vec::new(),
-                        })
-                        .collect(),
+                    sections: unique_sections,
                 }
             })
     }
@@ -552,6 +646,177 @@ mod tests {
     }
 
     #[test]
+    fn rejects_paths_that_are_absolute_empty_or_escape_their_anchor() {
+        let cases = [
+            (
+                "[changelog]\npath = \"\"\n",
+                "changelog.path",
+                "must not be empty",
+            ),
+            (
+                "[changelog]\npath = \"/outside/CHANGES.md\"\n",
+                "changelog.path",
+                "must be relative",
+            ),
+            (
+                "[changelog]\npath = \"../outside/CHANGES.md\"\n",
+                "changelog.path",
+                "escapes its anchor",
+            ),
+            (
+                "[fragments]\ndirectory = \"/outside\"\n",
+                "fragments.directory",
+                "must be relative",
+            ),
+            (
+                "[fragments]\ndirectory = \"../outside\"\n",
+                "fragments.directory",
+                "escapes its anchor",
+            ),
+            (
+                "[fragments]\nnext-file = \"/outside\"\n",
+                "fragments.next-file",
+                "must be relative",
+            ),
+            (
+                "[fragments]\nnext-file = \"state/../..\"\n",
+                "fragments.next-file",
+                "escapes its anchor",
+            ),
+            (
+                "[[sections]]\nid = \"core\"\ndirectory = \"/outside\"\n",
+                "sections[0].directory",
+                "must be relative",
+            ),
+            (
+                "[[sections]]\nid = \"core\"\ndirectory = \"../outside\"\n",
+                "sections[0].directory",
+                "escapes its anchor",
+            ),
+            (
+                "[[sections]]\nid = \"core\"\ndirectory = \"nested/..\"\n",
+                "sections[0].directory",
+                "must not resolve to its anchor",
+            ),
+        ];
+
+        for (input, key, reason) in cases {
+            let error = Config::parse(input).expect_err("invalid configured path");
+            let message = error.to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains(reason), "{message}");
+        }
+    }
+
+    #[test]
+    fn accepts_safe_parent_components_within_each_path_anchor() {
+        let config = Config::parse(
+            r#"
+            [changelog]
+            path = "docs/archive/../CHANGES.md"
+
+            [fragments]
+            directory = "state/archive/../changes.d"
+            next-file = "metadata/archive/../next"
+
+            [[sections]]
+            id = "core"
+            directory = "packages/archive/../core"
+            "#,
+        )
+        .expect("parents that remain below their anchor are valid");
+
+        assert_eq!(
+            config.changelog.path,
+            PathBuf::from("docs/archive/../CHANGES.md")
+        );
+    }
+
+    #[test]
+    fn rejects_markdown_next_file_before_fragment_discovery() {
+        let error = Config::parse("[fragments]\nnext-file = \"metadata/next.md\"\n")
+            .expect_err("Markdown next-version path");
+        let message = error.to_string();
+
+        assert!(message.contains("fragments.next-file"), "{message}");
+        assert!(message.contains("next.md"), "{message}");
+        assert!(message.contains("Markdown fragment"), "{message}");
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_section_identifiers() {
+        let empty = Config::parse("[[sections]]\nid = \"  \"\ndirectory = \"core\"\n")
+            .expect_err("blank section id");
+        assert!(empty.to_string().contains("sections[0].id"));
+
+        let duplicate = Config::parse(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "core"
+            directory = "other"
+            "#,
+        )
+        .expect_err("duplicate section id");
+        let message = duplicate.to_string();
+        assert!(message.contains("sections[0].id"), "{message}");
+        assert!(message.contains("sections[1].id"), "{message}");
+        assert!(message.contains("core"), "{message}");
+    }
+
+    #[test]
+    fn rejects_statically_duplicate_section_directories_but_allows_nesting() {
+        let duplicate = Config::parse(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "packages/./core"
+
+            [[sections]]
+            id = "other"
+            directory = "packages/core"
+            "#,
+        )
+        .expect_err("duplicate section directory");
+        let message = duplicate.to_string();
+        assert!(message.contains("sections[0].directory"), "{message}");
+        assert!(message.contains("sections[1].directory"), "{message}");
+
+        let parent_alias = Config::parse(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "packages/archive/../core"
+
+            [[sections]]
+            id = "other"
+            directory = "packages/core"
+            "#,
+        )
+        .expect_err("lexically equivalent section directory");
+        assert!(matches!(
+            parent_alias,
+            ConfigError::DuplicateSectionDirectory { .. }
+        ));
+
+        Config::parse(
+            r#"
+            [[sections]]
+            id = "packages"
+            directory = "packages"
+
+            [[sections]]
+            id = "core"
+            directory = "packages/core"
+            "#,
+        )
+        .expect("nested section directories are valid");
+    }
+
+    #[test]
     fn preserves_defaults_for_partial_nested_tables() {
         let config = Config::parse(
             r#"
@@ -635,6 +900,39 @@ mod tests {
             );
 
             prop_assert!(is_missing_placeholder);
+        }
+
+        #[test]
+        fn accepts_generated_parent_components_that_cancel_below_the_anchor(
+            prefix in prop::collection::vec("[a-z][a-z0-9_-]{0,8}", 0..4),
+            terminal in "[a-z][a-z0-9_-]{0,8}",
+            suffix in prop::collection::vec("[a-z][a-z0-9_-]{0,8}", 0..4),
+        ) {
+            let mut path = PathBuf::new();
+            path.extend(prefix);
+            path.push("detour");
+            path.push("..");
+            path.push(terminal);
+            path.extend(suffix);
+
+            prop_assert!(validate_config_path("generated.path", &path).is_ok());
+        }
+
+        #[test]
+        fn rejects_generated_parent_components_that_underflow_the_anchor(
+            parent_count in 1_usize..8,
+            suffix in prop::collection::vec("[a-z][a-z0-9_-]{0,8}", 0..4),
+        ) {
+            let mut path = PathBuf::new();
+            for _ in 0..parent_count {
+                path.push("..");
+            }
+            path.extend(suffix);
+
+            let error = validate_config_path("generated.path", &path)
+                .expect_err("parent path must underflow its anchor");
+            let invalid_path = matches!(error, ConfigError::InvalidPath { .. });
+            prop_assert!(invalid_path);
         }
     }
 }

@@ -30,6 +30,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// An operational repository configuration could not be serialized.
+    #[snafu(display("failed to serialize repository configuration: {source}"))]
+    SerializeConfig {
+        /// Underlying TOML serialization error.
+        source: toml::ser::Error,
+    },
+
     /// A file could not be removed.
     #[snafu(display("failed to remove file {}: {source}", path.display()))]
     RemoveFile {
@@ -80,7 +87,8 @@ pub enum Error {
         path: PathBuf,
 
         /// Configuration-specific error.
-        source: ConfigError,
+        #[snafu(source(from(ConfigError, Box::new)))]
+        source: Box<ConfigError>,
     },
 
     /// A fragment was invalid.
@@ -472,6 +480,121 @@ pub enum ConfigError {
     Parse {
         /// Underlying TOML parser error.
         source: toml::de::Error,
+    },
+
+    /// A configured repository path violates the lexical path contract.
+    #[snafu(display("configured path {key} = {} {reason}", path.display()))]
+    InvalidPath {
+        /// Configuration key containing the path.
+        key: String,
+
+        /// Configured path exactly as supplied.
+        path: PathBuf,
+
+        /// Human-readable reason the path is invalid.
+        reason: &'static str,
+    },
+
+    /// A configured path could not be resolved safely against filesystem state.
+    #[snafu(display(
+        "configured path {key} = {} could not be resolved safely at {}: {source}",
+        path.display(),
+        effective_path.display()
+    ))]
+    ConfigPathResolution {
+        /// Configuration key containing the path.
+        key: String,
+
+        /// Configured path exactly as supplied.
+        path: PathBuf,
+
+        /// Effective path after applying its configured anchor.
+        effective_path: PathBuf,
+
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
+
+    /// A configured path resolves outside its required filesystem boundary.
+    #[snafu(display(
+        "configured path {key} = {} resolves to {}, outside {boundary_key} at {}",
+        path.display(),
+        resolved.display(),
+        boundary.display()
+    ))]
+    ConfigPathOutsideBoundary {
+        /// Configuration key containing the path.
+        key: String,
+
+        /// Configured path exactly as supplied.
+        path: PathBuf,
+
+        /// Filesystem identity of the configured path.
+        resolved: PathBuf,
+
+        /// Name of the required boundary.
+        boundary_key: String,
+
+        /// Filesystem identity of the required boundary.
+        boundary: PathBuf,
+    },
+
+    /// Two configured or reserved paths overlap in the filesystem.
+    #[snafu(display(
+        "configured paths {first_key} = {} and {second_key} = {} overlap in the filesystem",
+        first_path.display(),
+        second_path.display()
+    ))]
+    ConfigPathOverlap {
+        /// Key of the first path.
+        first_key: String,
+
+        /// First configured path.
+        first_path: PathBuf,
+
+        /// Key or reserved role of the second path.
+        second_key: String,
+
+        /// Second configured or reserved path.
+        second_path: PathBuf,
+    },
+
+    /// A configured section identifier is empty or whitespace-only.
+    #[snafu(display("configured section identifier {key} must not be empty"))]
+    EmptySectionId {
+        /// Configuration key containing the empty identifier.
+        key: String,
+    },
+
+    /// Two configured sections use the same identifier.
+    #[snafu(display(
+        "configured section identifier {id:?} is duplicated by {first_key} and {second_key}"
+    ))]
+    DuplicateSectionId {
+        /// Repeated section identifier.
+        id: String,
+
+        /// Key of the first section identifier.
+        first_key: String,
+
+        /// Key of the later section identifier.
+        second_key: String,
+    },
+
+    /// Two configured sections use the same fragment directory.
+    #[snafu(display(
+        "configured section directory {} is duplicated by {first_key} and {second_key}",
+        path.display()
+    ))]
+    DuplicateSectionDirectory {
+        /// Repeated section directory.
+        path: PathBuf,
+
+        /// Key of the first section directory.
+        first_key: String,
+
+        /// Key of the later section directory.
+        second_key: String,
     },
 
     /// A configured section has an empty fragment directory.

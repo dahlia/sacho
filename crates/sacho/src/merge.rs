@@ -1,6 +1,7 @@
 //! Changelog merge driver core.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -11,7 +12,7 @@ use semver::Version;
 use crate::changelog::{ChangelogError, find_unreleased_region, version_heading_spans};
 use crate::commands::{CompileOptions, compile_unreleased};
 use crate::error::{Error, Result};
-use crate::repo::Repository;
+use crate::repo::{Repository, mutation_lock_path};
 
 /// Options for running Sacho's changelog merge driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,7 +526,7 @@ fn compile_unreleased_for_merge(repo: &Repository) -> Result<crate::compile::Com
         && let Some(other_head) = git_other_head(repo)?
     {
         let temp = merged_fragment_temp_root(repo, &other_head)?;
-        let temp_repo = Repository::from_root(temp.path())?;
+        let temp_repo = temp.repository()?;
         return compile_unreleased(&temp_repo, CompileOptions::default());
     }
 
@@ -534,11 +535,16 @@ fn compile_unreleased_for_merge(repo: &Repository) -> Result<crate::compile::Com
 
 struct TempRoot {
     path: PathBuf,
+    mutation_lock_path: PathBuf,
 }
 
 impl TempRoot {
     fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    fn repository(&self) -> Result<Repository> {
+        Repository::from_root_with_mutation_lock(self.path(), &self.mutation_lock_path)
     }
 }
 
@@ -555,15 +561,77 @@ fn merged_fragment_temp_root(repo: &Repository, other_head: &str) -> Result<Temp
         path: path.clone(),
         source,
     })?;
-    let temp = TempRoot { path };
-    copy_file(
-        repo.resolve(Repository::CONFIG_FILE),
-        temp.path().join(Repository::CONFIG_FILE),
-    )?;
+    let source_lock_path = mutation_lock_path(repo.root());
+    let mutation_lock_path = source_lock_path
+        .strip_prefix(repo.root())
+        .map(|relative| path.join(relative))
+        .unwrap_or(source_lock_path);
+    let temp = TempRoot {
+        path,
+        mutation_lock_path,
+    };
+    let config_path = temp.path().join(Repository::CONFIG_FILE);
+    let snapshot_config = serializable_snapshot_config(repo);
+    let config =
+        toml::to_string(&snapshot_config).map_err(|source| Error::SerializeConfig { source })?;
+    fs::write(&config_path, config).map_err(|source| Error::WriteFile {
+        path: config_path,
+        source,
+    })?;
     let fragment_dir = repo.config().fragments.directory.clone();
     copy_directory(repo.resolve(&fragment_dir), temp.path().join(&fragment_dir))?;
     overlay_other_fragment_changes(repo, temp.path(), other_head)?;
+    let snapshot_fragment_dir = &snapshot_config.fragments.directory;
+    if snapshot_fragment_dir != &fragment_dir {
+        copy_directory(
+            temp.path().join(&fragment_dir),
+            temp.path().join(snapshot_fragment_dir),
+        )?;
+    }
+    materialize_snapshot_fallback_paths(repo, &snapshot_config, temp.path())?;
     Ok(temp)
+}
+
+fn materialize_snapshot_fallback_paths(
+    repo: &Repository,
+    snapshot_config: &crate::config::Config,
+    temp_root: &std::path::Path,
+) -> Result<()> {
+    let operational_fragment_root = temp_root.join(&repo.config().fragments.directory);
+    let snapshot_fragment_root = temp_root.join(&snapshot_config.fragments.directory);
+
+    let operational_next = operational_fragment_root.join(&repo.config().fragments.next_file);
+    let snapshot_next = snapshot_fragment_root.join(&snapshot_config.fragments.next_file);
+    if operational_next != snapshot_next && operational_next.is_file() {
+        copy_file(operational_next, snapshot_next)?;
+    }
+
+    for (operational, snapshot) in repo.config().sections.iter().zip(&snapshot_config.sections) {
+        let operational_directory = operational_fragment_root.join(&operational.directory);
+        let snapshot_directory = snapshot_fragment_root.join(&snapshot.directory);
+        if operational_directory != snapshot_directory {
+            copy_directory(operational_directory, snapshot_directory)?;
+        }
+    }
+    Ok(())
+}
+
+fn serializable_snapshot_config(repo: &Repository) -> crate::config::Config {
+    let mut config = repo.config().clone();
+    let source = repo.source_config();
+    preserve_serializable_path(&mut config.changelog.path, &source.changelog.path);
+    preserve_serializable_path(&mut config.fragments.directory, &source.fragments.directory);
+    preserve_serializable_path(&mut config.fragments.next_file, &source.fragments.next_file);
+    for (section, source_section) in config.sections.iter_mut().zip(&source.sections) {
+        preserve_serializable_path(&mut section.directory, &source_section.directory);
+    }
+    config
+}
+
+fn preserve_serializable_path(path: &mut PathBuf, source: &std::path::Path) {
+    if path.to_str().is_none() {
+        *path = source.to_path_buf();
+    }
 }
 
 fn temp_root_path() -> PathBuf {
@@ -627,22 +695,11 @@ fn overlay_other_fragment_changes(
     if base.is_empty() {
         return Ok(());
     }
-    let fragment_dir = repo.config().fragments.directory.to_string_lossy();
-    let current_changed = git_changed_fragment_paths(repo, base, "HEAD", fragment_dir.as_ref())?;
-    let copied = git_output(
-        repo,
-        [
-            "diff",
-            "--name-only",
-            "-z",
-            "--diff-filter=ACMR",
-            base,
-            other_head,
-            "--",
-            fragment_dir.as_ref(),
-        ],
-    )?;
-    for path in nul_paths(&copied) {
+    let fragment_dir = &repo.config().fragments.directory;
+    let current_changed = git_changed_fragment_paths(repo, base, "HEAD", fragment_dir)?;
+    let copied =
+        git_changed_fragment_paths_with_filter(repo, base, other_head, "ACMR", fragment_dir)?;
+    for path in copied {
         if !is_fragment_markdown_path(&path) {
             continue;
         }
@@ -653,20 +710,9 @@ fn overlay_other_fragment_changes(
         }
     }
 
-    let deleted = git_output(
-        repo,
-        [
-            "diff",
-            "--name-only",
-            "-z",
-            "--diff-filter=D",
-            base,
-            other_head,
-            "--",
-            fragment_dir.as_ref(),
-        ],
-    )?;
-    for path in nul_paths(&deleted) {
+    let deleted =
+        git_changed_fragment_paths_with_filter(repo, base, other_head, "D", fragment_dir)?;
+    for path in deleted {
         if is_fragment_markdown_path(&path) && !current_changed.contains(&path) {
             let _ = fs::remove_file(temp_root.join(path));
         }
@@ -678,24 +724,56 @@ fn git_changed_fragment_paths(
     repo: &Repository,
     base: &str,
     revision: &str,
-    fragment_dir: &str,
+    fragment_dir: &std::path::Path,
 ) -> Result<HashSet<PathBuf>> {
-    Ok(nul_paths(&git_output(
-        repo,
-        [
+    Ok(
+        git_changed_fragment_paths_with_filter(repo, base, revision, "ACMR", fragment_dir)?
+            .into_iter()
+            .filter(|path| is_fragment_markdown_path(path))
+            .collect(),
+    )
+}
+
+fn git_changed_fragment_paths_with_filter(
+    repo: &Repository,
+    base: &str,
+    revision: &str,
+    filter: &str,
+    fragment_dir: &std::path::Path,
+) -> Result<Vec<PathBuf>> {
+    let filter_arg = format!("--diff-filter={filter}");
+    let output = Command::new("git")
+        .current_dir(repo.root())
+        .args([
             "diff",
             "--name-only",
             "-z",
-            "--diff-filter=ACMR",
+            &filter_arg,
             base,
             revision,
             "--",
-            fragment_dir,
-        ],
-    )?)
-    .into_iter()
-    .filter(|path| is_fragment_markdown_path(path))
-    .collect())
+        ])
+        .arg(fragment_dir)
+        .output()
+        .map_err(|source| Error::VcsCommandIo {
+            command: format!(
+                "git diff --name-only -z {filter_arg} {base} {revision} -- {}",
+                fragment_dir.display()
+            ),
+            source,
+        })?;
+    if output.status.success() {
+        Ok(nul_paths(&output.stdout))
+    } else {
+        Err(Error::VcsCommandFailed {
+            command: format!(
+                "git diff --name-only -z {filter_arg} {base} {revision} -- {}",
+                fragment_dir.display()
+            ),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
 }
 
 fn merge_shared_fragment(
@@ -807,12 +885,25 @@ fn is_fragment_markdown_path(path: &std::path::Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("md")
 }
 
-fn nul_paths(output: &str) -> Vec<PathBuf> {
+fn nul_paths(output: &[u8]) -> Vec<PathBuf> {
     output
-        .split('\0')
+        .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+        .map(git_path_from_bytes)
         .collect()
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(path.to_vec()))
+}
+
+#[cfg(not(unix))]
+#[cfg_attr(test, mutants::skip)]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(path).into_owned())
 }
 
 fn git_other_head(repo: &Repository) -> Result<Option<String>> {
@@ -829,20 +920,23 @@ fn git_other_head(repo: &Repository) -> Result<Option<String>> {
 }
 
 fn git_blob(repo: &Repository, revision: &str, path: &std::path::Path) -> Result<Vec<u8>> {
-    let spec = format!("{revision}:{}", path.to_string_lossy());
+    let mut spec = OsString::from(revision);
+    spec.push(":");
+    spec.push(path.as_os_str());
     let output = Command::new("git")
         .current_dir(repo.root())
-        .args(["show", &spec])
+        .arg("show")
+        .arg(&spec)
         .output()
         .map_err(|source| Error::VcsCommandIo {
-            command: format!("git show {spec}"),
+            command: format!("git show {}", spec.to_string_lossy()),
             source,
         })?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
         Err(Error::VcsCommandFailed {
-            command: format!("git show {spec}"),
+            command: format!("git show {}", spec.to_string_lossy()),
             status: output.status,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
@@ -910,6 +1004,39 @@ mod tests {
         fs::write(temp.path().join("changes.d/change.md"), fragment).expect("fragment");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("run Git");
+        assert!(
+            status.success(),
+            "git {} failed with {status}",
+            args.join(" ")
+        );
+    }
+
+    fn git_stdout(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run Git");
+        assert!(
+            output.status.success(),
+            "git {} failed with {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("ASCII Git output")
+            .trim()
+            .to_owned()
     }
 
     fn write_inputs(
@@ -1000,6 +1127,238 @@ Released on July 1, 2026.
         assert!(output.contains(" -  Fixed merged fragment.\n"));
         assert!(!output.contains("Current stale"));
         assert!(!output.contains("Other stale"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_snapshot_preserves_a_resolved_fragment_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[fragments]\ndirectory = \"alias\"\n",
+        )
+        .expect("config");
+        fs::create_dir(temp.path().join("actual")).expect("fragment directory");
+        fs::write(
+            temp.path().join("actual/change.md"),
+            " -  Preserved in merged snapshot.\n",
+        )
+        .expect("fragment");
+        symlink("actual", temp.path().join("alias")).expect("fragment alias");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Initial"]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot = merged_fragment_temp_root(&repo, "HEAD").expect("merged snapshot");
+        let snapshot_repo = snapshot.repository().expect("snapshot repo");
+        let discovered = crate::fragment::discover_fragment_candidates(&snapshot_repo)
+            .expect("snapshot fragments");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(
+            discovered.candidates[0].relative_path,
+            PathBuf::from("actual/change.md")
+        );
+    }
+
+    #[test]
+    fn merged_snapshot_preserves_the_source_git_lock_location() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\npath = \".sacho.lock\"\n",
+        )
+        .expect("config");
+        fs::create_dir(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("changes.d/change.md"),
+            " -  Preserved in merged snapshot.\n",
+        )
+        .expect("fragment");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Initial"]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot = merged_fragment_temp_root(&repo, "HEAD").expect("merged snapshot");
+
+        let snapshot_repo = snapshot
+            .repository()
+            .expect("snapshot must retain the source Git lock location");
+        crate::fragment::discover_fragment_candidates(&snapshot_repo)
+            .expect("snapshot reads must retain the source Git lock location");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_snapshot_preserves_a_non_utf8_resolved_fragment_directory() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[fragments]\ndirectory = \"alias\"\n",
+        )
+        .expect("config");
+        let actual = PathBuf::from(OsString::from_vec(b"actual-\xff".to_vec()));
+        fs::create_dir(temp.path().join(&actual)).expect("fragment directory");
+        fs::write(
+            temp.path().join(&actual).join("change.md"),
+            " -  Preserved in merged snapshot.\n",
+        )
+        .expect("fragment");
+        symlink(&actual, temp.path().join("alias")).expect("fragment alias");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Initial"]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot = merged_fragment_temp_root(&repo, "HEAD").expect("merged snapshot");
+        let snapshot_repo = snapshot.repository().expect("snapshot repo");
+        let discovered = crate::fragment::discover_fragment_candidates(&snapshot_repo)
+            .expect("snapshot fragments");
+
+        assert_eq!(discovered.candidates.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_snapshot_materializes_a_non_utf8_next_file_alias() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(temp.path().join("sacho.toml"), "").expect("config");
+        fs::create_dir(temp.path().join("changes.d")).expect("fragment directory");
+        let actual = PathBuf::from(OsString::from_vec(b"next-\xff".to_vec()));
+        fs::write(temp.path().join("changes.d").join(&actual), "2.0.0\n").expect("next version");
+        symlink(&actual, temp.path().join("changes.d/next")).expect("next-file alias");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Initial"]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot = merged_fragment_temp_root(&repo, "HEAD").expect("merged snapshot");
+        let snapshot_repo = snapshot.repository().expect("snapshot repo");
+        let compiled = crate::compile::compile_unreleased(
+            &snapshot_repo,
+            crate::compile::CompileOptions::default(),
+        )
+        .expect("compiled snapshot");
+
+        assert_eq!(
+            compiled.version_label,
+            crate::compile::VersionLabel::Version(String::from("2.0.0"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_snapshot_materializes_a_non_utf8_section_alias() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[[sections]]\nid = \"core\"\ndirectory = \"alias\"\n",
+        )
+        .expect("config");
+        fs::create_dir(temp.path().join("changes.d")).expect("fragment directory");
+        let actual = PathBuf::from(OsString::from_vec(b"actual-\xff".to_vec()));
+        fs::create_dir(temp.path().join("changes.d").join(&actual)).expect("section directory");
+        fs::write(
+            temp.path()
+                .join("changes.d")
+                .join(&actual)
+                .join("change.md"),
+            " -  Section fragment.\n",
+        )
+        .expect("fragment");
+        symlink(&actual, temp.path().join("changes.d/alias")).expect("section alias");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Initial"]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot = merged_fragment_temp_root(&repo, "HEAD").expect("merged snapshot");
+        let snapshot_repo = snapshot.repository().expect("snapshot repo");
+        let discovered = crate::fragment::discover_fragment_candidates(&snapshot_repo)
+            .expect("snapshot fragments");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(discovered.candidates[0].section.as_deref(), Some("core"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_snapshot_overlays_changes_under_a_non_utf8_fragment_directory() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), &["init", "--quiet"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test User"]);
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[fragments]\ndirectory = \"alias\"\n",
+        )
+        .expect("config");
+        let actual = PathBuf::from(OsString::from_vec(b"actual-\xff".to_vec()));
+        fs::create_dir(temp.path().join(&actual)).expect("fragment directory");
+        fs::write(
+            temp.path().join(&actual).join("base.md"),
+            " -  Base fragment.\n",
+        )
+        .expect("base fragment");
+        symlink(&actual, temp.path().join("alias")).expect("fragment alias");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Base"]);
+        let primary_branch = git_stdout(temp.path(), &["branch", "--show-current"]);
+        git(temp.path(), &["checkout", "--quiet", "-b", "other"]);
+        fs::write(
+            temp.path().join(&actual).join("incoming.md"),
+            " -  Incoming fragment.\n",
+        )
+        .expect("incoming fragment");
+        git(temp.path(), &["add", "."]);
+        git(temp.path(), &["commit", "--quiet", "-m", "Incoming"]);
+        let other_head = git_stdout(temp.path(), &["rev-parse", "HEAD"]);
+        git(temp.path(), &["checkout", "--quiet", &primary_branch]);
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let snapshot =
+            merged_fragment_temp_root(&repo, &other_head).expect("merged fragment snapshot");
+        let snapshot_repo = snapshot.repository().expect("snapshot repo");
+        let discovered = crate::fragment::discover_fragment_candidates(&snapshot_repo)
+            .expect("snapshot fragments");
+
+        assert_eq!(discovered.candidates.len(), 2);
+        assert!(
+            discovered
+                .candidates
+                .iter()
+                .any(|candidate| candidate.path.ends_with("incoming.md"))
+        );
     }
 
     #[test]

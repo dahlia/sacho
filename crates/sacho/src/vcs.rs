@@ -3829,6 +3829,10 @@ mod tests {
             "git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if args.as_slice() == ["init"] {
+            git(dir, ["config", "commit.gpgSign", "false"]);
+            git(dir, ["config", "tag.gpgSign", "false"]);
+        }
     }
 
     fn git_expect_failure<const N: usize>(dir: &std::path::Path, args: [&str; N]) {

@@ -170,6 +170,7 @@ pub fn discover_fragments(repo: &Repository) -> Result<DiscoveredFragments> {
 
 /// Discovers fragment file paths without parsing their contents.
 pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragmentCandidates> {
+    repo.revalidate_paths()?;
     let config = repo.config();
     let fragment_dir = repo.resolve(&config.fragments.directory);
     let mut candidates = Vec::new();
@@ -201,7 +202,7 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
                 path: fragment_dir.clone(),
             })?;
             let path = entry.path();
-            if !path.is_dir() || is_configured_section_dir(config, &path) {
+            if !path.is_dir() || is_configured_section_dir(repo, &path) {
                 continue;
             }
             let Some(section) = path
@@ -326,11 +327,17 @@ fn collect_markdown_files(
     Ok(())
 }
 
-fn is_configured_section_dir(config: &crate::Config, path: &Path) -> bool {
+fn is_configured_section_dir(repo: &Repository, path: &Path) -> bool {
+    let Ok(identity) = fs::canonicalize(path) else {
+        return false;
+    };
+    let config = repo.config();
+    let fragment_dir = repo.resolve(&config.fragments.directory);
     config
         .sections
         .iter()
-        .any(|section| path.ends_with(&section.directory))
+        .filter_map(|section| fs::canonicalize(fragment_dir.join(&section.directory)).ok())
+        .any(|configured| configured == identity)
 }
 
 fn repo_relative_path(repo: &Repository, path: &Path) -> PathBuf {
@@ -1089,6 +1096,97 @@ mod tests {
                 PathBuf::from("changes.d/core/z.md")
             ]
         );
+    }
+
+    #[test]
+    fn discovers_a_parent_normalized_section_exactly_once() {
+        for archive_exists in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(
+                temp.path().join("sacho.toml"),
+                r#"
+                [[sections]]
+                id = "Core"
+                directory = "packages/archive/.."
+                "#,
+            )
+            .expect("config");
+            std::fs::create_dir_all(temp.path().join("changes.d/packages")).expect("section dir");
+            if archive_exists {
+                std::fs::create_dir(temp.path().join("changes.d/packages/archive"))
+                    .expect("archive dir");
+            }
+            std::fs::write(
+                temp.path().join("changes.d/packages/change.md"),
+                " -  Fixed package discovery.\n",
+            )
+            .expect("fragment");
+            let repo = Repository::from_root(temp.path()).expect("repo");
+
+            let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+            assert_eq!(discovered.candidates.len(), 1, "archive={archive_exists}");
+            assert_eq!(
+                discovered.candidates[0].section,
+                Some(String::from("Core")),
+                "archive={archive_exists}"
+            );
+            assert!(discovered.warnings.is_empty(), "archive={archive_exists}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_a_symlinked_section_exactly_once() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "Core"
+            directory = "alias"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d/actual")).expect("section directory");
+        std::fs::write(
+            temp.path().join("changes.d/actual/change.md"),
+            " -  Fixed symlinked section discovery.\n",
+        )
+        .expect("fragment");
+        symlink("actual", temp.path().join("changes.d/alias")).expect("section alias");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(discovered.candidates[0].section, Some(String::from("Core")));
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_fragment_directory_created_as_an_external_symlink_after_opening() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        fs::write(temp.path().join("sacho.toml"), "").expect("config");
+        fs::write(
+            outside.path().join("external.md"),
+            " -  Must not be discovered.\n",
+        )
+        .expect("external fragment");
+        let repo = Repository::from_root(temp.path()).expect("repository");
+        symlink(outside.path(), temp.path().join("changes.d")).expect("external symlink");
+
+        let error = discover_fragment_candidates(&repo).expect_err("external fragment directory");
+        let message = error.to_string();
+
+        assert!(message.contains("fragments.directory"), "{message}");
+        assert!(message.contains("outside repository root"), "{message}");
     }
 
     #[test]

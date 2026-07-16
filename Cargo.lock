@@ -1343,12 +1343,14 @@ name = "sacho"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "caseless",
  "clap",
  "comrak 0.53.0",
  "globset",
  "hongdown",
  "indexmap",
  "jiff",
+ "libc",
  "miette",
  "mutants",
  "portable-pty",

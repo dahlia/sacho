@@ -4,6 +4,63 @@ use predicates::prelude::*;
 use std::io::{Read, Write};
 use std::process::Command as ProcessCommand;
 
+#[cfg(unix)]
+#[test]
+fn repository_commands_reject_an_external_configured_path_without_touching_it() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let outside = tempfile::TempDir::new().expect("outside tempdir");
+    let sentinel = outside.path().join("protected.txt");
+    std::fs::write(&sentinel, "unchanged\n").expect("sentinel");
+    symlink(outside.path(), temp.path().join("linked")).expect("external symlink");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[fragments]\ndirectory = \"linked\"\n",
+    )
+    .expect("config");
+
+    let invocations: &[&[&str]] = &[
+        &["init", "--no-interactive"],
+        &["add", "topic"],
+        &["next", "1.2.0"],
+        &["check", "--fix"],
+        &["fmt"],
+        &["preview"],
+        &["sync", "--force"],
+        &["release", "1.2.0", "--date", "2026-07-15"],
+        &["carry", "1.1.0"],
+    ];
+
+    for args in invocations {
+        let mut command = Command::cargo_bin("sacho").expect("binary");
+        command
+            .current_dir(temp.path())
+            .args(*args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("fragments.directory"))
+            .stderr(predicate::str::contains("linked"));
+
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel after command"),
+            "unchanged\n",
+            "command {args:?} changed the external sentinel"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside.path())
+                .expect("outside directory")
+                .count(),
+            1,
+            "command {args:?} created an external path"
+        );
+        assert!(
+            !temp.path().join(".sacho.lock").exists(),
+            "command {args:?} created the mutation lock before validation"
+        );
+    }
+}
+
 #[test]
 fn help_lists_commands() {
     let mut command = Command::cargo_bin("sacho").expect("binary");
@@ -1936,6 +1993,10 @@ fn git<const N: usize>(dir: &std::path::Path, args: [&str; N]) {
         "git failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if args.as_slice() == ["init"] {
+        git(dir, ["config", "commit.gpgSign", "false"]);
+        git(dir, ["config", "tag.gpgSign", "false"]);
+    }
 }
 
 fn git_output<const N: usize>(dir: &std::path::Path, args: [&str; N]) -> String {

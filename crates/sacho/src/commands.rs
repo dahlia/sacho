@@ -24,7 +24,15 @@ use crate::fragment::{
 };
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::carry_release;
-use crate::repo::{PreparedAtomicWrite, Repository, move_path_if_absent};
+#[cfg(test)]
+use crate::repo::MUTATION_LOCK_FILE;
+use crate::repo::{
+    PathValidationCache, PreparedAtomicWrite, Repository,
+    filesystem_path_identity as repo_path_identity, filesystem_paths_overlap, move_path_if_absent,
+    mutation_lock_path, normalize_repository_config_paths,
+    validate_configured_paths_against_reserved_with_cache,
+    validate_repository_config_paths_with_cache,
+};
 use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, HgVcs, JjVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
@@ -447,22 +455,14 @@ pub struct SkippedCheck {
 /// Bootstraps Sacho configuration and repository integration.
 pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<InitResult> {
     let root = init_root(root.as_ref());
-    let lock = acquire_mutation_lock_at_root(&root)?;
-    let mut result = InitResult::default();
     let config_path = root.join(Repository::CONFIG_FILE);
-    let created_config = !config_path.exists();
-    let config = if created_config {
-        default_init_config(&root, &options)
-    } else {
-        let contents = fs::read_to_string(&config_path).map_err(|source| Error::ReadFile {
-            path: config_path.clone(),
-            source,
-        })?;
-        Config::parse(&contents).map_err(|source| Error::Config {
-            path: config_path.clone(),
-            source,
-        })?
-    };
+    let lock_path = mutation_lock_path(&root);
+    let (_, mut preflight_config) = load_init_config(&root, &config_path, &options)?;
+    validate_init_config_paths(&root, &mut preflight_config, &lock_path)?;
+    let lock = acquire_mutation_lock_at_path(lock_path)?;
+    let (created_config, mut config) = load_init_config(&root, &config_path, &options)?;
+    validate_init_config_paths(&root, &mut config, &lock.path)?;
+    let mut result = InitResult::default();
     let fragment_dir = root.join(&config.fragments.directory);
     let fragment_dir_exists = fragment_dir.exists();
     if fragment_dir_exists && !fragment_dir.is_dir() {
@@ -484,7 +484,6 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
         });
     }
     validate_init_changelog_path(&config_path, &changelog_path, &config.changelog.path)?;
-    validate_configured_mutation_paths_at_root(&root, &config, &lock)?;
     if created_config {
         fs::write(&config_path, render_init_config(&config)).map_err(|source| {
             Error::WriteFile {
@@ -553,6 +552,105 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     }
 
     Ok(result)
+}
+
+fn load_init_config(
+    root: &Path,
+    config_path: &Path,
+    options: &InitOptions,
+) -> Result<(bool, Config)> {
+    let created = !config_path.exists();
+    let config = if created {
+        let config = default_init_config(root, options);
+        config.validate().map_err(|source| Error::Config {
+            path: config_path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        config
+    } else {
+        let contents = fs::read_to_string(config_path).map_err(|source| Error::ReadFile {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+        Config::parse(&contents).map_err(|source| Error::Config {
+            path: config_path.to_path_buf(),
+            source: Box::new(source),
+        })?
+    };
+    Ok((created, config))
+}
+
+fn validate_init_config_paths(root: &Path, config: &mut Config, lock_path: &Path) -> Result<()> {
+    let fragment_dir = root.join(&config.fragments.directory);
+    if fragment_dir.exists() && !fragment_dir.is_dir() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a directory",
+                config.fragments.directory.display()
+            ),
+        });
+    }
+    let changelog_path = root.join(&config.changelog.path);
+    if changelog_path.exists() && !changelog_path.is_file() {
+        return Err(Error::InitConflict {
+            message: format!(
+                "{} exists but is not a file",
+                config.changelog.path.display()
+            ),
+        });
+    }
+    let mut validation_cache = PathValidationCache::default();
+    let configured =
+        validate_repository_config_paths_with_cache(root, config, &mut validation_cache).map_err(
+            |source| Error::Config {
+                path: root.join(Repository::CONFIG_FILE),
+                source: Box::new(source),
+            },
+        )?;
+    validate_configured_paths_against_reserved_with_cache(
+        &configured,
+        "repository mutation lock",
+        lock_path,
+        &mut validation_cache,
+    )
+    .map_err(|source| Error::Config {
+        path: root.join(Repository::CONFIG_FILE),
+        source: Box::new(source),
+    })?;
+    for (marker, key, path) in [
+        (
+            ".git",
+            "potential Git repository mutation lock",
+            root.join(".git/sacho.lock"),
+        ),
+        (
+            ".jj",
+            "potential Jujutsu repository mutation lock",
+            root.join(".jj/sacho.lock"),
+        ),
+        (
+            ".hg",
+            "potential Mercurial repository mutation lock",
+            root.join(".hg/sacho.lock"),
+        ),
+    ] {
+        let marker = root.join(marker);
+        if marker.exists() && !marker.is_dir() {
+            continue;
+        }
+        validate_configured_paths_against_reserved_with_cache(
+            &configured,
+            key,
+            &path,
+            &mut validation_cache,
+        )
+        .map_err(|source| Error::Config {
+            path: root.join(Repository::CONFIG_FILE),
+            source: Box::new(source),
+        })?;
+    }
+    normalize_repository_config_paths(root, config, &configured);
+    Ok(())
 }
 
 /// Creates a changelog fragment.
@@ -1952,8 +2050,6 @@ struct MutationLock {
     path: PathBuf,
 }
 
-const MUTATION_LOCK_FILE: &str = ".sacho.lock";
-
 impl Drop for MutationLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();
@@ -1961,13 +2057,19 @@ impl Drop for MutationLock {
 }
 
 fn acquire_mutation_lock(repo: &Repository) -> Result<MutationLock> {
-    let lock = acquire_mutation_lock_at_root(repo.root())?;
-    validate_configured_mutation_paths(repo, &lock)?;
+    let path = mutation_lock_path(repo.root());
+    validate_configured_mutation_paths_at_root(repo.root(), repo.config(), &path)?;
+    let lock = acquire_mutation_lock_at_path(path)?;
+    validate_configured_mutation_paths(repo, &lock.path)?;
     Ok(lock)
 }
 
+#[cfg(test)]
 fn acquire_mutation_lock_at_root(root: &Path) -> Result<MutationLock> {
-    let path = mutation_lock_path(root);
+    acquire_mutation_lock_at_path(mutation_lock_path(root))
+}
+
+fn acquire_mutation_lock_at_path(path: PathBuf) -> Result<MutationLock> {
     let file = match fs::File::open(&path) {
         Ok(file) => file,
         Err(source) if source.kind() == ErrorKind::NotFound => {
@@ -2013,53 +2115,33 @@ fn acquire_mutation_lock_at_root(root: &Path) -> Result<MutationLock> {
     Ok(MutationLock { file, path })
 }
 
-fn validate_configured_mutation_paths(repo: &Repository, lock: &MutationLock) -> Result<()> {
-    validate_configured_mutation_paths_at_root(repo.root(), repo.config(), lock)
+fn validate_configured_mutation_paths(repo: &Repository, lock_path: &Path) -> Result<()> {
+    validate_configured_mutation_paths_at_root(repo.root(), repo.config(), lock_path)
 }
 
 fn validate_configured_mutation_paths_at_root(
     root: &Path,
     config: &Config,
-    lock: &MutationLock,
+    lock_path: &Path,
 ) -> Result<()> {
-    validate_mutation_lock_path(root, lock, &config.changelog.path)?;
-    validate_mutation_lock_path(
-        root,
-        lock,
-        &config.fragments.directory.join(&config.fragments.next_file),
+    let mut validation_cache = PathValidationCache::default();
+    let configured =
+        validate_repository_config_paths_with_cache(root, config, &mut validation_cache).map_err(
+            |source| Error::Config {
+                path: root.join(Repository::CONFIG_FILE),
+                source: Box::new(source),
+            },
+        )?;
+    validate_configured_paths_against_reserved_with_cache(
+        &configured,
+        "repository mutation lock",
+        lock_path,
+        &mut validation_cache,
     )
-}
-
-fn validate_mutation_lock_path(root: &Path, lock: &MutationLock, path: &Path) -> Result<()> {
-    let lock_identity = filesystem_path_identity(&lock.path)?;
-    let path_identity = filesystem_path_identity(&root.join(path))?;
-    if release_paths_overlap(&lock_identity, &path_identity, true) {
-        return Err(Error::MutationLockPathOverlap {
-            path: path.to_path_buf(),
-            lock_path: lock.path.clone(),
-        });
-    }
-    Ok(())
-}
-
-fn mutation_lock_path(root: &Path) -> PathBuf {
-    if root.join(".jj").is_dir() {
-        return root.join(".jj/sacho.lock");
-    }
-    if root.join(".hg").is_dir() {
-        return root.join(".hg/sacho.lock");
-    }
-    git_output(root, ["rev-parse", "--git-path", "sacho.lock"])
-        .ok()
-        .and_then(|output| parse_git_root_output(&output))
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            }
-        })
-        .unwrap_or_else(|| root.join(MUTATION_LOCK_FILE))
+    .map_err(|source| Error::Config {
+        path: root.join(Repository::CONFIG_FILE),
+        source: Box::new(source),
+    })
 }
 
 fn parse_git_root_output(output: &str) -> Option<PathBuf> {
@@ -2181,21 +2263,7 @@ fn probe_directory_case_sensitivity(
 }
 
 fn release_paths_overlap(first: &Path, second: &Path, case_sensitive: bool) -> bool {
-    path_starts_with(first, second, case_sensitive)
-        || path_starts_with(second, first, case_sensitive)
-}
-
-fn path_starts_with(path: &Path, base: &Path, case_sensitive: bool) -> bool {
-    if case_sensitive {
-        return path.starts_with(base);
-    }
-    let mut path_components = path.components();
-    base.components().all(|base_component| {
-        path_components.next().is_some_and(|path_component| {
-            path_component.as_os_str().to_string_lossy().to_lowercase()
-                == base_component.as_os_str().to_string_lossy().to_lowercase()
-        })
-    })
+    filesystem_paths_overlap(first, second, case_sensitive)
 }
 
 fn release_path_identity(repo: &Repository, path: &Path) -> Result<PathBuf> {
@@ -2203,52 +2271,10 @@ fn release_path_identity(repo: &Repository, path: &Path) -> Result<PathBuf> {
 }
 
 fn filesystem_path_identity(path: &Path) -> Result<PathBuf> {
-    let unresolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|source| Error::ReadFile {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .join(path)
-    };
-    let mut resolved = PathBuf::new();
-    let mut missing = Vec::new();
-    for component in unresolved.components() {
-        match component {
-            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-            Component::RootDir => resolved.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if missing.pop().is_none() {
-                    let candidate = resolved.join("..");
-                    resolved = fs::canonicalize(&candidate).map_err(|source| Error::ReadFile {
-                        path: unresolved.clone(),
-                        source,
-                    })?;
-                }
-            }
-            Component::Normal(name) if missing.is_empty() => {
-                let candidate = resolved.join(name);
-                match fs::canonicalize(&candidate) {
-                    Ok(canonical) => resolved = canonical,
-                    Err(source) if source.kind() == ErrorKind::NotFound => {
-                        missing.push(name.to_os_string());
-                    }
-                    Err(source) => {
-                        return Err(Error::ReadFile {
-                            path: unresolved,
-                            source,
-                        });
-                    }
-                }
-            }
-            Component::Normal(name) => missing.push(name.to_os_string()),
-        }
-    }
-    resolved.extend(missing);
-    Ok(resolved)
+    repo_path_identity(path).map_err(|source| Error::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn probe_release_move_support(
@@ -4618,6 +4644,12 @@ mod tests {
         }
     }
 
+    fn init_test_git_repository(root: &Path) {
+        git(root, ["init"]).expect("git init");
+        git(root, ["config", "commit.gpgSign", "false"]).expect("disable test commit signing");
+        git(root, ["config", "tag.gpgSign", "false"]).expect("disable test tag signing");
+    }
+
     fn repo_with_config(config: &str) -> (TempDir, Repository) {
         let temp = TempDir::new().expect("tempdir");
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
@@ -4737,6 +4769,39 @@ mod tests {
         let hg_lock = acquire_mutation_lock_at_root(hg.path()).expect("hg lock");
         assert_eq!(hg_lock.path, hg.path().join(".hg/sacho.lock"));
         assert!(!hg.path().join(MUTATION_LOCK_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_uses_the_resolved_path_after_a_configured_symlink_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        fs::create_dir_all(temp.path().join("safe/changes.d")).expect("safe fragments");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nmaterialize = false\n[fragments]\ndirectory = \"linked\"\n",
+        )
+        .expect("config");
+        symlink("safe/changes.d", temp.path().join("linked")).expect("safe symlink");
+        let repo = Repository::from_root(temp.path()).expect("repository");
+
+        fs::remove_file(temp.path().join("linked")).expect("remove safe symlink");
+        symlink(outside.path(), temp.path().join("linked")).expect("external symlink");
+
+        add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("topic"),
+            },
+        )
+        .expect("resolved fragment path");
+
+        assert!(temp.path().join("safe/changes.d/topic.md").is_file());
+        assert!(!outside.path().join("topic.md").exists());
+        assert!(temp.path().join(MUTATION_LOCK_FILE).is_file());
     }
 
     #[test]
@@ -5033,19 +5098,20 @@ mod tests {
         )
         .expect_err("mutation lock changelog");
 
-        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
         assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
         assert!(!temp.path().join("fragments").exists());
-        assert_eq!(
-            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
-            ""
-        );
+        assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
     }
 
     #[test]
     fn init_rejects_the_git_mutation_lock_as_the_changelog_path() {
         let temp = TempDir::new().expect("tempdir");
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         let lock_path = PathBuf::from(".git/sacho.lock");
 
         let error = init_repository(
@@ -5061,12 +5127,115 @@ mod tests {
         )
         .expect_err("Git mutation lock changelog");
 
-        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
         assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
         assert!(!temp.path().join("fragments").exists());
-        assert_eq!(
-            fs::read_to_string(temp.path().join(lock_path)).expect("mutation lock"),
-            ""
+        assert!(!temp.path().join(lock_path).exists());
+    }
+
+    #[test]
+    fn init_rejects_fragment_directories_that_would_contain_a_future_vcs_lock() {
+        for marker in [".git", ".jj", ".hg"] {
+            let temp = TempDir::new().expect("tempdir");
+
+            let error = init_repository(
+                temp.path(),
+                InitOptions {
+                    changelog_path: None,
+                    fragment_directory: Some(PathBuf::from(marker)),
+                    materialize: None,
+                    install_hook: false,
+                    append_existing_hook: false,
+                    repository_url: None,
+                },
+            )
+            .expect_err("future VCS lock parent");
+
+            assert!(matches!(
+                error,
+                Error::Config { source, .. }
+                    if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+            ));
+            assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
+            assert!(!temp.path().join(marker).exists());
+            assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn init_rejects_inactive_git_lock_parent_in_a_colocated_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        init_test_git_repository(temp.path());
+        fs::create_dir(temp.path().join(".jj")).expect("Jujutsu metadata directory");
+
+        let error = init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: Some(PathBuf::from(".git")),
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect_err("inactive Git lock parent");
+
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
+        assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
+        assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
+        assert!(!temp.path().join(".jj/sacho.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_uses_resolved_paths_for_git_merge_attributes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        init_test_git_repository(temp.path());
+        fs::create_dir(temp.path().join("docs")).expect("docs directory");
+        fs::write(
+            temp.path().join("docs/CHANGES.md"),
+            "Changelog\n=========\n",
+        )
+        .expect("changelog");
+        symlink("docs/CHANGES.md", temp.path().join("alias.md")).expect("changelog alias");
+        fs::write(
+            temp.path().join(Repository::CONFIG_FILE),
+            "[changelog]\npath = \"alias.md\"\n",
+        )
+        .expect("config");
+
+        init_repository(
+            temp.path(),
+            InitOptions {
+                changelog_path: None,
+                fragment_directory: None,
+                materialize: None,
+                install_hook: false,
+                append_existing_hook: false,
+                repository_url: None,
+            },
+        )
+        .expect("init");
+
+        let attributes =
+            fs::read_to_string(temp.path().join(".gitattributes")).expect("Git attributes");
+        assert!(attributes.contains("docs/CHANGES.md merge=sacho"));
+        assert!(!attributes.contains("alias.md merge=sacho"));
+        assert!(
+            fs::read_to_string(temp.path().join(Repository::CONFIG_FILE))
+                .expect("config")
+                .contains("path = \"alias.md\"")
         );
     }
 
@@ -5087,7 +5256,11 @@ mod tests {
         )
         .expect_err("configuration changelog alias");
 
-        assert!(matches!(error, Error::InitConflict { .. }));
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
         assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
         assert!(!temp.path().join("fragments").exists());
     }
@@ -5114,10 +5287,12 @@ mod tests {
         )
         .expect_err("configuration changelog alias");
 
-        assert!(matches!(error, Error::InitConflict { .. }));
-        let config = fs::read_to_string(temp.path().join(Repository::CONFIG_FILE))
-            .expect("configuration remains readable");
-        Config::parse(&config).expect("configuration remains valid");
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathResolution { .. })
+        ));
+        assert!(!temp.path().join(Repository::CONFIG_FILE).exists());
         assert_eq!(
             fs::read_link(temp.path().join(alias)).expect("changelog alias"),
             PathBuf::from(Repository::CONFIG_FILE)
@@ -5426,7 +5601,7 @@ mod tests {
     #[test]
     fn reference_transaction_matches_the_armed_commit() {
         let temp = TempDir::new().expect("tempdir");
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         git(temp.path(), ["config", "user.email", "test@example.com"]).expect("configure email");
         git(temp.path(), ["config", "user.name", "Test User"]).expect("configure name");
         fs::write(temp.path().join("README.md"), "initial\n").expect("readme");
@@ -5484,7 +5659,7 @@ mod tests {
             materialize = false
             "#,
         );
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
         commit_message_hook(&repo, Path::new("COMMIT_EDITMSG")).expect("arm hook");
         let state_path = commit_hook_state_path(repo.root()).expect("state path");
@@ -5504,7 +5679,7 @@ mod tests {
             materialize = false
             "#,
         );
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         let state_path = commit_hook_state_path(repo.root()).expect("state path");
         fs::create_dir(&state_path).expect("state directory");
 
@@ -5530,7 +5705,7 @@ mod tests {
     #[test]
     fn hook_install_updates_existing_marker_block() {
         let temp = TempDir::new().expect("tempdir");
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         fs::write(
             temp.path().join(".git/hooks/pre-commit"),
             "#!/bin/sh\n# sacho pre-commit begin\nold\n# sacho pre-commit end\n",
@@ -7545,38 +7720,24 @@ mod tests {
 
     #[test]
     fn release_rejects_overlapping_changelog_and_next_paths() {
-        let (temp, repo) = repo_with_config(
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
             r#"
             [changelog]
             path = "changes.d/next"
             materialize = false
             "#,
-        );
-        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
-        fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
-        fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
-
-        let error = plan_release(
-            &repo,
-            ReleaseOptions {
-                version: None,
-                date: release_date(),
-                next: Some(String::from("1.3.0")),
-            },
         )
-        .expect_err("overlapping paths");
+        .expect("config");
+
+        let error = Repository::from_root(temp.path()).expect_err("overlapping paths");
 
         assert!(matches!(
             error,
-            Error::ReleasePathOverlap { first, second }
-                if first == Path::new("changes.d/next")
-                    && second == Path::new("changes.d/next")
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
         ));
-        assert_eq!(
-            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
-            "1.2.0\n"
-        );
-        assert!(temp.path().join("changes.d/add.md").exists());
     }
 
     #[test]
@@ -7584,14 +7745,12 @@ mod tests {
         let (temp, repo) = repo_with_config(
             r#"
             [changelog]
-            path = "changes.d/next/CHANGES.md"
             materialize = false
             "#,
         );
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(temp.path().join("changes.d/add.md"), " -  Added release.\n").expect("fragment");
-
-        let error = plan_release(
+        let mut plan = plan_release(
             &repo,
             ReleaseOptions {
                 version: Some(String::from("1.2.0")),
@@ -7599,15 +7758,19 @@ mod tests {
                 next: Some(String::from("1.3.0")),
             },
         )
-        .expect_err("ancestor overlap");
+        .expect("plan");
+        plan.changelog.path = PathBuf::from("meta/ancestor/CHANGES.md");
+        plan.next_file.path = PathBuf::from("meta/ancestor");
+
+        let error = apply_release(&repo, plan).expect_err("ancestor overlap");
 
         assert!(matches!(
             error,
             Error::ReleasePathOverlap { first, second }
-                if first == Path::new("changes.d/next/CHANGES.md")
-                    && second == Path::new("changes.d/next")
+                if first == Path::new("meta/ancestor/CHANGES.md")
+                    && second == Path::new("meta/ancestor")
         ));
-        assert!(!temp.path().join("changes.d/next").exists());
+        assert!(!temp.path().join("meta/ancestor").exists());
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/add.md")).expect("fragment"),
             " -  Added release.\n"
@@ -7656,13 +7819,17 @@ mod tests {
             materialize = false
 
             [fragments]
-            directory = "meta"
+            directory = "meta/fragments"
             next-file = "out.tmp"
             "#,
         );
-        fs::create_dir_all(temp.path().join("meta")).expect("fragments dir");
-        fs::write(temp.path().join("meta/out.tmp"), "1.2.0\n").expect("next");
-        fs::write(temp.path().join("meta/add.md"), " -  Added release.\n").expect("fragment");
+        fs::create_dir_all(temp.path().join("meta/fragments")).expect("fragments dir");
+        fs::write(temp.path().join("meta/fragments/out.tmp"), "1.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("meta/fragments/add.md"),
+            " -  Added release.\n",
+        )
+        .expect("fragment");
 
         let plan = plan_release(
             &repo,
@@ -7681,10 +7848,10 @@ mod tests {
                 .contains("Added release.")
         );
         assert_eq!(
-            fs::read_to_string(temp.path().join("meta/out.tmp")).expect("next"),
+            fs::read_to_string(temp.path().join("meta/fragments/out.tmp")).expect("next"),
             "1.3.0\n"
         );
-        assert!(!temp.path().join("meta/add.md").exists());
+        assert!(!temp.path().join("meta/fragments/add.md").exists());
     }
 
     #[cfg(unix)]
@@ -7844,18 +8011,17 @@ mod tests {
             .to_path_buf();
         assert!(root.is_relative());
         let path = root.join(MUTATION_LOCK_FILE);
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .expect("mutation lock");
-        let lock = MutationLock { file, path };
+        let mut config = Config::parse("").expect("config");
+        config.changelog.path = PathBuf::from(MUTATION_LOCK_FILE);
 
-        let error = validate_mutation_lock_path(&root, &lock, Path::new(MUTATION_LOCK_FILE))
+        let error = validate_configured_mutation_paths_at_root(&root, &config, &path)
             .expect_err("relative mutation lock alias");
 
-        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
     }
 
     #[test]
@@ -8339,7 +8505,11 @@ mod tests {
         )
         .expect_err("symlink conflict");
 
-        assert!(matches!(error, Error::ReleasePathConflict { .. }));
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOutsideBoundary { .. })
+        ));
         assert!(!temp.path().join("CHANGES.md").exists());
         assert!(temp.path().join("changes.d/add.md").exists());
     }
@@ -8998,63 +9168,55 @@ mod tests {
 
     #[test]
     fn next_rejects_the_repository_mutation_lock_as_its_destination() {
-        let (temp, repo) = repo_with_config(
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join(Repository::CONFIG_FILE),
             r#"
             [changelog]
             materialize = false
 
             [fragments]
-            next-file = "../.sacho.lock"
+            directory = ".sacho.lock"
             "#,
-        );
-
-        let error = set_next_version(
-            &repo,
-            NextOptions {
-                version: String::from("1.2.0"),
-            },
         )
-        .expect_err("mutation lock destination");
+        .expect("config");
 
-        assert!(matches!(error, Error::MutationLockPathOverlap { .. }));
-        assert_eq!(
-            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
-            ""
-        );
+        let error = Repository::from_root(temp.path()).expect_err("mutation lock destination");
+
+        assert!(matches!(
+            error,
+            Error::Config { source, .. }
+                if matches!(source.as_ref(), crate::ConfigError::ConfigPathOverlap { .. })
+        ));
+        assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
     }
 
     #[test]
     fn sync_rejects_the_repository_mutation_lock_as_its_destination() {
-        let (temp, repo) = repo_with_config(
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join(Repository::CONFIG_FILE),
             r#"
             [changelog]
             path = ".sacho.lock"
             materialize = true
             "#,
-        );
+        )
+        .expect("config");
         let path = PathBuf::from(MUTATION_LOCK_FILE);
 
-        let error = apply_sync(
-            &repo,
-            SyncPlan::Apply(PendingWrite {
-                path: path.clone(),
-                old_contents: String::new(),
-                new_contents: String::from("replacement\n"),
-            }),
-        )
-        .expect_err("mutation lock destination");
+        let error = Repository::from_root(temp.path()).expect_err("mutation lock destination");
 
         assert!(matches!(
             error,
-            Error::MutationLockPathOverlap {
-                path: error_path,
-                ..
-            } if error_path == path
+            Error::Config { source, .. }
+                if matches!(
+                    source.as_ref(),
+                    crate::ConfigError::ConfigPathOverlap { first_path, .. }
+                        if first_path == &path
+                )
         ));
-        assert_eq!(
-            fs::read_to_string(temp.path().join(MUTATION_LOCK_FILE)).expect("mutation lock"),
-            ""
-        );
+        assert!(!temp.path().join(MUTATION_LOCK_FILE).exists());
     }
 
     #[test]
@@ -9232,7 +9394,7 @@ mod tests {
             Error::Fragment {
                 path,
                 source: crate::FragmentError::Frontmatter { .. },
-            } if path == PathBuf::from("changes.d/bad-priority.md")
+            } if path == Path::new("changes.d/bad-priority.md")
         ));
     }
 
@@ -9486,7 +9648,7 @@ priority: 0
             paths = ["src/**"]
             "#,
         );
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
         git(
             temp.path(),
@@ -9552,7 +9714,7 @@ priority: 0
             paths = ["packages/logtape/**"]
             "#,
         );
-        git(temp.path(), ["init"]).expect("git init");
+        init_test_git_repository(temp.path());
         git(temp.path(), ["add", "sacho.toml"]).expect("stage config");
         git(
             temp.path(),
