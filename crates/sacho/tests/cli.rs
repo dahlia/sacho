@@ -806,7 +806,7 @@ fn sync_in_terminal_keeps_changelog_after_default_no_confirmation() {
 }
 
 #[test]
-fn check_fix_non_terminal_formats_fragments_but_refuses_risky_sync() {
+fn check_fix_non_terminal_refuses_risky_sync_without_formatting() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
     std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
@@ -820,15 +820,153 @@ fn check_fix_non_terminal_formats_fragments_but_refuses_risky_sync() {
         .args(["check", "--fix"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("--force"));
+        .stderr(predicate::str::contains("sacho sync --force"))
+        .stderr(predicate::str::contains("sacho check --fix"));
 
     assert_eq!(
         std::fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
-        " -  Fixed issue.\n"
+        "- Fixed issue.\n"
     );
     assert_eq!(
         std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
         original
+    );
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["sync", "--force"])
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["check", "--fix"])
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+}
+
+#[test]
+fn fmt_non_terminal_refuses_risky_sync_without_formatting() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+    let changelog = "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n";
+    std::fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .arg("fmt")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("sacho sync --force"))
+        .stderr(predicate::str::contains("sacho fmt"));
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+        "- Fixed issue.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        changelog
+    );
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["sync", "--force"])
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .arg("fmt")
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+}
+
+#[test]
+fn fmt_non_terminal_applies_formatting_when_materialized_output_is_current() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\n -  Fixed issue.\n",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .arg("fmt")
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+        " -  Fixed issue.\n"
+    );
+}
+
+#[test]
+fn fmt_in_terminal_applies_formatting_and_sync_after_confirmation() {
+    let temp = sync_confirmation_repository();
+    std::fs::write(temp.path().join("changes.d/sync.md"), "- Fixed sync.\n").expect("fragment");
+
+    let (success, output) = run_in_terminal(temp.path(), &["fmt"], "yes\n");
+
+    assert!(success, "{output}");
+    assert!(output.contains("may discard hand edits"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/sync.md")).expect("fragment"),
+        " -  Fixed sync.\n"
+    );
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains(" -  Fixed sync.\n"));
+    assert!(!changelog.contains("Hand-edited note."));
+}
+
+#[test]
+fn fmt_in_terminal_default_no_keeps_fragments_and_changelog() {
+    let temp = sync_confirmation_repository();
+    std::fs::write(temp.path().join("changes.d/sync.md"), "- Fixed sync.\n").expect("fragment");
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["fmt"], "\n");
+
+    assert!(!success, "{output}");
+    assert!(output.contains("cancelled"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/sync.md")).expect("fragment"),
+        "- Fixed sync.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        changelog
     );
 }
 

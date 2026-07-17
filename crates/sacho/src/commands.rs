@@ -16,7 +16,7 @@ use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
 use crate::changelog::{BEGIN_MARKER, ChangelogError, END_MARKER, replace_unreleased_region};
-use crate::compile::{VersionLabel, compile_parsed_fragments};
+use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
 use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
 use crate::error::{Error, Result};
 use crate::fragment::{
@@ -130,6 +130,43 @@ pub struct FormatOptions;
 pub struct FormatResult {
     /// Fragment paths whose contents changed.
     pub changed: Vec<PathBuf>,
+}
+
+/// Planned fragment formatting and materialized changelog synchronization.
+///
+/// Planning is read-only.  Callers may inspect [`Self::sync`] to obtain any
+/// required user confirmation before passing the plan to [`apply_format`].
+/// The former `prepare_check_fix` compatibility wrapper is intentionally not
+/// available because its old mutation-before-confirmation contract cannot be
+/// preserved safely; use [`plan_format`] and [`apply_format`] together:
+///
+/// ```compile_fail
+/// use sacho::commands::prepare_check_fix;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatPlan {
+    /// Fragment paths that will be rewritten when the plan is applied.
+    pub formatting: FormatResult,
+
+    /// Materialized changelog synchronization required after formatting.
+    pub sync: SyncPlan,
+
+    fragments: Vec<FormatFragmentSnapshot>,
+    next_file: Option<FormatFileSnapshot>,
+    changelog: Option<FormatFileSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormatFragmentSnapshot {
+    path: PathBuf,
+    before: String,
+    after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormatFileSnapshot {
+    path: PathBuf,
+    contents: Option<String>,
 }
 
 /// Options for planning a changelog synchronization.
@@ -388,16 +425,6 @@ pub struct CheckReport {
 
     /// Checks skipped because they do not apply to this repository.
     pub skipped: Vec<SkippedCheck>,
-}
-
-/// Mechanically applied Layer 1 fixes and the pending Layer 2 synchronization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedCheckFix {
-    /// Fragment formatting changes applied while preparing the fix.
-    pub formatting: FormatResult,
-
-    /// Synchronization plan to be confirmed or applied by the caller.
-    pub sync: SyncPlan,
 }
 
 impl CheckReport {
@@ -739,17 +766,26 @@ pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextR
 }
 
 /// Formats all changelog fragments into normal form.
-pub fn format_fragments(repo: &Repository, _options: FormatOptions) -> Result<FormatResult> {
-    let _lock = acquire_mutation_lock(repo)?;
-    ensure_materialized_current_before_mutation(repo)?;
-    let result = format_fragments_only(repo)?;
-    let _sync = sync_after_mutation(repo)?;
-    Ok(result)
+pub fn format_fragments(repo: &Repository, options: FormatOptions) -> Result<FormatResult> {
+    let plan = plan_format(repo, options)?;
+    if matches!(plan.sync, SyncPlan::NeedsConfirmation { .. }) {
+        return Err(Error::SyncNeedsConfirmation {
+            path: repo.config().changelog.path.clone(),
+        });
+    }
+    apply_format(repo, plan)
 }
 
-fn format_fragments_only(repo: &Repository) -> Result<FormatResult> {
+/// Plans fragment formatting and materialized changelog synchronization.
+///
+/// This function does not mutate the repository.  When [`FormatPlan::sync`]
+/// requires confirmation, callers must obtain it before calling
+/// [`apply_format`].
+pub fn plan_format(repo: &Repository, _options: FormatOptions) -> Result<FormatPlan> {
     let discovered = discover_fragment_candidates(repo)?;
     let mut changed = Vec::new();
+    let mut snapshots = Vec::with_capacity(discovered.candidates.len());
+    let mut parsed = Vec::with_capacity(discovered.candidates.len());
 
     for candidate in discovered.candidates {
         let source = fs::read_to_string(&candidate.path).map_err(|source| Error::ReadFile {
@@ -758,7 +794,7 @@ fn format_fragments_only(repo: &Repository) -> Result<FormatResult> {
         })?;
         let formatted = format_fragment_source(&source)
             .map_err(|error| with_fragment_path(error, candidate.relative_path.clone()))?;
-        parse_fragment(
+        let fragment = parse_fragment(
             candidate.relative_path.clone(),
             &formatted,
             candidate.section,
@@ -769,12 +805,449 @@ fn format_fragments_only(repo: &Repository) -> Result<FormatResult> {
             source,
         })?;
         if source != formatted {
-            repo.atomic_write(&candidate.relative_path, formatted.as_bytes())?;
-            changed.push(candidate.relative_path);
+            changed.push(candidate.relative_path.clone());
         }
+        snapshots.push(FormatFragmentSnapshot {
+            path: candidate.relative_path,
+            before: source,
+            after: formatted,
+        });
+        parsed.push(fragment);
     }
 
-    Ok(FormatResult { changed })
+    let formatting = FormatResult { changed };
+    if !repo.config().changelog.materialize {
+        return Ok(FormatPlan {
+            formatting,
+            sync: SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled),
+            fragments: snapshots,
+            next_file: None,
+            changelog: None,
+        });
+    }
+
+    let next_path = next_version_path(repo);
+    let next_file = read_format_file_snapshot(repo, &next_path)?;
+    let version_label =
+        version_label_from_contents(&repo.resolve(&next_path), next_file.contents.as_deref())?;
+    let compiled =
+        compile_parsed_fragments(repo, CompileOptions::default(), version_label, parsed)?;
+    let changelog_path = repo.config().changelog.path.clone();
+    let changelog = read_format_file_snapshot(repo, &changelog_path)?;
+    let old_contents = changelog.contents.clone().ok_or_else(|| Error::ReadFile {
+        path: repo.resolve(&changelog_path),
+        source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+    })?;
+    let sync = plan_sync_from_contents(
+        repo,
+        &compiled.markdown,
+        old_contents,
+        SyncOptions { force: false },
+    )?;
+
+    Ok(FormatPlan {
+        formatting,
+        sync,
+        fragments: snapshots,
+        next_file: Some(next_file),
+        changelog: Some(changelog),
+    })
+}
+
+/// Applies a previously planned fragment formatting operation.
+///
+/// The complete fragment set, next-version file, and materialized changelog are
+/// revalidated under the repository mutation lock before the first write.  All
+/// replacements use atomic conditional claims, and an apply failure rolls back
+/// replacements that were already installed.
+pub fn apply_format(repo: &Repository, plan: FormatPlan) -> Result<FormatResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    validate_format_plan(repo, &plan)?;
+    let changes = format_file_changes(&plan);
+    let participant_identities = changes
+        .iter()
+        .map(|change| release_path_identity(repo, &change.path))
+        .collect::<Result<Vec<_>>>()?;
+    let paths = changes
+        .iter()
+        .map(|change| change.path.as_path())
+        .collect::<Vec<_>>();
+    probe_transaction_move_support(repo, &paths, &participant_identities)
+        .map_err(format_transaction_error)?;
+    let prepared = changes
+        .iter()
+        .map(|change| prepare_format_change(repo, change))
+        .collect::<Result<Vec<_>>>()?;
+    let mut applied = Vec::with_capacity(changes.len());
+    for (change, prepared) in changes.iter().zip(prepared) {
+        let outcome = match apply_format_change(repo, change, prepared) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(rollback_format(repo, error, applied)),
+        };
+        applied.push(AppliedReleaseChange {
+            path: change.path.clone(),
+            before: change.before.clone(),
+            after: change.after.clone(),
+            original: outcome.original,
+            created_directories: outcome.created_directories,
+        });
+    }
+    if let Err(failure) = commit_format_claims(repo, &mut applied, &plan) {
+        return Err(match failure {
+            FormatClaimCommitFailure::BeforeCommit(error) => rollback_format(repo, error, applied),
+            FormatClaimCommitFailure::AfterCommit(failures) => Error::FormatCleanup { failures },
+        });
+    }
+    Ok(plan.formatting)
+}
+
+fn format_file_changes(plan: &FormatPlan) -> Vec<ReleaseFileChange> {
+    let mut changes = plan
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.before != fragment.after)
+        .map(|fragment| ReleaseFileChange {
+            path: fragment.path.clone(),
+            before: ReleaseFileState::Present(fragment.before.clone()),
+            after: ReleaseFileState::Present(fragment.after.clone()),
+        })
+        .collect::<Vec<_>>();
+    if let Some(pending) = format_sync_pending(&plan.sync)
+        && pending.old_contents != pending.new_contents
+    {
+        changes.push(ReleaseFileChange {
+            path: pending.path.clone(),
+            before: ReleaseFileState::Present(pending.old_contents.clone()),
+            after: ReleaseFileState::Present(pending.new_contents.clone()),
+        });
+    }
+    changes
+}
+
+fn format_sync_pending(sync: &SyncPlan) -> Option<&PendingWrite> {
+    match sync {
+        SyncPlan::Apply(pending) | SyncPlan::NeedsConfirmation { pending, .. } => Some(pending),
+        SyncPlan::Skipped(_) => None,
+    }
+}
+
+fn prepare_format_change(
+    repo: &Repository,
+    change: &ReleaseFileChange,
+) -> Result<PreparedAtomicWrite> {
+    let ReleaseFileState::Present(contents) = &change.after else {
+        unreachable!("format transactions only replace files")
+    };
+    repo.prepare_atomic_write(&change.path, contents.as_bytes())
+}
+
+fn apply_format_change(
+    repo: &Repository,
+    change: &ReleaseFileChange,
+    prepared: PreparedAtomicWrite,
+) -> Result<AppliedReleaseOutcome> {
+    let ReleaseFileState::Present(expected) = &change.before else {
+        unreachable!("format transactions only replace existing files")
+    };
+    #[cfg(test)]
+    inject_format_apply_interference(
+        FormatApplyInterferenceStage::BeforeClaim,
+        repo,
+        &change.path,
+    );
+    let claimed =
+        claim_release_file(repo, &change.path, expected, &[]).map_err(format_transaction_error)?;
+    #[cfg(test)]
+    inject_format_apply_interference(FormatApplyInterferenceStage::AfterClaim, repo, &change.path);
+    match prepared.commit_if_absent() {
+        Ok(()) => Ok(AppliedReleaseOutcome {
+            original: Some(claimed),
+            created_directories: Vec::new(),
+        }),
+        Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => {
+            claimed
+                .discard(repo, &change.path)
+                .map_err(claim_discard_error)
+                .map_err(format_transaction_error)?;
+            Err(Error::StaleFormatPlan {
+                path: change.path.clone(),
+            })
+        }
+        Err(source) => {
+            let error = Error::WriteFile {
+                path: repo.resolve(&change.path),
+                source,
+            };
+            Err(format_transaction_error(restore_claim_after_error(
+                claimed,
+                &change.path,
+                error,
+            )))
+        }
+    }
+}
+
+enum FormatClaimCommitFailure {
+    BeforeCommit(Error),
+    AfterCommit(Vec<String>),
+}
+
+fn commit_format_claims(
+    repo: &Repository,
+    applied: &mut [AppliedReleaseChange],
+    plan: &FormatPlan,
+) -> std::result::Result<(), FormatClaimCommitFailure> {
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .preflight_discard(repo, &change.path)
+                .map_err(format_transaction_error)
+                .map_err(FormatClaimCommitFailure::BeforeCommit)?;
+        }
+    }
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .validate_retained_state(&change.path, &change.before)
+                .map_err(format_transaction_error)
+                .map_err(FormatClaimCommitFailure::BeforeCommit)?;
+        }
+        validate_release_state(repo, &change.path, &change.after)
+            .map_err(format_transaction_error)
+            .map_err(FormatClaimCommitFailure::BeforeCommit)?;
+    }
+    validate_format_committed_state(repo, plan).map_err(FormatClaimCommitFailure::BeforeCommit)?;
+
+    let mut failures = Vec::new();
+    for change in applied.iter_mut() {
+        let Some(original) = change.original.take() else {
+            continue;
+        };
+        if let Err(failure) = original.discard_after_commit(repo, &change.path) {
+            failures.push(format!(
+                "{}: {}",
+                change.path.display(),
+                format_transaction_error(claim_discard_error(failure))
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(FormatClaimCommitFailure::AfterCommit(failures))
+    }
+}
+
+fn rollback_format(repo: &Repository, error: Error, applied: Vec<AppliedReleaseChange>) -> Error {
+    let error = format_transaction_error(error);
+    let rollback_failures = applied
+        .into_iter()
+        .rev()
+        .filter_map(|change| {
+            rollback_applied_release_change(repo, change)
+                .err()
+                .map(format_transaction_error)
+                .map(|error| error.to_string())
+        })
+        .collect::<Vec<_>>();
+    if rollback_failures.is_empty() {
+        error
+    } else {
+        Error::FormatApply {
+            cause: error.to_string(),
+            rollback_failures,
+        }
+    }
+}
+
+fn format_transaction_error(error: Error) -> Error {
+    match error {
+        Error::StaleReleasePlan { path } | Error::ReleasePathConflict { path } => {
+            Error::StaleFormatPlan { path }
+        }
+        Error::ReleaseRollbackConflict { path } => Error::FormatRollbackConflict { path },
+        Error::ReleaseApply {
+            cause,
+            rollback_failures,
+        } => Error::FormatApply {
+            cause,
+            rollback_failures,
+        },
+        Error::ReleaseCleanup { failures } => Error::FormatCleanup { failures },
+        Error::ReleaseTransactionUnsupported => Error::FormatTransactionUnsupported,
+        error => error,
+    }
+}
+
+fn read_format_file_snapshot(repo: &Repository, path: &Path) -> Result<FormatFileSnapshot> {
+    let absolute = repo.resolve(path);
+    let contents = match fs::read_to_string(&absolute) {
+        Ok(contents) => Some(contents),
+        Err(source) if source.kind() == ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(Error::ReadFile {
+                path: absolute,
+                source,
+            });
+        }
+    };
+    Ok(FormatFileSnapshot {
+        path: path.to_path_buf(),
+        contents,
+    })
+}
+
+fn validate_format_plan(repo: &Repository, plan: &FormatPlan) -> Result<()> {
+    validate_format_fragment_paths(repo, plan)?;
+    for fragment in &plan.fragments {
+        validate_format_file_contents(repo, &fragment.path, Some(&fragment.before))?;
+    }
+    validate_format_plan_inputs(repo, plan)
+}
+
+fn validate_format_committed_state(repo: &Repository, plan: &FormatPlan) -> Result<()> {
+    validate_format_fragment_paths(repo, plan)?;
+    for fragment in &plan.fragments {
+        validate_format_file_contents(repo, &fragment.path, Some(&fragment.after))?;
+    }
+    if let Some(next_file) = &plan.next_file {
+        validate_format_file_contents(repo, &next_file.path, next_file.contents.as_deref())?;
+    }
+    if let Some(changelog) = &plan.changelog {
+        let expected = format_sync_pending(&plan.sync)
+            .map(|pending| pending.new_contents.as_str())
+            .or(changelog.contents.as_deref());
+        validate_format_file_contents(repo, &changelog.path, expected)?;
+    }
+    Ok(())
+}
+
+fn validate_format_fragment_paths(repo: &Repository, plan: &FormatPlan) -> Result<()> {
+    let expected_paths = plan
+        .fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    let current_paths = discover_fragment_candidates(repo)?
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.relative_path)
+        .collect::<Vec<_>>();
+    if let Some(path) = differing_fragment_path(&expected_paths, &current_paths) {
+        return Err(Error::StaleFormatPlan { path });
+    }
+    Ok(())
+}
+
+fn validate_format_plan_inputs(repo: &Repository, plan: &FormatPlan) -> Result<()> {
+    if let Some(next_file) = &plan.next_file {
+        validate_format_file_contents(repo, &next_file.path, next_file.contents.as_deref())?;
+    }
+    if let Some(changelog) = &plan.changelog {
+        validate_format_file_contents(repo, &changelog.path, changelog.contents.as_deref())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORMAT_APPLY_INTERFERENCES: std::cell::RefCell<Vec<(FormatApplyInterferenceStage, PathBuf, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatApplyInterferenceStage {
+    BeforeClaim,
+    AfterClaim,
+}
+
+#[cfg(test)]
+fn set_format_apply_interference(path: impl Into<PathBuf>, contents: impl Into<String>) {
+    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
+        interferences.borrow_mut().push((
+            FormatApplyInterferenceStage::BeforeClaim,
+            path.into(),
+            contents.into(),
+        ));
+    });
+}
+
+#[cfg(test)]
+fn set_format_apply_interference_after_claim(
+    path: impl Into<PathBuf>,
+    contents: impl Into<String>,
+) {
+    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
+        interferences.borrow_mut().push((
+            FormatApplyInterferenceStage::AfterClaim,
+            path.into(),
+            contents.into(),
+        ));
+    });
+}
+
+#[cfg(test)]
+fn inject_format_apply_interference(
+    stage: FormatApplyInterferenceStage,
+    repo: &Repository,
+    path: &Path,
+) {
+    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
+        let mut interferences = interferences.borrow_mut();
+        if let Some(index) = interferences
+            .iter()
+            .position(|(expected_stage, expected, _)| *expected_stage == stage && expected == path)
+        {
+            let (_, _, contents) = interferences.remove(index);
+            fs::write(repo.resolve(path), contents).expect("inject concurrent format edit");
+        }
+    });
+}
+
+#[cfg(test)]
+fn clear_format_apply_interference() {
+    FORMAT_APPLY_INTERFERENCES.with(|interferences| interferences.borrow_mut().clear());
+}
+
+fn validate_format_file_contents(
+    repo: &Repository,
+    path: &Path,
+    expected: Option<&str>,
+) -> Result<()> {
+    let absolute = repo.resolve(path);
+    match expected {
+        Some(expected) => match fs::read(&absolute) {
+            Ok(contents) if contents == expected.as_bytes() => Ok(()),
+            Ok(_) => Err(Error::StaleFormatPlan {
+                path: path.to_path_buf(),
+            }),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    ErrorKind::NotFound | ErrorKind::IsADirectory | ErrorKind::InvalidData
+                ) =>
+            {
+                Err(Error::StaleFormatPlan {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(source) => Err(Error::ReadFile {
+                path: absolute,
+                source,
+            }),
+        },
+        None => match fs::symlink_metadata(&absolute) {
+            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(Error::StaleFormatPlan {
+                path: path.to_path_buf(),
+            }),
+            Err(source) => Err(Error::ReadFile {
+                path: absolute,
+                source,
+            }),
+        },
+    }
 }
 
 /// Compiles the current fragments into an unreleased changelog region.
@@ -800,9 +1273,20 @@ fn plan_sync_unlocked(repo: &Repository, options: SyncOptions) -> Result<SyncPla
         path: absolute_path,
         source,
     })?;
+    plan_sync_from_contents(repo, &compiled.markdown, old_contents, options)
+}
+
+fn plan_sync_from_contents(
+    repo: &Repository,
+    compiled_markdown: &str,
+    old_contents: String,
+    options: SyncOptions,
+) -> Result<SyncPlan> {
+    let config = repo.config();
+    let changelog_path = config.changelog.path.clone();
     let replacement = replace_unreleased_region(
         &old_contents,
-        &compiled.markdown,
+        compiled_markdown,
         config.changelog.region_detection,
         &config.changelog.unreleased_heading,
     )
@@ -861,17 +1345,6 @@ fn apply_sync_unlocked(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> 
 
     repo.atomic_write(&pending.path, pending.new_contents.as_bytes())?;
     Ok(SyncResult { changed: true })
-}
-
-/// Applies Layer 1 formatting fixes and prepares, but does not apply, Layer 2 sync.
-///
-/// Callers are responsible for confirming [`SyncPlan::NeedsConfirmation`] before
-/// passing the returned plan to [`apply_sync`].
-pub fn prepare_check_fix(repo: &Repository) -> Result<PreparedCheckFix> {
-    let _lock = acquire_mutation_lock(repo)?;
-    let formatting = format_fragments_only(repo)?;
-    let sync = plan_sync_unlocked(repo, SyncOptions { force: false })?;
-    Ok(PreparedCheckFix { formatting, sync })
 }
 
 /// Plans a release operation.
@@ -1171,17 +1644,13 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
         });
     }
     if options.fix {
-        let prepared = prepare_check_fix(repo)?;
-        match prepared.sync {
-            SyncPlan::NeedsConfirmation { .. } => {
-                return Err(Error::SyncNeedsConfirmation {
-                    path: repo.config().changelog.path.clone(),
-                });
-            }
-            plan => {
-                apply_sync(repo, plan)?;
-            }
+        let prepared = plan_format(repo, FormatOptions)?;
+        if matches!(&prepared.sync, SyncPlan::NeedsConfirmation { .. }) {
+            return Err(Error::SyncNeedsConfirmation {
+                path: repo.config().changelog.path.clone(),
+            });
         }
+        apply_format(repo, prepared)?;
         return check(
             repo,
             CheckOptions {
@@ -2282,15 +2751,25 @@ fn probe_release_move_support(
     plan: &ReleasePlan,
     participant_identities: &[PathBuf],
 ) -> Result<()> {
-    let paths = std::iter::once(&plan.changelog.path)
-        .chain(std::iter::once(&plan.next_file.path))
+    let paths = std::iter::once(plan.changelog.path.as_path())
+        .chain(std::iter::once(plan.next_file.path.as_path()))
         .chain(
             plan.consumed_fragments
                 .iter()
-                .map(|fragment| &fragment.path),
-        );
+                .map(|fragment| fragment.path.as_path()),
+        )
+        .collect::<Vec<_>>();
+    probe_transaction_move_support(repo, &paths, participant_identities)
+}
+
+fn probe_transaction_move_support(
+    repo: &Repository,
+    paths: &[&Path],
+    participant_identities: &[PathBuf],
+) -> Result<()> {
+    debug_assert_eq!(paths.len(), participant_identities.len());
     let mut probed_directories = IndexSet::new();
-    for (path, identity) in paths.zip(participant_identities) {
+    for (path, identity) in paths.iter().copied().zip(participant_identities) {
         let directory = nearest_existing_directory(identity).ok_or_else(|| Error::ReadFile {
             path: identity.clone(),
             source: std::io::Error::new(
@@ -7962,12 +8441,12 @@ mod tests {
                 version: String::from("1.2.0"),
             },
         ));
-        assert_mutation_locked(format_fragments(&repo, FormatOptions));
+        let format_plan = plan_format(&repo, FormatOptions).expect("format plan without mutation");
+        assert_mutation_locked(apply_format(&repo, format_plan));
         assert_mutation_locked(apply_sync(
             &repo,
             SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled),
         ));
-        assert_mutation_locked(prepare_check_fix(&repo));
         assert_mutation_locked(plan_release(
             &repo,
             ReleaseOptions {
@@ -9318,23 +9797,425 @@ mod tests {
     }
 
     #[test]
-    fn fmt_refuses_to_discard_materialized_hand_edits() {
+    fn format_plan_does_not_change_files_before_confirmation() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
-        fs::write(
-            temp.path().join("CHANGES.md"),
-            "Unreleased\n----------\n\nTo be released.\n\n -  Hand edited entry.\n",
-        )
-        .expect("changelog");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\n -  Hand edited entry.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
 
-        let error = format_fragments(&repo, FormatOptions).expect_err("needs explicit sync");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+
+        assert!(matches!(plan.sync, SyncPlan::NeedsConfirmation { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+            "- Fixed issue.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn format_fragments_requires_confirmation_without_changing_files() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = format_fragments(&repo, FormatOptions).expect_err("confirmation required");
 
         assert!(matches!(error, Error::SyncNeedsConfirmation { .. }));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
             "- Fixed issue.\n"
         );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn applying_confirmed_format_plan_updates_fragments_and_changelog() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+
+        let result = apply_format(&repo, plan).expect("apply format");
+
+        assert_eq!(result.changed, vec![PathBuf::from("changes.d/fmt.md")]);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+            " -  Fixed issue.\n"
+        );
+        assert!(
+            fs::read_to_string(temp.path().join("CHANGES.md"))
+                .expect("changelog")
+                .contains(" -  Fixed issue.\n")
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn format_apply_rejects_a_fragment_changed_after_planning_without_other_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/a.md"), "- Added first.\n").expect("first");
+        fs::write(temp.path().join("changes.d/b.md"), "- Added second.\n").expect("second");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        fs::write(temp.path().join("changes.d/b.md"), " -  Concurrent edit.\n")
+            .expect("concurrent edit");
+
+        let error = apply_format(&repo, plan).expect_err("stale format plan");
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
+            "- Added first.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn format_move_probe_failure_changes_nothing() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = "- Added first.\n";
+        let second = "- Added second.\n";
+        let changelog = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("changes.d/a.md"), first).expect("first");
+        fs::write(temp.path().join("changes.d/b.md"), second).expect("second");
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        set_release_failpoint(ReleaseApplyStage::Probe, PathBuf::from("changes.d/a.md"));
+
+        let error = apply_format(&repo, plan).expect_err("move probe failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::FormatTransactionUnsupported));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
+            first
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/b.md")).expect("second"),
+            second
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn format_apply_preserves_a_fragment_changed_after_preflight_validation() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/a.md"), "- Added first.\n").expect("first");
+        fs::write(temp.path().join("changes.d/b.md"), "- Added second.\n").expect("second");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        let concurrent = " -  Concurrent edit.\n";
+        set_format_apply_interference("changes.d/b.md", concurrent);
+
+        let error = apply_format(&repo, plan).expect_err("stale format plan");
+        clear_format_apply_interference();
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
+            "- Added first.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/b.md")).expect("second"),
+            concurrent
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn format_apply_preserves_an_atomic_save_after_claim_and_rolls_back() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/a.md"), "- Added first.\n").expect("first");
+        fs::write(temp.path().join("changes.d/b.md"), "- Added second.\n").expect("second");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        let concurrent = " -  Concurrent atomic save.\n";
+        set_format_apply_interference_after_claim("changes.d/b.md", concurrent);
+
+        let error = apply_format(&repo, plan).expect_err("stale format plan");
+        clear_format_apply_interference();
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
+            "- Added first.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/b.md")).expect("second"),
+            concurrent
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert!(
+            fs::read_dir(temp.path().join("changes.d"))
+                .expect("fragments")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".sacho-claim-"))
+        );
+    }
+
+    #[test]
+    fn format_apply_rejects_a_fragment_added_after_planning_without_other_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/planned.md"),
+            "- Added planned.\n",
+        )
+        .expect("planned");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        fs::write(temp.path().join("changes.d/late.md"), " -  Added late.\n")
+            .expect("late fragment");
+
+        let error = apply_format(&repo, plan).expect_err("stale fragment set");
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/late.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/planned.md")).expect("planned"),
+            "- Added planned.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn format_apply_rejects_next_file_changed_after_planning_without_other_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+        fs::write(temp.path().join("changes.d/next"), "1.0.0\n").expect("next");
+        let changelog = "Version 1.0.0\n-------------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        fs::write(temp.path().join("changes.d/next"), "2.0.0\n").expect("concurrent next");
+
+        let error = apply_format(&repo, plan).expect_err("stale next file");
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/next"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+            "- Fixed issue.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn format_apply_rejects_changelog_changed_after_planning_without_fragment_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        let concurrent = "Unreleased\n----------\n\nTo be released.\n\nConcurrent edit.\n";
+        fs::write(temp.path().join("CHANGES.md"), concurrent).expect("concurrent changelog");
+
+        let error = apply_format(&repo, plan).expect_err("stale changelog");
+
+        assert!(
+            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("CHANGES.md"))
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+            "- Fixed issue.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            concurrent
+        );
+    }
+
+    #[test]
+    fn format_fragments_without_materialization_keeps_simple_formatting_behavior() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fmt.md"), "- Fixed issue.\n").expect("fragment");
+
+        let result = format_fragments(&repo, FormatOptions).expect("format fragments");
+
+        assert_eq!(result.changed, vec![PathBuf::from("changes.d/fmt.md")]);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
+            " -  Fixed issue.\n"
+        );
+    }
+
+    #[test]
+    fn planning_format_does_not_mutate_before_sync_confirmation() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+        )
+        .expect("changelog");
+
+        let prepared = plan_format(&repo, FormatOptions).expect("format plan");
+
+        assert!(matches!(prepared.sync, SyncPlan::NeedsConfirmation { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+            "- Fixed issue.\n"
+        );
+    }
+
+    #[test]
+    fn check_fix_requires_confirmation_without_changing_files() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = check(
+            &repo,
+            CheckOptions {
+                fix: true,
+                ..CheckOptions::default()
+            },
+        )
+        .expect_err("confirmation required");
+
+        assert!(matches!(error, Error::SyncNeedsConfirmation { .. }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+            "- Fixed issue.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn format_plans_are_pure_and_idempotent(
+            entries in prop::collection::vec("[A-Za-z]{1,16}", 1..6),
+        ) {
+            let (temp, repo) = repo_with_config("");
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            for (index, entry) in entries.iter().enumerate() {
+                fs::write(
+                    temp.path().join(format!("changes.d/{index}.md")),
+                    format!("- Added {entry}.\n"),
+                )
+                .expect("fragment");
+            }
+            let changelog = "Unreleased\n----------\n\nTo be released.\n";
+            fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+            let before = (0..entries.len())
+                .map(|index| {
+                    fs::read_to_string(temp.path().join(format!("changes.d/{index}.md")))
+                        .expect("fragment")
+                })
+                .collect::<Vec<_>>();
+
+            let plan = plan_format(&repo, FormatOptions).expect("format plan");
+
+            let still_before = (0..entries.len())
+                .map(|index| {
+                    fs::read_to_string(temp.path().join(format!("changes.d/{index}.md")))
+                        .expect("fragment")
+                })
+                .collect::<Vec<_>>();
+            prop_assert_eq!(still_before, before);
+            prop_assert_eq!(
+                fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+                changelog,
+            );
+
+            apply_format(&repo, plan).expect("apply format");
+            prop_assert!(check(&repo, CheckOptions::default()).expect("check").is_clean());
+            let formatted = (0..entries.len())
+                .map(|index| {
+                    fs::read_to_string(temp.path().join(format!("changes.d/{index}.md")))
+                        .expect("fragment")
+                })
+                .collect::<Vec<_>>();
+            let second = plan_format(&repo, FormatOptions).expect("second plan");
+            prop_assert!(second.formatting.changed.is_empty());
+            prop_assert!(matches!(
+                &second.sync,
+                SyncPlan::Skipped(SyncSkipReason::AlreadyCurrent)
+            ));
+            apply_format(&repo, second).expect("apply second plan");
+            let after_second = (0..entries.len())
+                .map(|index| {
+                    fs::read_to_string(temp.path().join(format!("changes.d/{index}.md")))
+                        .expect("fragment")
+                })
+                .collect::<Vec<_>>();
+            prop_assert_eq!(after_second, formatted);
+        }
     }
 
     #[test]

@@ -216,6 +216,56 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// A formatting plan no longer matches a file it was built from.
+    #[snafu(display(
+        "refusing to apply stale formatting plan because {} changed after planning; plan the formatting again",
+        path.display()
+    ))]
+    StaleFormatPlan {
+        /// Path whose current state differs from the planned state.
+        path: PathBuf,
+    },
+
+    /// The platform cannot provide the no-replace move required by formatting
+    /// transactions.
+    #[snafu(display(
+        "formatting transactions are unsupported because this platform has no atomic no-replace move"
+    ))]
+    FormatTransactionUnsupported,
+
+    /// Rollback found that another writer changed an applied formatting path.
+    #[snafu(display(
+        "refusing to roll back {} because it changed after formatting wrote it",
+        path.display()
+    ))]
+    FormatRollbackConflict {
+        /// Path whose concurrent state was preserved.
+        path: PathBuf,
+    },
+
+    /// Applying formatting failed and one or more prior writes could not be restored.
+    #[snafu(display(
+        "format apply failed: {cause}; rollback also failed: {}",
+        rollback_failures.join("; ")
+    ))]
+    FormatApply {
+        /// Original apply failure.
+        cause: String,
+
+        /// Failures encountered while restoring already-applied changes.
+        rollback_failures: Vec<String>,
+    },
+
+    /// Formatting committed, but removing retained transaction claims failed.
+    #[snafu(display(
+        "formatting committed, but transaction cleanup failed: {}",
+        failures.join("; ")
+    ))]
+    FormatCleanup {
+        /// Failures encountered while deleting committed claim files.
+        failures: Vec<String>,
+    },
+
     /// A release plan no longer matches a file it was built from.
     #[snafu(display(
         "refusing to apply stale release plan because {} changed after planning; plan the release again",

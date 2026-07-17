@@ -10,9 +10,9 @@ use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, NextOptions, ReleaseDate, ReleaseOptions, SyncOptions, SyncPlan,
-    add_fragment, apply_merge_driver, apply_release, apply_sync, carry, check, commit_message_hook,
-    compile_unreleased, format_fragments, init_repository, mercurial_update_hook, plan_release,
-    plan_sync, prepare_check_fix, reference_transaction_hook, set_next_version,
+    add_fragment, apply_format, apply_merge_driver, apply_release, apply_sync, carry, check,
+    commit_message_hook, compile_unreleased, init_repository, mercurial_update_hook, plan_format,
+    plan_release, plan_sync, reference_transaction_hook, set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
@@ -188,11 +188,11 @@ impl Cli {
             Command::Check { base, staged, fix } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 if fix {
-                    let prepared = prepare_check_fix(&repo)?;
-                    let Some(plan) = confirm_sync_plan(prepared.sync)? else {
+                    let prepared = plan_format(&repo, FormatOptions)?;
+                    if !confirm_sync_plan(&prepared.sync, Some("sacho check --fix"))? {
                         return Ok(ExitCode::from(2));
-                    };
-                    apply_sync(&repo, plan)?;
+                    }
+                    apply_format(&repo, prepared)?;
                 }
                 let report = check(
                     &repo,
@@ -206,7 +206,11 @@ impl Cli {
             }
             Command::Fmt => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                format_fragments(&repo, FormatOptions)?;
+                let plan = plan_format(&repo, FormatOptions)?;
+                if !confirm_sync_plan(&plan.sync, Some("sacho fmt"))? {
+                    return Ok(ExitCode::from(2));
+                }
+                apply_format(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Preview { section } => {
@@ -224,9 +228,9 @@ impl Cli {
             Command::Sync { force } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let plan = plan_sync(&repo, SyncOptions { force })?;
-                let Some(plan) = confirm_sync_plan(plan)? else {
+                if !confirm_sync_plan(&plan, None)? {
                     return Ok(ExitCode::from(2));
-                };
+                }
                 apply_sync(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -350,9 +354,9 @@ fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
     }
 }
 
-fn confirm_sync_plan(plan: SyncPlan) -> Result<Option<SyncPlan>, CliReport> {
-    let SyncPlan::NeedsConfirmation { diff, .. } = &plan else {
-        return Ok(Some(plan));
+fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Result<bool, CliReport> {
+    let SyncPlan::NeedsConfirmation { diff, .. } = plan else {
+        return Ok(true);
     };
 
     let interactive = sync_should_prompt(io::stdin().is_terminal(), io::stdout().is_terminal());
@@ -366,14 +370,20 @@ fn confirm_sync_plan(plan: SyncPlan) -> Result<Option<SyncPlan>, CliReport> {
         eprintln!(
             "the synchronization shown above replaces the materialized unreleased region and may discard hand edits"
         );
-        eprintln!("rerun with `sacho sync --force` to apply it non-interactively");
-        return Ok(None);
+        if let Some(command) = formatting_command {
+            eprintln!(
+                "run `sacho sync --force`, then rerun `{command}` to apply all fixes non-interactively"
+            );
+        } else {
+            eprintln!("rerun with `sacho sync --force` to apply it non-interactively");
+        }
+        return Ok(false);
     }
     if prompt_bool("Apply this synchronization", false)? {
-        Ok(Some(plan))
+        Ok(true)
     } else {
-        eprintln!("synchronization cancelled; the changelog was not changed");
-        Ok(None)
+        eprintln!("synchronization cancelled; the repository was not changed");
+        Ok(false)
     }
 }
 

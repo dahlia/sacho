@@ -218,20 +218,30 @@ fn read_version_label(repo: &Repository) -> Result<VersionLabel> {
             .join(&repo.config().fragments.next_file),
     );
     match fs::read_to_string(&path) {
-        Ok(contents) => {
-            let values = contents
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>();
-            match values.as_slice() {
-                [] => Ok(VersionLabel::Unreleased),
-                [value] => Ok(VersionLabel::Version((*value).to_owned())),
-                _ => Err(crate::Error::InvalidNextVersion { path }),
-            }
-        }
+        Ok(contents) => version_label_from_contents(&path, Some(&contents)),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(VersionLabel::Unreleased),
         Err(source) => Err(source).context(ReadFileSnafu { path }),
+    }
+}
+
+pub(crate) fn version_label_from_contents(
+    path: &Path,
+    contents: Option<&str>,
+) -> Result<VersionLabel> {
+    let Some(contents) = contents else {
+        return Ok(VersionLabel::Unreleased);
+    };
+    let values = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(VersionLabel::Unreleased),
+        [value] => Ok(VersionLabel::Version((*value).to_owned())),
+        _ => Err(crate::Error::InvalidNextVersion {
+            path: path.to_path_buf(),
+        }),
     }
 }
 
