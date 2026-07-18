@@ -8,10 +8,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use hongdown::{
-    DashSetting, IndentWidth, LeadingSpaces, LineWidth, Options as HongdownOptions, TrailingSpaces,
-    UnorderedMarker, format,
-};
 use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
@@ -27,8 +23,9 @@ use crate::fragment::{
     DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
     discover_fragment_candidates, parse_fragment,
 };
+use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
-use crate::released::{carry_release, find_released_section};
+use crate::released::{carry_release, render_released_section};
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
 use crate::repo::{
@@ -1194,7 +1191,7 @@ pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> 
     } else {
         None
     };
-    find_released_section(&changelog, &options.version, unreleased_region).ok_or(
+    render_released_section(&changelog, &options.version, unreleased_region)?.ok_or(
         Error::ReleasedVersionNotFound {
             version: options.version,
         },
@@ -4439,9 +4436,7 @@ fn ensure_materialized_current_before_mutation(repo: &Repository) -> Result<()> 
 
 fn format_fragment_source(source: &str) -> Result<String> {
     let parsed = parse_frontmatter_for_format(source)?;
-    let body = format(parsed.body, &hongdown_options()).map_err(|source| Error::Format {
-        source: Box::new(source),
-    })?;
+    let body = format_markdown(parsed.body)?;
     let mut output = canonical_frontmatter(parsed.frontmatter)?;
     output.push_str(body.trim_end());
     output.push('\n');
@@ -4581,21 +4576,6 @@ fn yaml_key_sort_text(key: &Value) -> String {
             .trim_start_matches("---\n")
             .trim()
             .to_owned(),
-    }
-}
-
-fn hongdown_options() -> HongdownOptions {
-    HongdownOptions {
-        line_width: Some(LineWidth::new(80).expect("80 is a valid line width")),
-        unordered_marker: UnorderedMarker::Hyphen,
-        leading_spaces: LeadingSpaces::new(1).expect("1 is valid leading spaces"),
-        trailing_spaces: TrailingSpaces::new(2).expect("2 is valid trailing spaces"),
-        indent_width: IndentWidth::new(4).expect("4 is a valid indent width"),
-        curly_double_quotes: false,
-        curly_single_quotes: false,
-        ellipsis: false,
-        em_dash: DashSetting::Disabled,
-        ..HongdownOptions::default()
     }
 }
 

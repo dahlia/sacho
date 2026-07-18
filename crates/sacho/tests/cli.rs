@@ -806,7 +806,7 @@ fn preview_help_describes_section_option() {
 }
 
 #[test]
-fn show_prints_the_exact_released_section() {
+fn show_formats_the_released_section() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(
         temp.path().join("sacho.toml"),
@@ -855,11 +855,120 @@ Released on July 19, 2026.
 
  -  Added show.
 
-```markdown
+<!-- end list -->
+
+~~~~ markdown
 Version 0.0.0
 -------------
-```
+~~~~
+",
+        );
+}
 
+#[test]
+fn show_includes_reference_definitions_from_other_sections() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Project changelog
+=================
+
+Version 0.2.0
+-------------
+
+Released on July 18, 2026.
+
+ -  It contains a [link].
+
+[link]: https://example.com/
+
+
+Version 0.1.0
+-------------
+
+Released on July 1, 2026.
+
+ -  It also contains the same [link].
+",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "0.1.0"])
+        .assert()
+        .success()
+        .stdout(
+            "\
+Version 0.1.0
+-------------
+
+Released on July 1, 2026.
+
+ -  It also contains the same [link].
+
+[link]: https://example.com/
+",
+        );
+}
+
+#[test]
+fn show_includes_footnote_definitions_from_other_sections() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Project changelog
+=================
+
+Version 0.2.0
+-------------
+
+Released on July 18, 2026.
+
+[^note]: Shared footnote text.[^detail]
+
+[^detail]: More detail.
+
+Version 0.1.0
+-------------
+
+Released on July 1, 2026.
+
+ -  It contains a footnote.[^note]
+",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "0.1.0"])
+        .assert()
+        .success()
+        .stdout(
+            "\
+Version 0.1.0
+-------------
+
+Released on July 1, 2026.
+
+ -  It contains a footnote.[^note]
+
+[^note]: Shared footnote text.[^detail]
+[^detail]: More detail.
 ",
         );
 }

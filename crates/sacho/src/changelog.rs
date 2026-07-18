@@ -11,7 +11,7 @@ pub struct ReleasedSection {
     /// Released version string.
     pub version: String,
 
-    /// Exact Markdown source for the section, including its version heading.
+    /// Markdown for the section, including its version heading.
     pub markdown: String,
 }
 

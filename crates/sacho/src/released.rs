@@ -1,14 +1,15 @@
 //! Released changelog section parsing for carry and merge workflows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
-use comrak::{Arena, Options as ComrakOptions, parse_document};
+use comrak::{Arena, Options as ComrakOptions, format_commonmark, parse_document};
 
 use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
 use crate::config::SectionConfig;
 use crate::error::{Error, Result};
+use crate::markdown::format_markdown;
 use crate::repo::Repository;
 
 /// Entries decompiled from a released changelog section.
@@ -36,8 +37,9 @@ pub struct CarriedFragment {
 
 #[derive(Debug, Clone)]
 struct TargetSection<'a> {
-    markdown: &'a str,
     body: &'a str,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -111,8 +113,99 @@ pub fn find_released_section(
     let target = find_target_section(source, version, unreleased_region)?;
     Some(ReleasedSection {
         version: version.to_owned(),
-        markdown: target.markdown.to_owned(),
+        markdown: source[target.start..target.end].to_owned(),
     })
+}
+
+pub(crate) fn render_released_section(
+    source: &str,
+    version: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+) -> Result<Option<ReleasedSection>> {
+    let Some(target) = find_target_section(source, version, unreleased_region) else {
+        return Ok(None);
+    };
+    let markdown = render_target_section(source, &target)?;
+    Ok(Some(ReleasedSection {
+        version: version.to_owned(),
+        markdown,
+    }))
+}
+
+fn render_target_section(source: &str, target: &TargetSection<'_>) -> Result<String> {
+    let arena = Arena::new();
+    let options = comrak_options();
+    let document = parse_document(&arena, source, &options);
+    let section = arena.alloc(NodeValue::Document.into());
+    let line_starts = line_starts(source);
+    let nodes = document
+        .children()
+        .filter(|node| {
+            sourcepos_start_offset(&line_starts, node.data().sourcepos.start)
+                .is_some_and(|start| (target.start..target.end).contains(&start))
+        })
+        .collect::<Vec<_>>();
+    let footnote_definitions = referenced_footnote_definitions(document, &nodes);
+    for node in nodes {
+        section.append(node);
+    }
+    for definition in footnote_definitions {
+        section.append(definition);
+    }
+
+    let mut rendered = String::new();
+    format_commonmark(section, &options, &mut rendered)
+        .expect("writing CommonMark to a String cannot fail");
+    format_markdown(&rendered)
+}
+
+fn referenced_footnote_definitions<'a>(
+    document: &'a AstNode<'a>,
+    selected_nodes: &[&'a AstNode<'a>],
+) -> Vec<&'a AstNode<'a>> {
+    let definitions = document
+        .children()
+        .filter(|node| matches!(node.data().value, NodeValue::FootnoteDefinition(_)))
+        .collect::<Vec<_>>();
+    let mut referenced = BTreeSet::new();
+    for node in selected_nodes {
+        collect_footnote_references(node, &mut referenced);
+    }
+    let mut pending = referenced.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(name) = pending.pop_front() {
+        let Some(definition) = definitions.iter().find(|definition| {
+            matches!(
+                &definition.data().value,
+                NodeValue::FootnoteDefinition(definition) if definition.name == name
+            )
+        }) else {
+            continue;
+        };
+        let mut nested_references = BTreeSet::new();
+        collect_footnote_references(definition, &mut nested_references);
+        for nested in nested_references {
+            if referenced.insert(nested.clone()) {
+                pending.push_back(nested);
+            }
+        }
+    }
+
+    definitions
+        .into_iter()
+        .filter(|definition| match &definition.data().value {
+            NodeValue::FootnoteDefinition(definition) => referenced.contains(&definition.name),
+            _ => false,
+        })
+        .collect()
+}
+
+fn collect_footnote_references<'a>(node: &'a AstNode<'a>, references: &mut BTreeSet<String>) {
+    if let NodeValue::FootnoteReference(reference) = &node.data().value {
+        references.insert(reference.name.clone());
+    }
+    for child in node.children() {
+        collect_footnote_references(child, references);
+    }
 }
 
 fn carried_fragment_path(
@@ -175,8 +268,9 @@ fn find_target_section<'a>(
             .map(|next| next.start)
             .unwrap_or(source.len());
         return Some(TargetSection {
-            markdown: &source[candidate.start..end],
             body: &source[candidate.body_start..end],
+            start: candidate.start,
+            end,
         });
     }
     None
