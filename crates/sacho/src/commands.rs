@@ -459,6 +459,9 @@ pub struct CarryOptions {
 pub struct ShowOptions {
     /// Released version whose section should be returned.
     pub version: String,
+
+    /// Whether to omit the released version heading from the returned Markdown.
+    pub skip_heading: bool,
 }
 
 /// Result of carrying released entries.
@@ -1191,11 +1194,15 @@ pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> 
     } else {
         None
     };
-    render_released_section(&changelog, &options.version, unreleased_region)?.ok_or(
-        Error::ReleasedVersionNotFound {
-            version: options.version,
-        },
-    )
+    render_released_section(
+        &changelog,
+        &options.version,
+        unreleased_region,
+        options.skip_heading,
+    )?
+    .ok_or(Error::ReleasedVersionNotFound {
+        version: options.version,
+    })
 }
 
 /// Plans a synchronization between fragments and the materialized changelog.

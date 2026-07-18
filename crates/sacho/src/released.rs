@@ -121,30 +121,42 @@ pub(crate) fn render_released_section(
     source: &str,
     version: &str,
     unreleased_region: Option<UnreleasedRegionSpan>,
+    skip_heading: bool,
 ) -> Result<Option<ReleasedSection>> {
     let Some(target) = find_target_section(source, version, unreleased_region) else {
         return Ok(None);
     };
-    let markdown = render_target_section(source, &target)?;
+    let markdown = render_target_section(source, &target, skip_heading)?;
     Ok(Some(ReleasedSection {
         version: version.to_owned(),
         markdown,
     }))
 }
 
-fn render_target_section(source: &str, target: &TargetSection<'_>) -> Result<String> {
+fn render_target_section(
+    source: &str,
+    target: &TargetSection<'_>,
+    skip_heading: bool,
+) -> Result<String> {
     let arena = Arena::new();
     let options = comrak_options();
     let document = parse_document(&arena, source, &options);
     let section = arena.alloc(NodeValue::Document.into());
     let line_starts = line_starts(source);
-    let nodes = document
+    let mut nodes = document
         .children()
         .filter(|node| {
             sourcepos_start_offset(&line_starts, node.data().sourcepos.start)
                 .is_some_and(|start| (target.start..target.end).contains(&start))
         })
         .collect::<Vec<_>>();
+    if skip_heading
+        && nodes
+            .first()
+            .is_some_and(|node| matches!(node.data().value, NodeValue::Heading(_)))
+    {
+        nodes.remove(0);
+    }
     let footnote_definitions = referenced_footnote_definitions(document, &nodes);
     for node in nodes {
         section.append(node);

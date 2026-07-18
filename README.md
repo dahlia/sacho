@@ -114,12 +114,13 @@ sacho show 1.2.0
 
 The output starts at the version heading and ends before the next released
 version heading. It is written to standard output unless `-o PATH` or
-`--output-file PATH` is supplied. For example, a GitHub Actions job triggered
-by a `v1.2.0` tag can run:
+`--output-file PATH` is supplied. Pass `-H` or `--skip-heading` to omit the
+version heading. For example, a GitHub Actions job triggered by a `v1.2.0` tag
+can run:
 
 ~~~~ sh
 version="${GITHUB_REF_NAME#v}"
-sacho show "$version" --output-file release-notes.md
+sacho show "$version" --skip-heading --output-file release-notes.md
 gh release create "$GITHUB_REF_NAME" --notes-file release-notes.md
 ~~~~
 

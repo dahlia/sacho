@@ -866,6 +866,49 @@ Version 0.0.0
 }
 
 #[test]
+fn show_can_skip_the_version_heading() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Version 1.2.0
+-------------
+
+Released on July 19, 2026.
+
+ -  Added show.
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+    )
+    .expect("changelog");
+
+    for flag in ["-H", "--skip-heading"] {
+        let mut command = Command::cargo_bin("sacho").expect("binary");
+        command
+            .current_dir(temp.path())
+            .args(["show", "1.2.0", flag])
+            .assert()
+            .success()
+            .stdout(
+                "\
+Released on July 19, 2026.
+
+ -  Added show.
+",
+            );
+    }
+}
+
+#[test]
 fn show_includes_reference_definitions_from_other_sections() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(
@@ -1154,6 +1197,8 @@ fn show_help_describes_version_argument() {
         .stdout(predicate::str::contains(
             "Released version whose section should be printed",
         ))
+        .stdout(predicate::str::contains("-H, --skip-heading"))
+        .stdout(predicate::str::contains("Do not print the version heading"))
         .stdout(predicate::str::contains("-o, --output-file <PATH>"))
         .stdout(predicate::str::contains(
             "Write the released section to a file",

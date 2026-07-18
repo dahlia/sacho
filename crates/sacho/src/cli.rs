@@ -115,6 +115,10 @@ enum Command {
         #[arg(help = "Released version whose section should be printed")]
         version: String,
 
+        /// Do not print the version heading.
+        #[arg(short = 'H', long, help = "Do not print the version heading")]
+        skip_heading: bool,
+
         /// File to receive the released section instead of standard output.
         #[arg(
             short,
@@ -271,10 +275,17 @@ impl Cli {
             }
             Command::Show {
                 version,
+                skip_heading,
                 output_file,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let released = show(&repo, ShowOptions { version })?;
+                let released = show(
+                    &repo,
+                    ShowOptions {
+                        version,
+                        skip_heading,
+                    },
+                )?;
                 if let Some(path) = output_file {
                     std::fs::write(&path, released.markdown)
                         .map_err(|source| Error::WriteFile { path, source })?;
