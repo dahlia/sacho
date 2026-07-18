@@ -106,6 +106,23 @@ If no next version has been set, pass the release version explicitly, for
 example `sacho release 1.2.0`. Use `--date YYYY-MM-DD` when the release date
 must be supplied rather than taken from the local clock.
 
+After committing a release, print its frozen Markdown section with `show`:
+
+~~~~ sh
+sacho show 1.2.0
+~~~~
+
+The output starts at the version heading and ends before the next released
+version heading. It is written to standard output unless `-o PATH` or
+`--output-file PATH` is supplied. For example, a GitHub Actions job triggered
+by a `v1.2.0` tag can run:
+
+~~~~ sh
+version="${GITHUB_REF_NAME#v}"
+sacho show "$version" --output-file release-notes.md
+gh release create "$GITHUB_REF_NAME" --notes-file release-notes.md
+~~~~
+
 
 Version-control integration
 ---------------------------

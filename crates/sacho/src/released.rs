@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
 use comrak::{Arena, Options as ComrakOptions, parse_document};
 
+use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
 use crate::config::SectionConfig;
 use crate::error::{Error, Result};
 use crate::repo::Repository;
@@ -35,6 +36,7 @@ pub struct CarriedFragment {
 
 #[derive(Debug, Clone)]
 struct TargetSection<'a> {
+    markdown: &'a str,
     body: &'a str,
 }
 
@@ -52,10 +54,11 @@ struct ReferenceDefinition {
 
 /// Parses a released version section and returns deterministic carry fragments.
 pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Result<CarriedRelease> {
-    let target =
-        find_target_section(changelog, version).ok_or_else(|| Error::ReleasedVersionNotFound {
+    let target = find_target_section(changelog, version, None).ok_or_else(|| {
+        Error::ReleasedVersionNotFound {
             version: version.to_owned(),
-        })?;
+        }
+    })?;
     let entries = parse_entries(repo, target.body)?;
     let mut grouped = BTreeMap::<Option<String>, Vec<String>>::new();
     for entry in entries {
@@ -92,6 +95,23 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
     Ok(CarriedRelease {
         version: version.to_owned(),
         fragments,
+    })
+}
+
+/// Finds a released version section in changelog Markdown.
+///
+/// The returned Markdown preserves the source from the version heading through
+/// the byte immediately before the next released version heading. A candidate
+/// inside `unreleased_region` is ignored when that span is supplied.
+pub fn find_released_section(
+    source: &str,
+    version: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+) -> Option<ReleasedSection> {
+    let target = find_target_section(source, version, unreleased_region)?;
+    Some(ReleasedSection {
+        version: version.to_owned(),
+        markdown: target.markdown.to_owned(),
     })
 }
 
@@ -133,7 +153,11 @@ fn fragment_markdown(items: Vec<String>) -> String {
     markdown
 }
 
-fn find_target_section<'a>(source: &'a str, version: &str) -> Option<TargetSection<'a>> {
+fn find_target_section<'a>(
+    source: &'a str,
+    version: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+) -> Option<TargetSection<'a>> {
     let lines = source_lines(source);
     let candidates = version_heading_candidates(&lines);
     let target = format!("Version {version}");
@@ -141,11 +165,17 @@ fn find_target_section<'a>(source: &'a str, version: &str) -> Option<TargetSecti
         if candidate.text != target {
             continue;
         }
+        if unreleased_region
+            .is_some_and(|region| (region.start..region.end).contains(&candidate.start))
+        {
+            continue;
+        }
         let end = candidates
             .get(index + 1)
             .map(|next| next.start)
             .unwrap_or(source.len());
         return Some(TargetSection {
+            markdown: &source[candidate.start..end],
             body: &source[candidate.body_start..end],
         });
     }
@@ -553,6 +583,7 @@ fn comrak_options() -> ComrakOptions<'static> {
 mod tests {
     use std::fs;
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::*;
@@ -596,6 +627,33 @@ Released on July 7, 2026.
             carried.fragments[0]
                 .markdown
                 .contains(" -  Fixed carry.  [[#8]]\n")
+        );
+    }
+
+    #[test]
+    fn returns_exact_markdown_for_a_released_section() {
+        let source = "\
+Project changelog
+=================
+
+## Version 1.2.0
+
+Released on July 19, 2026.
+
+ -  Added show.
+
+Version 1.1.0
+-------------
+
+Older release.
+";
+
+        let released = find_released_section(source, "1.2.0", None).expect("released section");
+
+        assert_eq!(released.version, "1.2.0");
+        assert_eq!(
+            released.markdown,
+            "## Version 1.2.0\n\nReleased on July 19, 2026.\n\n -  Added show.\n\n"
         );
     }
 
@@ -838,6 +896,29 @@ six hashes
         );
         assert_eq!(&source[headings[0].body_start..][..6], "\nbody\n");
         assert_eq!(&source[headings[1].body_start..][..10], "\nold body\n");
+    }
+
+    proptest! {
+        #[test]
+        fn released_section_stops_exactly_before_the_next_version_heading(
+            suffix in "[a-z0-9]{1,12}",
+            body in "[a-z0-9 .!?]{0,80}",
+        ) {
+            let version = format!("target-{suffix}");
+            let heading = format!("Version {version}");
+            let target = format!(
+                "{heading}\n{}\n\nRelease note: {body}\n\n",
+                "-".repeat(heading.len()),
+            );
+            let source = format!(
+                "Version before\n--------------\n\nOlder.\n\n{target}Version after\n-------------\n\nNewer.\n"
+            );
+
+            let released =
+                find_released_section(&source, &version, None).expect("released section");
+
+            prop_assert_eq!(released.markdown, target);
+        }
     }
 
     #[test]

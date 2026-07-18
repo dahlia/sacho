@@ -27,6 +27,7 @@ fn repository_commands_reject_an_external_configured_path_without_touching_it() 
         &["check", "--fix"],
         &["fmt"],
         &["preview"],
+        &["show", "1.1.0"],
         &["sync", "--force"],
         &["release", "1.2.0", "--date", "2026-07-15"],
         &["carry", "1.1.0"],
@@ -74,6 +75,9 @@ fn help_lists_commands() {
         ))
         .stdout(predicate::str::contains(
             "Print the compiled unreleased region",
+        ))
+        .stdout(predicate::str::contains(
+            "Print a released changelog section",
         ));
 }
 
@@ -799,6 +803,252 @@ fn preview_help_describes_section_option() {
             "Print the compiled unreleased region",
         ))
         .stdout(predicate::str::contains("Section id to preview by itself"));
+}
+
+#[test]
+fn show_prints_the_exact_released_section() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\npath = \"docs/NEWS.md\"\n",
+    )
+    .expect("config");
+    std::fs::create_dir(temp.path().join("docs")).expect("docs directory");
+    std::fs::write(
+        temp.path().join("docs/NEWS.md"),
+        "\
+Project changelog
+=================
+
+Version 1.2.0
+-------------
+
+Released on July 19, 2026.
+
+ -  Added show.
+
+```markdown
+Version 0.0.0
+-------------
+```
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "1.2.0"])
+        .assert()
+        .success()
+        .stdout(
+            "\
+Version 1.2.0
+-------------
+
+Released on July 19, 2026.
+
+ -  Added show.
+
+```markdown
+Version 0.0.0
+-------------
+```
+
+",
+        );
+}
+
+#[test]
+fn show_reports_a_missing_released_version() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Version 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "1.2.0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "released version \"1.2.0\" not found in changelog",
+        ));
+}
+
+#[test]
+fn show_rejects_the_materialized_unreleased_version() {
+    let cases = [
+        (
+            "",
+            "\
+Version 1.2.0
+-------------
+
+To be released.
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+        ),
+        (
+            "[changelog]\nregion-detection = \"marker\"\n",
+            "\
+<!-- sacho:unreleased:begin -->
+Version 1.2.0
+-------------
+
+To be released.
+<!-- sacho:unreleased:end -->
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+        ),
+    ];
+
+    for (config, changelog) in cases {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("sacho.toml"), config).expect("config");
+        std::fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let mut command = Command::cargo_bin("sacho").expect("binary");
+
+        command
+            .current_dir(temp.path())
+            .args(["show", "1.2.0"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "released version \"1.2.0\" not found in changelog",
+            ));
+    }
+}
+
+#[test]
+fn show_prints_a_release_below_the_materialized_unreleased_region() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Unreleased
+----------
+
+To be released.
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "1.1.0"])
+        .assert()
+        .success()
+        .stdout(
+            "\
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+",
+        );
+}
+
+#[test]
+fn show_writes_the_released_section_to_an_output_file() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Version 1.2.0\n-------------\n\nReleased on July 19, 2026.\n",
+    )
+    .expect("changelog");
+    std::fs::write(temp.path().join("release-notes.md"), "stale\n").expect("stale output");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "1.2.0", "-o", "release-notes.md"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("release-notes.md")).expect("output"),
+        "Version 1.2.0\n-------------\n\nReleased on July 19, 2026.\n"
+    );
+}
+
+#[test]
+fn show_reports_an_output_file_write_error() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Version 1.2.0\n-------------\n\nReleased on July 19, 2026.\n",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["show", "1.2.0", "--output-file", "missing/release-notes.md"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "failed to write missing/release-notes.md",
+        ));
+}
+
+#[test]
+fn show_help_describes_version_argument() {
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .args(["show", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Print a released changelog section",
+        ))
+        .stdout(predicate::str::contains(
+            "Released version whose section should be printed",
+        ))
+        .stdout(predicate::str::contains("-o, --output-file <PATH>"))
+        .stdout(predicate::str::contains(
+            "Write the released section to a file",
+        ));
 }
 
 #[test]

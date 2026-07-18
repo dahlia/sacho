@@ -16,7 +16,10 @@ use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
 use similar::TextDiff;
 
-use crate::changelog::{BEGIN_MARKER, ChangelogError, END_MARKER, replace_unreleased_region};
+use crate::changelog::{
+    BEGIN_MARKER, ChangelogError, END_MARKER, ReleasedSection, find_unreleased_region,
+    replace_unreleased_region,
+};
 use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
 use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
 use crate::error::{Error, MutationCommand, Result};
@@ -25,7 +28,7 @@ use crate::fragment::{
     discover_fragment_candidates, parse_fragment,
 };
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
-use crate::released::carry_release;
+use crate::released::{carry_release, find_released_section};
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
 use crate::repo::{
@@ -451,6 +454,13 @@ pub struct ReleaseResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarryOptions {
     /// Released version to decompile back into fragments.
+    pub version: String,
+}
+
+/// Options for showing a released changelog section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowOptions {
+    /// Released version whose section should be returned.
     pub version: String,
 }
 
@@ -1160,6 +1170,35 @@ fn read_format_file_snapshot(repo: &Repository, path: &Path) -> Result<FormatFil
 /// Compiles the current fragments into an unreleased changelog region.
 pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<CompiledRegion> {
     crate::compile::compile_unreleased(repo, options)
+}
+
+/// Reads one released section from the configured changelog.
+pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> {
+    let config = &repo.config().changelog;
+    let changelog_path = config.path.clone();
+    let absolute_path = repo.resolve(&changelog_path);
+    let changelog = fs::read_to_string(&absolute_path).map_err(|source| Error::ReadFile {
+        path: absolute_path,
+        source,
+    })?;
+    let unreleased_region = if config.materialize {
+        match find_unreleased_region(
+            &changelog,
+            config.region_detection,
+            &config.unreleased_heading,
+        ) {
+            Ok(region) => Some(region),
+            Err(ChangelogError::RegionNotFound) => None,
+            Err(source) => return Err(changelog_error(changelog_path, source)),
+        }
+    } else {
+        None
+    };
+    find_released_section(&changelog, &options.version, unreleased_region).ok_or(
+        Error::ReleasedVersionNotFound {
+            version: options.version,
+        },
+    )
 }
 
 /// Plans a synchronization between fragments and the materialized changelog.

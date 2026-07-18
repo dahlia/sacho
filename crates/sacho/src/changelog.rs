@@ -11,8 +11,8 @@ pub struct ReleasedSection {
     /// Released version string.
     pub version: String,
 
-    /// Markdown body for the released section.
-    pub body: String,
+    /// Exact Markdown source for the section, including its version heading.
+    pub markdown: String,
 }
 
 /// The unreleased changelog region in a materialized changelog file.

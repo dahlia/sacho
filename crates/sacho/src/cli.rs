@@ -10,10 +10,10 @@ use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, MutationCleanupWarning, NextOptions, ReleaseDate, ReleaseOptions,
-    SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver, apply_release,
-    apply_sync, carry, check, commit_message_hook, compile_unreleased, infer_repository_url,
-    init_repository, mercurial_update_hook, plan_format, plan_release, plan_sync,
-    reference_transaction_hook, set_next_version,
+    ShowOptions, SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver,
+    apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
+    infer_repository_url, init_repository, mercurial_update_hook, plan_format, plan_release,
+    plan_sync, reference_transaction_hook, set_next_version, show,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
@@ -107,6 +107,22 @@ enum Command {
         /// Section id to preview by itself.
         #[arg(long, help = "Section id to preview by itself")]
         section: Option<String>,
+    },
+
+    /// Print a released changelog section.
+    Show {
+        /// Released version whose section should be printed.
+        #[arg(help = "Released version whose section should be printed")]
+        version: String,
+
+        /// File to receive the released section instead of standard output.
+        #[arg(
+            short,
+            long,
+            value_name = "PATH",
+            help = "Write the released section to a file"
+        )]
+        output_file: Option<PathBuf>,
     },
 
     /// Regenerate the materialized unreleased changelog region.
@@ -251,6 +267,20 @@ impl Cli {
                     },
                 )?;
                 print!("{}", compiled.markdown);
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Show {
+                version,
+                output_file,
+            } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let released = show(&repo, ShowOptions { version })?;
+                if let Some(path) = output_file {
+                    std::fs::write(&path, released.markdown)
+                        .map_err(|source| Error::WriteFile { path, source })?;
+                } else {
+                    print!("{}", released.markdown);
+                }
                 Ok(ExitCode::SUCCESS)
             }
             Command::Sync { force } => {
