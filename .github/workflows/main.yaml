@@ -92,6 +92,14 @@ jobs:
             aqua:koalaman/shellcheck
             aqua:rhysd/actionlint
           experimental: true
+      - name: Validate the release notes
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.base-version }}
+        run: >-
+          cargo run --locked --package sacho -- show "$VERSION"
+          --skip-heading --output-file /dev/null
       - name: Check the project
         run: mise check
 
@@ -278,15 +286,18 @@ jobs:
         shell: bash
         env:
           ARCHIVE: ${{ steps.stage.outputs.archive }}
+          BINARY: ${{ matrix.binary }}
           DIST_NAME: ${{ steps.stage.outputs.dist-name }}
-        run: tar --create --xz --file "$ARCHIVE" "$DIST_NAME"
+        run: >-
+          tar --create --xz --file "$ARCHIVE" --directory "$DIST_NAME"
+          "$BINARY" README.md LICENSE
       - name: Create the Windows archive
         if: matrix.os == 'windows'
         shell: pwsh
         env:
           ARCHIVE: ${{ steps.stage.outputs.archive }}
           DIST_NAME: ${{ steps.stage.outputs.dist-name }}
-        run: Compress-Archive -Path $env:DIST_NAME -DestinationPath $env:ARCHIVE
+        run: Compress-Archive -Path "$env:DIST_NAME/*" -DestinationPath $env:ARCHIVE
       - name: Upload the distribution
         uses: actions/upload-artifact@v7
         with:
@@ -294,6 +305,67 @@ jobs:
           path: ${{ steps.stage.outputs.archive }}
           if-no-files-found: error
           compression-level: 0
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [version, dist]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Download the distributions
+        uses: actions/download-artifact@v8
+        with:
+          path: dists
+          merge-multiple: true
+      - name: Extract the release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="dists/sacho-${VERSION}-linux-amd64.tar.xz"
+          mkdir release-notes-bin
+          tar --extract --xz --file "$archive" --directory release-notes-bin
+          release-notes-bin/sacho \
+            show "$VERSION" --skip-heading --output-file release-notes.md
+      - name: Publish the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_state="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --json isDraft \
+              --jq 'if .isDraft then "draft" else "published" end' \
+              2>/dev/null || true
+          )"
+          if [[ "$release_state" == "published" ]]; then
+            echo "GitHub Release $GITHUB_REF_NAME is already published." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$release_state" == "draft" ]]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "Sacho $VERSION" \
+              --notes-file release-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --verify-tag \
+              --title "Sacho $VERSION" \
+              --notes-file release-notes.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" dists/* --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false
 
   publish:
     name: Publish to crates.io
