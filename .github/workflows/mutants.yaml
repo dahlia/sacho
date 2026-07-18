@@ -9,6 +9,7 @@ permissions:
   contents: read
 
 env:
+  MISE_AUTO_INSTALL: "0"
   MISE_NO_HOOKS: "1"
 
 jobs:
