@@ -9,10 +9,11 @@ use jiff::{Timestamp, civil};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
-    InitOptions, InitResult, NextOptions, ReleaseDate, ReleaseOptions, SyncOptions, SyncPlan,
-    add_fragment, apply_format, apply_merge_driver, apply_release, apply_sync, carry, check,
-    commit_message_hook, compile_unreleased, init_repository, mercurial_update_hook, plan_format,
-    plan_release, plan_sync, reference_transaction_hook, set_next_version,
+    InitOptions, InitResult, MutationCleanupWarning, NextOptions, ReleaseDate, ReleaseOptions,
+    SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver, apply_release,
+    apply_sync, carry, check, commit_message_hook, compile_unreleased, init_repository,
+    mercurial_update_hook, plan_format, plan_release, plan_sync, reference_transaction_hook,
+    set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
@@ -182,6 +183,7 @@ impl Cli {
             Command::Next { version } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let result = set_next_version(&repo, NextOptions { version })?;
+                print_mutation_cleanup_warnings("sacho next", &result.cleanup_warnings);
                 println!("{}", result.path.display());
                 Ok(ExitCode::SUCCESS)
             }
@@ -192,7 +194,8 @@ impl Cli {
                     if !confirm_sync_plan(&prepared.sync, Some("sacho check --fix"))? {
                         return Ok(ExitCode::from(2));
                     }
-                    apply_format(&repo, prepared)?;
+                    let result = apply_format(&repo, prepared)?;
+                    print_mutation_cleanup_warnings("sacho check --fix", &result.cleanup_warnings);
                 }
                 let report = check(
                     &repo,
@@ -210,7 +213,8 @@ impl Cli {
                 if !confirm_sync_plan(&plan.sync, Some("sacho fmt"))? {
                     return Ok(ExitCode::from(2));
                 }
-                apply_format(&repo, plan)?;
+                let result = apply_format(&repo, plan)?;
+                print_mutation_cleanup_warnings("sacho fmt", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
             Command::Preview { section } => {
@@ -254,7 +258,8 @@ impl Cli {
             }
             Command::Carry { version } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                carry(&repo, CarryOptions { version })?;
+                let result = carry(&repo, CarryOptions { version })?;
+                print_mutation_cleanup_warnings("sacho carry", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
             Command::MergeDriver {
@@ -302,6 +307,16 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
         }
+    }
+}
+
+fn print_mutation_cleanup_warnings(command: &str, warnings: &[MutationCleanupWarning]) {
+    for warning in warnings {
+        eprintln!(
+            "warning: `{command}` committed successfully, but transaction cleanup failed for {}: {}",
+            warning.path.display(),
+            warning.message,
+        );
     }
 }
 

@@ -53,6 +53,11 @@ pub(crate) struct PreparedAtomicWrite {
 }
 
 impl PreparedAtomicWrite {
+    /// Transfers ownership of directories created while preparing the write.
+    pub(crate) fn take_created_directories(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.created_directories)
+    }
+
     /// Replaces the destination with the prepared file.
     pub(crate) fn commit(mut self) -> std::io::Result<()> {
         replace_file(&self.temporary, &self.destination)?;
@@ -710,7 +715,7 @@ impl PathValidationCache {
             .collect()
     }
 
-    fn filesystem_path_case_sensitive(&mut self, path: &Path) -> std::io::Result<bool> {
+    pub(crate) fn filesystem_path_case_sensitive(&mut self, path: &Path) -> std::io::Result<bool> {
         let directory = path
             .ancestors()
             .find(|ancestor| ancestor.is_dir())

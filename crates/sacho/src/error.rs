@@ -3,6 +3,29 @@ use std::path::PathBuf;
 use crate::changelog::ChangelogError;
 use snafu::Snafu;
 
+/// Built-in command whose multi-file repository mutation is transactional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationCommand {
+    /// The `next` command.
+    Next,
+
+    /// The `fmt` command.
+    Format,
+
+    /// The `carry` command.
+    Carry,
+}
+
+impl std::fmt::Display for MutationCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Next => "next",
+            Self::Format => "fmt",
+            Self::Carry => "carry",
+        })
+    }
+}
+
 /// Result type returned by Sacho library APIs.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -216,54 +239,76 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// A formatting plan no longer matches a file it was built from.
+    /// A transactional mutation no longer matches a file it was planned from.
     #[snafu(display(
-        "refusing to apply stale formatting plan because {} changed after planning; plan the formatting again",
+        "refusing to apply stale {command} mutation because {} changed after planning; run the command again",
         path.display()
     ))]
-    StaleFormatPlan {
+    StaleMutationPlan {
+        /// Command whose planned inputs became stale.
+        command: MutationCommand,
+
         /// Path whose current state differs from the planned state.
         path: PathBuf,
     },
 
-    /// The platform cannot provide the no-replace move required by formatting
-    /// transactions.
+    /// Two transactional mutation entries resolve to overlapping filesystem paths.
     #[snafu(display(
-        "formatting transactions are unsupported because this platform has no atomic no-replace move"
+        "{command} mutation paths {} and {} overlap in the filesystem",
+        first.display(),
+        second.display()
     ))]
-    FormatTransactionUnsupported,
+    MutationPathOverlap {
+        /// Command whose participants overlap.
+        command: MutationCommand,
 
-    /// Rollback found that another writer changed an applied formatting path.
+        /// First conflicting repository-relative path.
+        first: PathBuf,
+
+        /// Second conflicting repository-relative path.
+        second: PathBuf,
+    },
+
+    /// The platform cannot provide the no-replace move required by a mutation.
     #[snafu(display(
-        "refusing to roll back {} because it changed after formatting wrote it",
+        "{command} transactions are unsupported because this platform has no atomic no-replace move"
+    ))]
+    MutationTransactionUnsupported {
+        /// Command that requires the unsupported transaction primitive.
+        command: MutationCommand,
+    },
+
+    /// Rollback found that another writer changed an applied mutation path.
+    #[snafu(display(
+        "refusing to roll back {} because it changed after {command} wrote it",
         path.display()
     ))]
-    FormatRollbackConflict {
+    MutationRollbackConflict {
+        /// Command whose rollback encountered the conflict.
+        command: MutationCommand,
+
         /// Path whose concurrent state was preserved.
         path: PathBuf,
     },
 
-    /// Applying formatting failed and one or more prior writes could not be restored.
+    /// Applying a transactional mutation failed, possibly followed by rollback failures.
     #[snafu(display(
-        "format apply failed: {cause}; rollback also failed: {}",
-        rollback_failures.join("; ")
+        "{command} apply failed: {cause}{rollback_summary}",
+        rollback_summary = if rollback_failures.is_empty() {
+            String::from("; all applied changes were rolled back")
+        } else {
+            format!("; rollback also failed: {}", rollback_failures.join("; "))
+        }
     ))]
-    FormatApply {
+    MutationApply {
+        /// Command whose apply phase failed.
+        command: MutationCommand,
+
         /// Original apply failure.
         cause: String,
 
         /// Failures encountered while restoring already-applied changes.
         rollback_failures: Vec<String>,
-    },
-
-    /// Formatting committed, but removing retained transaction claims failed.
-    #[snafu(display(
-        "formatting committed, but transaction cleanup failed: {}",
-        failures.join("; ")
-    ))]
-    FormatCleanup {
-        /// Failures encountered while deleting committed claim files.
-        failures: Vec<String>,
     },
 
     /// A release plan no longer matches a file it was built from.

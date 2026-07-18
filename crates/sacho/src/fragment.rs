@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
@@ -223,8 +224,7 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
         }
     }
 
-    candidates
-        .sort_by(|(left, _), (right, _)| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    candidates.sort_by(|(left, _), (right, _)| compare_fragment_paths(left, right));
 
     let candidates = candidates
         .into_iter()
@@ -239,6 +239,10 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
         candidates,
         warnings,
     })
+}
+
+pub(crate) fn compare_fragment_paths(left: &Path, right: &Path) -> Ordering {
+    left.to_string_lossy().cmp(&right.to_string_lossy())
 }
 
 /// Parses one fragment from source text.

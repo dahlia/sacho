@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -18,9 +19,10 @@ use similar::TextDiff;
 use crate::changelog::{BEGIN_MARKER, ChangelogError, END_MARKER, replace_unreleased_region};
 use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
 use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
-use crate::error::{Error, Result};
+use crate::error::{Error, MutationCommand, Result};
 use crate::fragment::{
-    DiscoveryWarning, Fragment, FragmentWarning, discover_fragment_candidates, parse_fragment,
+    DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
+    discover_fragment_candidates, parse_fragment,
 };
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::carry_release;
@@ -119,6 +121,12 @@ pub struct NextOptions {
 pub struct NextResult {
     /// Path of the next-version file that was written.
     pub path: PathBuf,
+
+    /// Synchronization result when materialization is enabled.
+    pub sync: Option<SyncResult>,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
 }
 
 /// Options for formatting fragments.
@@ -130,6 +138,23 @@ pub struct FormatOptions;
 pub struct FormatResult {
     /// Fragment paths whose contents changed.
     pub changed: Vec<PathBuf>,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
+}
+
+/// Warning emitted after a repository mutation committed successfully.
+///
+/// The repository already contains the complete final state when this warning
+/// is returned.  It describes a retained private claim that could not be
+/// removed and may require manual cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationCleanupWarning {
+    /// Repository-relative participant associated with the retained claim.
+    pub path: PathBuf,
+
+    /// Cleanup failure, including the private path retained for recovery.
+    pub message: String,
 }
 
 /// Planned fragment formatting and materialized changelog synchronization.
@@ -167,6 +192,19 @@ struct FormatFragmentSnapshot {
 struct FormatFileSnapshot {
     path: PathBuf,
     contents: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryMutationPlan {
+    command: MutationCommand,
+    participants: Vec<ReleaseFileChange>,
+    fragment_paths_before: Vec<PathBuf>,
+    fragment_paths_after: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RepositoryMutationOutcome {
+    cleanup_warnings: Vec<MutationCleanupWarning>,
 }
 
 /// Options for planning a changelog synchronization.
@@ -279,6 +317,19 @@ pub enum ReleaseFileState {
 
     /// The path is a regular UTF-8 file with these exact contents.
     Present(String),
+
+    /// The path is a regular non-UTF-8 file with these exact bytes.
+    Raw(Vec<u8>),
+}
+
+impl ReleaseFileState {
+    fn contents(&self) -> Option<&[u8]> {
+        match self {
+            Self::Missing => None,
+            Self::Present(contents) => Some(contents.as_bytes()),
+            Self::Raw(contents) => Some(contents),
+        }
+    }
 }
 
 /// Before and after state of a file changed by a release.
@@ -302,6 +353,13 @@ pub struct ReleaseFragment {
 
     /// Exact contents observed while planning.
     pub contents: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseFragmentSource {
+    path: PathBuf,
+    contents: Vec<u8>,
+    section: Option<String>,
 }
 
 /// Calendar date used for a release.
@@ -399,6 +457,9 @@ pub struct CarryResult {
 
     /// Synchronization result when materialization is enabled.
     pub sync: Option<SyncResult>,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
 }
 
 /// Options for running repository checks.
@@ -751,21 +812,116 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
     Ok(AddResult { path, sync })
 }
 
-/// Sets the next unreleased version.
+/// Sets the next unreleased version and synchronizes materialized output.
+///
+/// The next-version file, every fragment snapshot, and the changelog form one
+/// transaction.  An error returned after applying begins includes any rollback
+/// failures; otherwise every applied participant was restored.  Cleanup that
+/// fails only after commit is reported through [`NextResult::cleanup_warnings`].
 pub fn set_next_version(repo: &Repository, options: NextOptions) -> Result<NextResult> {
     let version = options.version.trim();
     if version.is_empty() {
         return Err(Error::EmptyNextVersion);
     }
     let _lock = acquire_mutation_lock(repo)?;
-    ensure_materialized_current_before_mutation(repo)?;
-    let path = next_version_path(repo);
-    repo.atomic_write(&path, format!("{version}\n").as_bytes())?;
-    let _sync = sync_after_mutation(repo)?;
-    Ok(NextResult { path })
+    let (plan, path, sync) = plan_next_mutation(repo, version)?;
+    let outcome = apply_repository_mutation(repo, &plan)?;
+    Ok(NextResult {
+        path,
+        sync,
+        cleanup_warnings: outcome.cleanup_warnings,
+    })
 }
 
-/// Formats all changelog fragments into normal form.
+fn plan_next_mutation(
+    repo: &Repository,
+    version: &str,
+) -> Result<(RepositoryMutationPlan, PathBuf, Option<SyncResult>)> {
+    let next_path = next_version_path(repo);
+    let next_contents = format!("{version}\n");
+    let next_label = version_label_from_contents(&repo.resolve(&next_path), Some(&next_contents))?;
+    let fragment_sources = snapshot_release_fragment_sources(repo)?;
+    let fragment_paths = fragment_sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    let next_before = read_release_file_state(repo, &next_path)?;
+    let next_after = ReleaseFileState::Present(next_contents);
+    let mut participants = vec![ReleaseFileChange {
+        path: next_path.clone(),
+        before: next_before.clone(),
+        after: next_after,
+    }];
+    participants.extend(fragment_sources.iter().map(|source| {
+        let state = release_file_state_from_bytes(source.contents.clone());
+        ReleaseFileChange {
+            path: source.path.clone(),
+            before: state.clone(),
+            after: state,
+        }
+    }));
+
+    let sync = if repo.config().changelog.materialize {
+        let parsed = parse_release_fragment_sources(repo, &fragment_sources)?;
+        let next_contents = release_file_state_utf8(repo, &next_path, &next_before)?;
+        let before_label = version_label_from_contents(&repo.resolve(&next_path), next_contents)?;
+        let compiled_before = compile_parsed_fragments(
+            repo,
+            CompileOptions::default(),
+            before_label,
+            parsed.clone(),
+        )?;
+        let changelog_path = repo.config().changelog.path.clone();
+        let changelog_before = read_release_file_state(repo, &changelog_path)?;
+        if matches!(changelog_before, ReleaseFileState::Missing) {
+            return Err(Error::ReadFile {
+                path: repo.resolve(&changelog_path),
+                source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+            });
+        }
+        ensure_materialized_release_snapshot_current(
+            repo,
+            &changelog_path,
+            &changelog_before,
+            &compiled_before.markdown,
+        )?;
+        let compiled_after =
+            compile_parsed_fragments(repo, CompileOptions::default(), next_label, parsed)?;
+        let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
+            .expect("materialized next planning requires an existing changelog");
+        let replacement = replace_unreleased_region(
+            old_changelog,
+            &compiled_after.markdown,
+            repo.config().changelog.region_detection,
+            &repo.config().changelog.unreleased_heading,
+        )
+        .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+        let changed = replacement.new_contents != *old_changelog;
+        participants.push(ReleaseFileChange {
+            path: changelog_path,
+            before: changelog_before,
+            after: ReleaseFileState::Present(replacement.new_contents),
+        });
+        Some(SyncResult { changed })
+    } else {
+        None
+    };
+
+    Ok((
+        RepositoryMutationPlan {
+            command: MutationCommand::Next,
+            participants,
+            fragment_paths_before: fragment_paths.clone(),
+            fragment_paths_after: fragment_paths,
+        },
+        next_path,
+        sync,
+    ))
+}
+
+/// Formats all changelog fragments into normal form as one transaction.
+///
+/// See [`apply_format`] for the rollback and committed-cleanup guarantees.
 pub fn format_fragments(repo: &Repository, options: FormatOptions) -> Result<FormatResult> {
     let plan = plan_format(repo, options)?;
     if matches!(plan.sync, SyncPlan::NeedsConfirmation { .. }) {
@@ -815,7 +971,10 @@ pub fn plan_format(repo: &Repository, _options: FormatOptions) -> Result<FormatP
         parsed.push(fragment);
     }
 
-    let formatting = FormatResult { changed };
+    let formatting = FormatResult {
+        changed,
+        cleanup_warnings: Vec::new(),
+    };
     if !repo.config().changelog.materialize {
         return Ok(FormatPlan {
             formatting,
@@ -859,223 +1018,66 @@ pub fn plan_format(repo: &Repository, _options: FormatOptions) -> Result<FormatP
 /// The complete fragment set, next-version file, and materialized changelog are
 /// revalidated under the repository mutation lock before the first write.  All
 /// replacements use atomic conditional claims, and an apply failure rolls back
-/// replacements that were already installed.
+/// replacements that were already installed.  Concurrent edits encountered
+/// during rollback are preserved and included in the returned error.  Once all
+/// participants have committed, claim-removal failures are returned as
+/// [`FormatResult::cleanup_warnings`] instead of turning success into an error.
 pub fn apply_format(repo: &Repository, plan: FormatPlan) -> Result<FormatResult> {
     let _lock = acquire_mutation_lock(repo)?;
-    validate_format_plan(repo, &plan)?;
-    let changes = format_file_changes(&plan);
-    let participant_identities = changes
-        .iter()
-        .map(|change| release_path_identity(repo, &change.path))
-        .collect::<Result<Vec<_>>>()?;
-    let paths = changes
-        .iter()
-        .map(|change| change.path.as_path())
-        .collect::<Vec<_>>();
-    probe_transaction_move_support(repo, &paths, &participant_identities)
-        .map_err(format_transaction_error)?;
-    let prepared = changes
-        .iter()
-        .map(|change| prepare_format_change(repo, change))
-        .collect::<Result<Vec<_>>>()?;
-    let mut applied = Vec::with_capacity(changes.len());
-    for (change, prepared) in changes.iter().zip(prepared) {
-        let outcome = match apply_format_change(repo, change, prepared) {
-            Ok(outcome) => outcome,
-            Err(error) => return Err(rollback_format(repo, error, applied)),
-        };
-        applied.push(AppliedReleaseChange {
-            path: change.path.clone(),
-            before: change.before.clone(),
-            after: change.after.clone(),
-            original: outcome.original,
-            created_directories: outcome.created_directories,
-        });
-    }
-    if let Err(failure) = commit_format_claims(repo, &mut applied, &plan) {
-        return Err(match failure {
-            FormatClaimCommitFailure::BeforeCommit(error) => rollback_format(repo, error, applied),
-            FormatClaimCommitFailure::AfterCommit(failures) => Error::FormatCleanup { failures },
-        });
-    }
-    Ok(plan.formatting)
+    let mutation = format_mutation_plan(&plan);
+    let outcome = apply_repository_mutation(repo, &mutation)?;
+    let mut result = plan.formatting;
+    result.cleanup_warnings = outcome.cleanup_warnings;
+    Ok(result)
 }
 
-fn format_file_changes(plan: &FormatPlan) -> Vec<ReleaseFileChange> {
-    let mut changes = plan
+fn format_mutation_plan(plan: &FormatPlan) -> RepositoryMutationPlan {
+    let mut participants = plan
         .fragments
         .iter()
-        .filter(|fragment| fragment.before != fragment.after)
         .map(|fragment| ReleaseFileChange {
             path: fragment.path.clone(),
             before: ReleaseFileState::Present(fragment.before.clone()),
             after: ReleaseFileState::Present(fragment.after.clone()),
         })
         .collect::<Vec<_>>();
-    if let Some(pending) = format_sync_pending(&plan.sync)
-        && pending.old_contents != pending.new_contents
-    {
-        changes.push(ReleaseFileChange {
-            path: pending.path.clone(),
-            before: ReleaseFileState::Present(pending.old_contents.clone()),
-            after: ReleaseFileState::Present(pending.new_contents.clone()),
+    if let Some(next_file) = &plan.next_file {
+        let state = release_state_from_optional_contents(next_file.contents.clone());
+        participants.push(ReleaseFileChange {
+            path: next_file.path.clone(),
+            before: state.clone(),
+            after: state,
         });
     }
-    changes
+    if let Some(changelog) = &plan.changelog {
+        let before = release_state_from_optional_contents(changelog.contents.clone());
+        let after = format_sync_pending(&plan.sync).map_or_else(
+            || before.clone(),
+            |pending| ReleaseFileState::Present(pending.new_contents.clone()),
+        );
+        participants.push(ReleaseFileChange {
+            path: changelog.path.clone(),
+            before,
+            after,
+        });
+    }
+    let fragment_paths = plan
+        .fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    RepositoryMutationPlan {
+        command: MutationCommand::Format,
+        participants,
+        fragment_paths_before: fragment_paths.clone(),
+        fragment_paths_after: fragment_paths,
+    }
 }
 
 fn format_sync_pending(sync: &SyncPlan) -> Option<&PendingWrite> {
     match sync {
         SyncPlan::Apply(pending) | SyncPlan::NeedsConfirmation { pending, .. } => Some(pending),
         SyncPlan::Skipped(_) => None,
-    }
-}
-
-fn prepare_format_change(
-    repo: &Repository,
-    change: &ReleaseFileChange,
-) -> Result<PreparedAtomicWrite> {
-    let ReleaseFileState::Present(contents) = &change.after else {
-        unreachable!("format transactions only replace files")
-    };
-    repo.prepare_atomic_write(&change.path, contents.as_bytes())
-}
-
-fn apply_format_change(
-    repo: &Repository,
-    change: &ReleaseFileChange,
-    prepared: PreparedAtomicWrite,
-) -> Result<AppliedReleaseOutcome> {
-    let ReleaseFileState::Present(expected) = &change.before else {
-        unreachable!("format transactions only replace existing files")
-    };
-    #[cfg(test)]
-    inject_format_apply_interference(
-        FormatApplyInterferenceStage::BeforeClaim,
-        repo,
-        &change.path,
-    );
-    let claimed =
-        claim_release_file(repo, &change.path, expected, &[]).map_err(format_transaction_error)?;
-    #[cfg(test)]
-    inject_format_apply_interference(FormatApplyInterferenceStage::AfterClaim, repo, &change.path);
-    match prepared.commit_if_absent() {
-        Ok(()) => Ok(AppliedReleaseOutcome {
-            original: Some(claimed),
-            created_directories: Vec::new(),
-        }),
-        Err(source) if error_has_kind(&source, ErrorKind::AlreadyExists) => {
-            claimed
-                .discard(repo, &change.path)
-                .map_err(claim_discard_error)
-                .map_err(format_transaction_error)?;
-            Err(Error::StaleFormatPlan {
-                path: change.path.clone(),
-            })
-        }
-        Err(source) => {
-            let error = Error::WriteFile {
-                path: repo.resolve(&change.path),
-                source,
-            };
-            Err(format_transaction_error(restore_claim_after_error(
-                claimed,
-                &change.path,
-                error,
-            )))
-        }
-    }
-}
-
-enum FormatClaimCommitFailure {
-    BeforeCommit(Error),
-    AfterCommit(Vec<String>),
-}
-
-fn commit_format_claims(
-    repo: &Repository,
-    applied: &mut [AppliedReleaseChange],
-    plan: &FormatPlan,
-) -> std::result::Result<(), FormatClaimCommitFailure> {
-    for change in applied.iter() {
-        if let Some(original) = &change.original {
-            original
-                .preflight_discard(repo, &change.path)
-                .map_err(format_transaction_error)
-                .map_err(FormatClaimCommitFailure::BeforeCommit)?;
-        }
-    }
-    for change in applied.iter() {
-        if let Some(original) = &change.original {
-            original
-                .validate_retained_state(&change.path, &change.before)
-                .map_err(format_transaction_error)
-                .map_err(FormatClaimCommitFailure::BeforeCommit)?;
-        }
-        validate_release_state(repo, &change.path, &change.after)
-            .map_err(format_transaction_error)
-            .map_err(FormatClaimCommitFailure::BeforeCommit)?;
-    }
-    validate_format_committed_state(repo, plan).map_err(FormatClaimCommitFailure::BeforeCommit)?;
-
-    let mut failures = Vec::new();
-    for change in applied.iter_mut() {
-        let Some(original) = change.original.take() else {
-            continue;
-        };
-        if let Err(failure) = original.discard_after_commit(repo, &change.path) {
-            failures.push(format!(
-                "{}: {}",
-                change.path.display(),
-                format_transaction_error(claim_discard_error(failure))
-            ));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(FormatClaimCommitFailure::AfterCommit(failures))
-    }
-}
-
-fn rollback_format(repo: &Repository, error: Error, applied: Vec<AppliedReleaseChange>) -> Error {
-    let error = format_transaction_error(error);
-    let rollback_failures = applied
-        .into_iter()
-        .rev()
-        .filter_map(|change| {
-            rollback_applied_release_change(repo, change)
-                .err()
-                .map(format_transaction_error)
-                .map(|error| error.to_string())
-        })
-        .collect::<Vec<_>>();
-    if rollback_failures.is_empty() {
-        error
-    } else {
-        Error::FormatApply {
-            cause: error.to_string(),
-            rollback_failures,
-        }
-    }
-}
-
-fn format_transaction_error(error: Error) -> Error {
-    match error {
-        Error::StaleReleasePlan { path } | Error::ReleasePathConflict { path } => {
-            Error::StaleFormatPlan { path }
-        }
-        Error::ReleaseRollbackConflict { path } => Error::FormatRollbackConflict { path },
-        Error::ReleaseApply {
-            cause,
-            rollback_failures,
-        } => Error::FormatApply {
-            cause,
-            rollback_failures,
-        },
-        Error::ReleaseCleanup { failures } => Error::FormatCleanup { failures },
-        Error::ReleaseTransactionUnsupported => Error::FormatTransactionUnsupported,
-        error => error,
     }
 }
 
@@ -1095,159 +1097,6 @@ fn read_format_file_snapshot(repo: &Repository, path: &Path) -> Result<FormatFil
         path: path.to_path_buf(),
         contents,
     })
-}
-
-fn validate_format_plan(repo: &Repository, plan: &FormatPlan) -> Result<()> {
-    validate_format_fragment_paths(repo, plan)?;
-    for fragment in &plan.fragments {
-        validate_format_file_contents(repo, &fragment.path, Some(&fragment.before))?;
-    }
-    validate_format_plan_inputs(repo, plan)
-}
-
-fn validate_format_committed_state(repo: &Repository, plan: &FormatPlan) -> Result<()> {
-    validate_format_fragment_paths(repo, plan)?;
-    for fragment in &plan.fragments {
-        validate_format_file_contents(repo, &fragment.path, Some(&fragment.after))?;
-    }
-    if let Some(next_file) = &plan.next_file {
-        validate_format_file_contents(repo, &next_file.path, next_file.contents.as_deref())?;
-    }
-    if let Some(changelog) = &plan.changelog {
-        let expected = format_sync_pending(&plan.sync)
-            .map(|pending| pending.new_contents.as_str())
-            .or(changelog.contents.as_deref());
-        validate_format_file_contents(repo, &changelog.path, expected)?;
-    }
-    Ok(())
-}
-
-fn validate_format_fragment_paths(repo: &Repository, plan: &FormatPlan) -> Result<()> {
-    let expected_paths = plan
-        .fragments
-        .iter()
-        .map(|fragment| fragment.path.clone())
-        .collect::<Vec<_>>();
-    let current_paths = discover_fragment_candidates(repo)?
-        .candidates
-        .into_iter()
-        .map(|candidate| candidate.relative_path)
-        .collect::<Vec<_>>();
-    if let Some(path) = differing_fragment_path(&expected_paths, &current_paths) {
-        return Err(Error::StaleFormatPlan { path });
-    }
-    Ok(())
-}
-
-fn validate_format_plan_inputs(repo: &Repository, plan: &FormatPlan) -> Result<()> {
-    if let Some(next_file) = &plan.next_file {
-        validate_format_file_contents(repo, &next_file.path, next_file.contents.as_deref())?;
-    }
-    if let Some(changelog) = &plan.changelog {
-        validate_format_file_contents(repo, &changelog.path, changelog.contents.as_deref())?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-thread_local! {
-    static FORMAT_APPLY_INTERFERENCES: std::cell::RefCell<Vec<(FormatApplyInterferenceStage, PathBuf, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FormatApplyInterferenceStage {
-    BeforeClaim,
-    AfterClaim,
-}
-
-#[cfg(test)]
-fn set_format_apply_interference(path: impl Into<PathBuf>, contents: impl Into<String>) {
-    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
-        interferences.borrow_mut().push((
-            FormatApplyInterferenceStage::BeforeClaim,
-            path.into(),
-            contents.into(),
-        ));
-    });
-}
-
-#[cfg(test)]
-fn set_format_apply_interference_after_claim(
-    path: impl Into<PathBuf>,
-    contents: impl Into<String>,
-) {
-    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
-        interferences.borrow_mut().push((
-            FormatApplyInterferenceStage::AfterClaim,
-            path.into(),
-            contents.into(),
-        ));
-    });
-}
-
-#[cfg(test)]
-fn inject_format_apply_interference(
-    stage: FormatApplyInterferenceStage,
-    repo: &Repository,
-    path: &Path,
-) {
-    FORMAT_APPLY_INTERFERENCES.with(|interferences| {
-        let mut interferences = interferences.borrow_mut();
-        if let Some(index) = interferences
-            .iter()
-            .position(|(expected_stage, expected, _)| *expected_stage == stage && expected == path)
-        {
-            let (_, _, contents) = interferences.remove(index);
-            fs::write(repo.resolve(path), contents).expect("inject concurrent format edit");
-        }
-    });
-}
-
-#[cfg(test)]
-fn clear_format_apply_interference() {
-    FORMAT_APPLY_INTERFERENCES.with(|interferences| interferences.borrow_mut().clear());
-}
-
-fn validate_format_file_contents(
-    repo: &Repository,
-    path: &Path,
-    expected: Option<&str>,
-) -> Result<()> {
-    let absolute = repo.resolve(path);
-    match expected {
-        Some(expected) => match fs::read(&absolute) {
-            Ok(contents) if contents == expected.as_bytes() => Ok(()),
-            Ok(_) => Err(Error::StaleFormatPlan {
-                path: path.to_path_buf(),
-            }),
-            Err(source)
-                if matches!(
-                    source.kind(),
-                    ErrorKind::NotFound | ErrorKind::IsADirectory | ErrorKind::InvalidData
-                ) =>
-            {
-                Err(Error::StaleFormatPlan {
-                    path: path.to_path_buf(),
-                })
-            }
-            Err(source) => Err(Error::ReadFile {
-                path: absolute,
-                source,
-            }),
-        },
-        None => match fs::symlink_metadata(&absolute) {
-            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-            Ok(_) => Err(Error::StaleFormatPlan {
-                path: path.to_path_buf(),
-            }),
-            Err(source) => Err(Error::ReadFile {
-                path: absolute,
-                source,
-            }),
-        },
-    }
 }
 
 /// Compiles the current fragments into an unreleased changelog region.
@@ -1408,10 +1257,11 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
     }
     let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
     let next = options.next.map(|next| next.trim().to_owned());
-    let old_changelog = match &changelog_before {
-        ReleaseFileState::Present(contents) => contents.clone(),
-        ReleaseFileState::Missing => initial_changelog(&repo.config().changelog.title),
-    };
+    let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
+        .map_or_else(
+            || initial_changelog(&repo.config().changelog.title),
+            ToOwned::to_owned,
+        );
     let new_changelog = if repo.config().changelog.materialize {
         let empty_unreleased = empty_unreleased_markdown(repo, next.as_deref());
         replace_region_for_release(
@@ -1462,9 +1312,8 @@ fn ensure_materialized_release_snapshot_current(
     if !repo.config().changelog.materialize {
         return Ok(());
     }
-    let ReleaseFileState::Present(contents) = changelog else {
-        unreachable!("materialized release planning rejects a missing changelog");
-    };
+    let contents = release_file_state_utf8(repo, changelog_path, changelog)?
+        .expect("materialized release planning rejects a missing changelog");
     let replacement = replace_unreleased_region(
         contents,
         compiled_markdown,
@@ -1568,18 +1417,39 @@ pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResu
 }
 
 /// Carries entries from an existing release into unreleased fragments.
+///
+/// All carried fragments and materialized output are committed together.  An
+/// apply error restores earlier writes in reverse order without overwriting a
+/// concurrent edit; failures after commit are returned through
+/// [`CarryResult::cleanup_warnings`].
 pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     let _lock = acquire_mutation_lock(repo)?;
-    ensure_materialized_current_before_mutation(repo)?;
+    let (plan, written_fragments, sync) = plan_carry_mutation(repo, &options.version)?;
+    let outcome = apply_repository_mutation(repo, &plan)?;
+    Ok(CarryResult {
+        written_fragments,
+        sync,
+        cleanup_warnings: outcome.cleanup_warnings,
+    })
+}
 
+fn plan_carry_mutation(
+    repo: &Repository,
+    version: &str,
+) -> Result<(RepositoryMutationPlan, Vec<PathBuf>, Option<SyncResult>)> {
     let changelog_path = repo.config().changelog.path.clone();
+    let changelog_before = read_release_file_state(repo, &changelog_path)?;
     let changelog =
-        fs::read_to_string(repo.resolve(&changelog_path)).map_err(|source| Error::ReadFile {
-            path: repo.resolve(&changelog_path),
-            source,
+        release_file_state_utf8(repo, &changelog_path, &changelog_before)?.ok_or_else(|| {
+            Error::ReadFile {
+                path: repo.resolve(&changelog_path),
+                source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+            }
         })?;
-    let carried = carry_release(repo, &changelog, &options.version)?;
-    for fragment in &carried.fragments {
+    let mut carried = carry_release(repo, changelog, version)?;
+    for fragment in &mut carried.fragments {
+        fragment.markdown = format_fragment_source(&fragment.markdown)
+            .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
         parse_fragment(
             fragment.path.clone(),
             &fragment.markdown,
@@ -1591,24 +1461,122 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
             source,
         })?;
     }
-
-    let mut written_fragments = Vec::new();
-    for fragment in carried.fragments {
-        repo.atomic_write(&fragment.path, fragment.markdown.as_bytes())?;
-        written_fragments.push(fragment.path);
+    let written_fragments = carried
+        .fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    let before_sources = snapshot_release_fragment_sources(repo)?;
+    let parsed_before = repo
+        .config()
+        .changelog
+        .materialize
+        .then(|| parse_release_fragment_sources(repo, &before_sources))
+        .transpose()?;
+    let mut after_sources = before_sources.clone();
+    for carried_fragment in &carried.fragments {
+        if let Some(existing) = after_sources
+            .iter_mut()
+            .find(|source| source.path == carried_fragment.path)
+        {
+            existing.contents = carried_fragment.markdown.as_bytes().to_vec();
+            existing.section.clone_from(&carried_fragment.section);
+        } else {
+            after_sources.push(ReleaseFragmentSource {
+                path: carried_fragment.path.clone(),
+                contents: carried_fragment.markdown.as_bytes().to_vec(),
+                section: carried_fragment.section.clone(),
+            });
+        }
     }
+    after_sources.sort_by(|left, right| compare_fragment_paths(&left.path, &right.path));
+    let parsed_after = repo
+        .config()
+        .changelog
+        .materialize
+        .then(|| parse_release_fragment_sources(repo, &after_sources))
+        .transpose()?;
+    let next_path = next_version_path(repo);
+    let next_state = read_release_file_state(repo, &next_path)?;
+    let mut participants = Vec::with_capacity(after_sources.len() + 2);
+    for source in &after_sources {
+        let before = before_sources
+            .iter()
+            .find(|before| before.path == source.path)
+            .map_or(ReleaseFileState::Missing, |before| {
+                release_file_state_from_bytes(before.contents.clone())
+            });
+        participants.push(ReleaseFileChange {
+            path: source.path.clone(),
+            before,
+            after: release_file_state_from_bytes(source.contents.clone()),
+        });
+    }
+    participants.push(ReleaseFileChange {
+        path: next_path.clone(),
+        before: next_state.clone(),
+        after: next_state.clone(),
+    });
 
-    let sync = if repo.config().changelog.materialize {
-        let plan = plan_sync_unlocked(repo, SyncOptions { force: true })?;
-        Some(apply_sync_unlocked(repo, plan)?)
+    let changelog_after = if repo.config().changelog.materialize {
+        let next_contents = release_file_state_utf8(repo, &next_path, &next_state)?;
+        let version_label = version_label_from_contents(&repo.resolve(&next_path), next_contents)?;
+        let compiled_before = compile_parsed_fragments(
+            repo,
+            CompileOptions::default(),
+            version_label.clone(),
+            parsed_before.expect("materialized carry parses the previous fragment snapshot"),
+        )?;
+        ensure_materialized_release_snapshot_current(
+            repo,
+            &changelog_path,
+            &changelog_before,
+            &compiled_before.markdown,
+        )?;
+        let compiled_after = compile_parsed_fragments(
+            repo,
+            CompileOptions::default(),
+            version_label,
+            parsed_after.expect("materialized carry parses the resulting fragment snapshot"),
+        )?;
+        let replacement = replace_unreleased_region(
+            changelog,
+            &compiled_after.markdown,
+            repo.config().changelog.region_detection,
+            &repo.config().changelog.unreleased_heading,
+        )
+        .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+        ReleaseFileState::Present(replacement.new_contents)
     } else {
-        None
+        changelog_before.clone()
     };
+    let sync = repo.config().changelog.materialize.then(|| SyncResult {
+        changed: changelog_after != changelog_before,
+    });
+    participants.push(ReleaseFileChange {
+        path: changelog_path,
+        before: changelog_before,
+        after: changelog_after,
+    });
 
-    Ok(CarryResult {
+    let before_paths = before_sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    let after_paths = after_sources
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<Vec<_>>();
+    Ok((
+        RepositoryMutationPlan {
+            command: MutationCommand::Carry,
+            participants,
+            fragment_paths_before: before_paths,
+            fragment_paths_after: after_paths,
+        },
         written_fragments,
         sync,
-    })
+    ))
 }
 
 /// Runs the changelog merge driver and writes its result to the current-side file.
@@ -1650,14 +1618,21 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
                 path: repo.config().changelog.path.clone(),
             });
         }
-        apply_format(repo, prepared)?;
-        return check(
+        let formatting = apply_format(repo, prepared)?;
+        let mut report = check(
             repo,
             CheckOptions {
                 fix: false,
                 ..options
             },
+        )?;
+        report.warnings.extend(
+            formatting
+                .cleanup_warnings
+                .into_iter()
+                .map(check_fix_cleanup_warning),
         );
+        return Ok(report);
     }
 
     let discovered = discover_fragment_candidates(repo)?;
@@ -2453,12 +2428,34 @@ fn read_release_file_state(repo: &Repository, path: &Path) -> Result<ReleaseFile
     if !metadata.file_type().is_file() {
         return Err(Error::ReleasePathConflict { path: absolute });
     }
-    fs::read_to_string(&absolute)
-        .map(ReleaseFileState::Present)
+    fs::read(&absolute)
+        .map(release_file_state_from_bytes)
         .map_err(|source| Error::ReadFile {
             path: absolute,
             source,
         })
+}
+
+fn release_file_state_from_bytes(contents: Vec<u8>) -> ReleaseFileState {
+    match String::from_utf8(contents) {
+        Ok(contents) => ReleaseFileState::Present(contents),
+        Err(error) => ReleaseFileState::Raw(error.into_bytes()),
+    }
+}
+
+fn release_file_state_utf8<'a>(
+    repo: &Repository,
+    path: &Path,
+    state: &'a ReleaseFileState,
+) -> Result<Option<&'a str>> {
+    match state {
+        ReleaseFileState::Missing => Ok(None),
+        ReleaseFileState::Present(contents) => Ok(Some(contents)),
+        ReleaseFileState::Raw(_) => Err(Error::ReadFile {
+            path: repo.resolve(path),
+            source: std::io::Error::new(ErrorKind::InvalidData, "file is not valid UTF-8"),
+        }),
+    }
 }
 
 fn release_next_version(
@@ -2466,7 +2463,7 @@ fn release_next_version(
     path: &Path,
     state: &ReleaseFileState,
 ) -> Result<Option<String>> {
-    let ReleaseFileState::Present(contents) = state else {
+    let Some(contents) = release_file_state_utf8(repo, path, state)? else {
         return Ok(None);
     };
     let values = contents
@@ -2484,34 +2481,72 @@ fn release_next_version(
 }
 
 fn snapshot_release_fragments(repo: &Repository) -> Result<(Vec<ReleaseFragment>, Vec<Fragment>)> {
+    let sources = snapshot_release_fragment_sources(repo)?;
+    let parsed = parse_release_fragment_sources(repo, &sources)?;
+    let snapshots = sources
+        .into_iter()
+        .map(|source| {
+            let contents = String::from_utf8(source.contents).map_err(|error| Error::ReadFile {
+                path: repo.resolve(&source.path),
+                source: std::io::Error::new(ErrorKind::InvalidData, error),
+            })?;
+            Ok(ReleaseFragment {
+                path: source.path,
+                contents,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((snapshots, parsed))
+}
+
+fn snapshot_release_fragment_sources(repo: &Repository) -> Result<Vec<ReleaseFragmentSource>> {
     let candidates = discover_fragment_candidates(repo)?.candidates;
-    let mut snapshots = Vec::with_capacity(candidates.len());
-    let mut parsed = Vec::with_capacity(candidates.len());
+    let mut sources = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let state = read_release_file_state(repo, &candidate.relative_path)?;
-        let ReleaseFileState::Present(contents) = state else {
-            return Err(Error::StaleReleasePlan {
-                path: candidate.relative_path,
-            });
+        let contents = match state {
+            ReleaseFileState::Present(contents) => contents.into_bytes(),
+            ReleaseFileState::Raw(contents) => contents,
+            ReleaseFileState::Missing => {
+                return Err(Error::StaleReleasePlan {
+                    path: candidate.relative_path,
+                });
+            }
         };
-        parsed.push(
+        sources.push(ReleaseFragmentSource {
+            path: candidate.relative_path,
+            contents,
+            section: candidate.section,
+        });
+    }
+    Ok(sources)
+}
+
+fn parse_release_fragment_sources(
+    repo: &Repository,
+    sources: &[ReleaseFragmentSource],
+) -> Result<Vec<Fragment>> {
+    sources
+        .iter()
+        .map(|fragment_source| {
+            let contents = std::str::from_utf8(&fragment_source.contents).map_err(|error| {
+                Error::ReadFile {
+                    path: repo.resolve(&fragment_source.path),
+                    source: std::io::Error::new(ErrorKind::InvalidData, error),
+                }
+            })?;
             parse_fragment(
-                candidate.relative_path.clone(),
-                &contents,
-                candidate.section,
+                fragment_source.path.clone(),
+                contents,
+                fragment_source.section.clone(),
                 &repo.config().links,
             )
             .map_err(|source| Error::Fragment {
-                path: candidate.relative_path.clone(),
+                path: fragment_source.path.clone(),
                 source,
-            })?,
-        );
-        snapshots.push(ReleaseFragment {
-            path: candidate.relative_path,
-            contents,
-        });
-    }
-    Ok((snapshots, parsed))
+            })
+        })
+        .collect()
 }
 
 struct MutationLock {
@@ -2904,6 +2939,331 @@ fn differing_fragment_path(planned: &[PathBuf], current: &[PathBuf]) -> Option<P
         .cloned()
 }
 
+fn release_state_from_optional_contents(contents: Option<String>) -> ReleaseFileState {
+    contents.map_or(ReleaseFileState::Missing, ReleaseFileState::Present)
+}
+
+fn apply_repository_mutation(
+    repo: &Repository,
+    plan: &RepositoryMutationPlan,
+) -> Result<RepositoryMutationOutcome> {
+    validate_repository_mutation(repo, plan)?;
+    let participant_identities = validate_distinct_mutation_paths(repo, plan)?;
+    let changed = plan
+        .participants
+        .iter()
+        .enumerate()
+        .filter(|(_, participant)| participant.before != participant.after)
+        .collect::<Vec<_>>();
+    let changed_paths = changed
+        .iter()
+        .map(|(_, participant)| participant.path.as_path())
+        .collect::<Vec<_>>();
+    let changed_identities = changed
+        .iter()
+        .map(|(index, _)| participant_identities[*index].clone())
+        .collect::<Vec<_>>();
+    probe_transaction_move_support(repo, &changed_paths, &changed_identities)
+        .map_err(|error| mutation_transaction_error(plan.command, error))?;
+    let mut prepared = VecDeque::with_capacity(changed.len());
+    for (_, change) in &changed {
+        match prepare_release_change(repo, change, &participant_identities) {
+            Ok(write) => prepared.push_back(write),
+            Err(error) => {
+                discard_prepared_mutation_writes(&mut prepared);
+                return Err(mutation_transaction_error(plan.command, error));
+            }
+        }
+    }
+    let mut applied = Vec::with_capacity(changed.len());
+    for (_, change) in changed {
+        let mut write = prepared
+            .pop_front()
+            .expect("every changed mutation participant has a prepared write");
+        let created_directories = write
+            .as_mut()
+            .map(PreparedAtomicWrite::take_created_directories)
+            .unwrap_or_default();
+        let mut outcome = match apply_release_change(repo, change, write, &participant_identities) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                discard_prepared_mutation_writes(&mut prepared);
+                let cleanup_failures = remove_release_created_directories(created_directories)
+                    .err()
+                    .map(|error| mutation_transaction_error(plan.command, error).to_string())
+                    .into_iter()
+                    .collect();
+                let error = rollback_repository_mutation(repo, plan.command, error, applied);
+                return Err(mutation_apply_error(plan.command, error, cleanup_failures));
+            }
+        };
+        outcome.created_directories.extend(created_directories);
+        applied.push(AppliedReleaseChange {
+            path: change.path.clone(),
+            before: change.before.clone(),
+            after: change.after.clone(),
+            original: outcome.original,
+            created_directories: outcome.created_directories,
+        });
+    }
+    let cleanup_warnings = match commit_repository_mutation(repo, plan, &mut applied) {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            return Err(rollback_repository_mutation(
+                repo,
+                plan.command,
+                error,
+                applied,
+            ));
+        }
+    };
+    Ok(RepositoryMutationOutcome { cleanup_warnings })
+}
+
+fn discard_prepared_mutation_writes(prepared: &mut VecDeque<Option<PreparedAtomicWrite>>) {
+    while let Some(write) = prepared.pop_back() {
+        drop(write);
+    }
+}
+
+fn validate_repository_mutation(repo: &Repository, plan: &RepositoryMutationPlan) -> Result<()> {
+    for participant in &plan.participants {
+        validate_mutation_state(repo, plan.command, &participant.path, &participant.before)?;
+    }
+    validate_mutation_fragment_paths(repo, plan.command, &plan.fragment_paths_before)
+}
+
+fn validate_mutation_state(
+    repo: &Repository,
+    command: MutationCommand,
+    path: &Path,
+    expected: &ReleaseFileState,
+) -> Result<()> {
+    match read_release_file_state(repo, path) {
+        Ok(current) if current == *expected => Ok(()),
+        Ok(_) => Err(Error::StaleMutationPlan {
+            command,
+            path: path.to_path_buf(),
+        }),
+        Err(error) if mutation_state_error_is_stale(&error) => Err(Error::StaleMutationPlan {
+            command,
+            path: path.to_path_buf(),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn mutation_state_error_is_stale(error: &Error) -> bool {
+    match error {
+        Error::ReleasePathConflict { .. } => true,
+        Error::ReadFile { source, .. } => [
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+            ErrorKind::IsADirectory,
+        ]
+        .into_iter()
+        .any(|kind| error_has_kind(source, kind)),
+        _ => false,
+    }
+}
+
+fn validate_mutation_fragment_paths(
+    repo: &Repository,
+    command: MutationCommand,
+    expected: &[PathBuf],
+) -> Result<()> {
+    let current = discover_fragment_candidates(repo)?
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.relative_path)
+        .collect::<Vec<_>>();
+    if let Some(path) = differing_fragment_path(expected, &current) {
+        Err(Error::StaleMutationPlan { command, path })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_distinct_mutation_paths(
+    repo: &Repository,
+    plan: &RepositoryMutationPlan,
+) -> Result<Vec<PathBuf>> {
+    let mut identities = plan
+        .participants
+        .iter()
+        .map(|participant| {
+            Ok((
+                participant.path.clone(),
+                release_path_identity(repo, &participant.path)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let identity_paths = identities
+        .iter()
+        .map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
+    let mut writable_case_sensitivity = Vec::<(PathBuf, bool)>::new();
+    let mut sensitivities = vec![None; identity_paths.len()];
+    for (index, identity) in identity_paths.iter().enumerate() {
+        if plan.participants[index].before != plan.participants[index].after {
+            sensitivities[index] = Some(release_path_case_sensitivity(
+                identity,
+                &identity_paths,
+                &mut writable_case_sensitivity,
+            )?);
+        }
+    }
+    let mut read_only_case_sensitivity = PathValidationCache::default();
+    for (index, identity) in identity_paths.iter().enumerate() {
+        if sensitivities[index].is_none() {
+            sensitivities[index] = Some(
+                read_only_case_sensitivity
+                    .filesystem_path_case_sensitive(identity)
+                    .map_err(|source| Error::ReadFile {
+                        path: identity.clone(),
+                        source,
+                    })?,
+            );
+        }
+    }
+    let sensitivities = sensitivities
+        .into_iter()
+        .map(|case_sensitive| {
+            case_sensitive.expect("every mutation participant has a case-sensitivity result")
+        })
+        .collect::<Vec<_>>();
+    for index in 0..identities.len() {
+        let (path, identity) = &identities[index];
+        if let Some((other, _)) = identities[..index]
+            .iter()
+            .enumerate()
+            .find(|(other_index, (_, other_identity))| {
+                release_paths_overlap(
+                    identity,
+                    other_identity,
+                    release_path_pair_case_sensitive(
+                        sensitivities[index],
+                        sensitivities[*other_index],
+                    ),
+                )
+            })
+            .map(|(_, identity)| identity)
+        {
+            return Err(Error::MutationPathOverlap {
+                command: plan.command,
+                first: other.clone(),
+                second: path.clone(),
+            });
+        }
+    }
+    Ok(identities.drain(..).map(|(_, identity)| identity).collect())
+}
+
+fn commit_repository_mutation(
+    repo: &Repository,
+    plan: &RepositoryMutationPlan,
+    applied: &mut [AppliedReleaseChange],
+) -> Result<Vec<MutationCleanupWarning>> {
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .preflight_discard(repo, &change.path)
+                .map_err(|error| mutation_transaction_error(plan.command, error))?;
+        }
+    }
+    for change in applied.iter() {
+        if let Some(original) = &change.original {
+            original
+                .validate_retained_state(&change.path, &change.before)
+                .map_err(|error| mutation_transaction_error(plan.command, error))?;
+        }
+    }
+    for participant in &plan.participants {
+        validate_mutation_state(repo, plan.command, &participant.path, &participant.after)?;
+    }
+    validate_mutation_fragment_paths(repo, plan.command, &plan.fragment_paths_after)?;
+
+    let mut warnings = Vec::new();
+    for change in applied.iter_mut() {
+        let Some(original) = change.original.take() else {
+            continue;
+        };
+        if let Err(failure) = original.discard_after_commit(repo, &change.path) {
+            warnings.push(MutationCleanupWarning {
+                path: change.path.clone(),
+                message: claim_discard_error(failure).to_string(),
+            });
+        }
+    }
+    Ok(warnings)
+}
+
+fn rollback_repository_mutation(
+    repo: &Repository,
+    command: MutationCommand,
+    error: Error,
+    applied: Vec<AppliedReleaseChange>,
+) -> Error {
+    let error = mutation_transaction_error(command, error);
+    let rollback_failures = applied
+        .into_iter()
+        .rev()
+        .filter_map(|change| {
+            rollback_applied_release_change(repo, change)
+                .err()
+                .map(|error| mutation_transaction_error(command, error).to_string())
+        })
+        .collect::<Vec<_>>();
+    mutation_apply_error(command, error, rollback_failures)
+}
+
+fn mutation_apply_error(
+    command: MutationCommand,
+    error: Error,
+    rollback_failures: Vec<String>,
+) -> Error {
+    match error {
+        Error::MutationApply {
+            command: _,
+            cause,
+            rollback_failures: mut existing_failures,
+        } => {
+            existing_failures.extend(rollback_failures);
+            Error::MutationApply {
+                command,
+                cause,
+                rollback_failures: existing_failures,
+            }
+        }
+        error => Error::MutationApply {
+            command,
+            cause: error.to_string(),
+            rollback_failures,
+        },
+    }
+}
+
+fn mutation_transaction_error(command: MutationCommand, error: Error) -> Error {
+    match error {
+        Error::StaleReleasePlan { path } | Error::ReleasePathConflict { path } => {
+            Error::StaleMutationPlan { command, path }
+        }
+        Error::ReleaseRollbackConflict { path } => {
+            Error::MutationRollbackConflict { command, path }
+        }
+        Error::ReleaseApply {
+            cause,
+            rollback_failures,
+        } => Error::MutationApply {
+            command,
+            cause,
+            rollback_failures,
+        },
+        Error::ReleaseTransactionUnsupported => Error::MutationTransactionUnsupported { command },
+        error => error,
+    }
+}
+
 fn validate_release_state(
     repo: &Repository,
     path: &Path,
@@ -2927,15 +3287,11 @@ fn prepare_release_change(
     if change.before == change.after {
         return Ok(None);
     }
-    match &change.after {
-        ReleaseFileState::Present(contents) => repo
-            .prepare_atomic_write_avoiding(
-                &change.path,
-                contents.as_bytes(),
-                participant_identities,
-            )
+    match change.after.contents() {
+        Some(contents) => repo
+            .prepare_atomic_write_avoiding(&change.path, contents, participant_identities)
             .map(Some),
-        ReleaseFileState::Missing => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -2950,8 +3306,8 @@ fn apply_release_change(
         return Ok(AppliedReleaseOutcome::default());
     }
     release_failpoint(ReleaseApplyStage::Apply, &change.path, repo)?;
-    match &change.before {
-        ReleaseFileState::Present(expected) => {
+    match change.before.contents() {
+        Some(expected) => {
             let claimed = claim_release_file(repo, &change.path, expected, participant_identities)?;
             if let Err(error) =
                 release_failpoint(ReleaseApplyStage::ApplyClaimed, &change.path, repo)
@@ -2960,9 +3316,9 @@ fn apply_release_change(
             }
             match prepared {
                 Some(prepared) => {
-                    let ReleaseFileState::Present(_) = &change.after else {
+                    if change.after.contents().is_none() {
                         unreachable!("a prepared release change always writes a file");
-                    };
+                    }
                     install_over_claimed_file(repo, &change.path, prepared, claimed).map(
                         |original| AppliedReleaseOutcome {
                             original: Some(original),
@@ -2978,7 +3334,7 @@ fn apply_release_change(
                 }),
             }
         }
-        ReleaseFileState::Missing => {
+        None => {
             match prepared {
                 Some(prepared) => install_into_missing_path(repo, &change.path, prepared).map(
                     |created_directories| AppliedReleaseOutcome {
@@ -3007,7 +3363,7 @@ fn remove_release_fragment(
     let claimed = claim_release_file(
         repo,
         &fragment.path,
-        &fragment.contents,
+        fragment.contents.as_bytes(),
         participant_identities,
     )?;
     if let Err(error) = release_failpoint(ReleaseApplyStage::ApplyClaimed, &fragment.path, repo) {
@@ -3042,22 +3398,19 @@ impl ClaimedReleaseFile {
     }
 
     fn validate_retained_state(&self, path: &Path, expected: &ReleaseFileState) -> Result<()> {
-        let ReleaseFileState::Present(expected) = expected else {
-            unreachable!("a retained release original was present before applying")
-        };
+        let expected = expected
+            .contents()
+            .expect("a retained release original was present before applying");
         let matches = match fs::symlink_metadata(&self.file) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                match fs::read_to_string(&self.file) {
-                    Ok(contents) => contents == *expected,
-                    Err(source) if error_has_kind(&source, ErrorKind::InvalidData) => false,
-                    Err(source) => {
-                        return Err(Error::ReadFile {
-                            path: self.file.clone(),
-                            source,
-                        });
-                    }
+            Ok(metadata) if metadata.file_type().is_file() => match fs::read(&self.file) {
+                Ok(contents) => contents == *expected,
+                Err(source) => {
+                    return Err(Error::ReadFile {
+                        path: self.file.clone(),
+                        source,
+                    });
                 }
-            }
+            },
             Ok(_) => false,
             Err(source) => {
                 return Err(Error::ReadFile {
@@ -3153,7 +3506,7 @@ fn restore_claim_after_error(claimed: ClaimedReleaseFile, path: &Path, error: Er
 fn claim_release_file(
     repo: &Repository,
     path: &Path,
-    expected: &str,
+    expected: &[u8],
     participant_identities: &[PathBuf],
 ) -> Result<ClaimedReleaseFile> {
     let destination = repo.resolve(path);
@@ -3178,9 +3531,8 @@ fn claim_release_file(
         destination,
     };
     let matches = match fs::symlink_metadata(&claimed.file) {
-        Ok(metadata) if metadata.file_type().is_file() => match fs::read_to_string(&claimed.file) {
+        Ok(metadata) if metadata.file_type().is_file() => match fs::read(&claimed.file) {
             Ok(contents) => contents == expected,
-            Err(source) if error_has_kind(&source, ErrorKind::InvalidData) => false,
             Err(source) => {
                 let error = Error::ReadFile {
                     path: claimed.file.clone(),
@@ -3348,11 +3700,9 @@ fn restore_release_state(
     applied_after: &ReleaseFileState,
 ) -> Result<()> {
     release_failpoint(ReleaseApplyStage::Rollback, path, repo)?;
-    match applied_after {
-        ReleaseFileState::Present(expected) => {
-            restore_over_applied_file(repo, path, before, expected)
-        }
-        ReleaseFileState::Missing => restore_into_missing_path(repo, path, before),
+    match applied_after.contents() {
+        Some(expected) => restore_over_applied_file(repo, path, before, expected),
+        None => restore_into_missing_path(repo, path, before),
     }
 }
 
@@ -3360,7 +3710,7 @@ fn restore_over_applied_file(
     repo: &Repository,
     path: &Path,
     before: &ReleaseFileState,
-    expected: &str,
+    expected: &[u8],
 ) -> Result<()> {
     let absolute = repo.resolve(path);
     let directory = reserve_release_claim_directory(&absolute, &[])?;
@@ -3400,7 +3750,7 @@ fn restore_over_applied_file(
             path: path.to_path_buf(),
         });
     }
-    let claimed_contents = match fs::read_to_string(&guard) {
+    let claimed_contents = match fs::read(&guard) {
         Ok(claimed) => claimed,
         Err(source) => {
             let error = Error::ReadFile {
@@ -3422,11 +3772,9 @@ fn restore_over_applied_file(
         preserve_applied_claim(repo, path, claimed_file)?;
         return Err(error);
     }
-    let result = match before {
-        ReleaseFileState::Present(contents) => {
-            install_rollback_file_if_absent(repo, path, contents)
-        }
-        ReleaseFileState::Missing => match fs::symlink_metadata(&absolute) {
+    let result = match before.contents() {
+        Some(contents) => install_rollback_file_if_absent(repo, path, contents),
+        None => match fs::symlink_metadata(&absolute) {
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
             Ok(_) => Err(Error::ReleaseRollbackConflict {
                 path: path.to_path_buf(),
@@ -3474,16 +3822,14 @@ fn restore_into_missing_path(
     before: &ReleaseFileState,
 ) -> Result<()> {
     release_failpoint(ReleaseApplyStage::RollbackClaimed, path, repo)?;
-    match before {
-        ReleaseFileState::Present(contents) => {
-            install_rollback_file_if_absent(repo, path, contents)
-        }
-        ReleaseFileState::Missing => Ok(()),
+    match before.contents() {
+        Some(contents) => install_rollback_file_if_absent(repo, path, contents),
+        None => Ok(()),
     }
 }
 
-fn install_rollback_file_if_absent(repo: &Repository, path: &Path, contents: &str) -> Result<()> {
-    repo.prepare_atomic_write(path, contents.as_bytes())?
+fn install_rollback_file_if_absent(repo: &Repository, path: &Path, contents: &[u8]) -> Result<()> {
+    repo.prepare_atomic_write(path, contents)?
         .commit_if_absent()
         .map_err(|source| {
             if source.kind() == ErrorKind::AlreadyExists {
@@ -3601,8 +3947,8 @@ fn restore_retained_release_original(
     original: ClaimedReleaseFile,
 ) -> Result<()> {
     release_failpoint(ReleaseApplyStage::Rollback, path, repo)?;
-    match applied_after {
-        ReleaseFileState::Present(expected) => {
+    match applied_after.contents() {
+        Some(expected) => {
             let applied = claim_release_file(repo, path, expected, &[]).map_err(|error| {
                 if matches!(
                     error,
@@ -3627,7 +3973,7 @@ fn restore_retained_release_original(
                 }
             }
         }
-        ReleaseFileState::Missing => {
+        None => {
             match fs::symlink_metadata(repo.resolve(path)) {
                 Err(source) if source.kind() == ErrorKind::NotFound => {}
                 Ok(_) => {
@@ -4165,6 +4511,16 @@ fn discovery_warning(warning: &DiscoveryWarning) -> CheckWarning {
                 section
             ),
         },
+    }
+}
+
+fn check_fix_cleanup_warning(warning: MutationCleanupWarning) -> CheckWarning {
+    CheckWarning {
+        message: format!(
+            "sacho check --fix committed successfully, but transaction cleanup failed for {}: {}",
+            warning.path.display(),
+            warning.message,
+        ),
     }
 }
 
@@ -6265,6 +6621,216 @@ mod tests {
 
             prop_assert_eq!(CommitHookState::decode(&state.encode()).expect("decode"), state);
         }
+
+        #[test]
+        fn mutation_failure_at_any_apply_position_restores_every_target(
+            target_count in 1usize..7,
+            failure_seed in any::<usize>(),
+        ) {
+            let failure_index = failure_seed % target_count;
+            let (temp, repo) = repo_with_config(
+                "[changelog]\nmaterialize = false\n",
+            );
+            fs::create_dir_all(temp.path().join("targets")).expect("targets dir");
+            let participants = (0..target_count)
+                .map(|index| {
+                    let path = PathBuf::from(format!("targets/{index}.txt"));
+                    fs::write(repo.resolve(&path), format!("before {index}\n"))
+                        .expect("target");
+                    ReleaseFileChange {
+                        path,
+                        before: ReleaseFileState::Present(format!("before {index}\n")),
+                        after: ReleaseFileState::Present(format!("after {index}\n")),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let failure_path = participants[failure_index].path.clone();
+            let plan = RepositoryMutationPlan {
+                command: MutationCommand::Format,
+                participants,
+                fragment_paths_before: Vec::new(),
+                fragment_paths_after: Vec::new(),
+            };
+            let _lock = acquire_mutation_lock(&repo).expect("mutation lock");
+            set_release_failpoint(ReleaseApplyStage::Apply, failure_path);
+
+            let error = apply_repository_mutation(&repo, &plan)
+                .expect_err("injected apply failure");
+            clear_release_failpoint();
+
+            let rolled_back = matches!(
+                error,
+                Error::MutationApply {
+                    command: MutationCommand::Format,
+                    rollback_failures,
+                    ..
+                } if rollback_failures.is_empty()
+            );
+            prop_assert!(rolled_back);
+            for index in 0..target_count {
+                prop_assert_eq!(
+                    fs::read_to_string(temp.path().join(format!("targets/{index}.txt")))
+                        .expect("restored target"),
+                    format!("before {index}\n"),
+                );
+            }
+            assert_no_release_artifacts(temp.path());
+        }
+    }
+
+    #[test]
+    fn mutation_prepare_failure_removes_shared_new_directories() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        let participants = ["nested/deep/first.txt", "nested/second.txt", "failure.txt"]
+            .into_iter()
+            .map(|path| ReleaseFileChange {
+                path: PathBuf::from(path),
+                before: ReleaseFileState::Missing,
+                after: ReleaseFileState::Present(format!("{path}\n")),
+            })
+            .collect();
+        let plan = RepositoryMutationPlan {
+            command: MutationCommand::Carry,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: Vec::new(),
+        };
+        let _lock = acquire_mutation_lock(&repo).expect("mutation lock");
+        set_release_failpoint(ReleaseApplyStage::Prepare, PathBuf::from("failure.txt"));
+
+        let error = apply_repository_mutation(&repo, &plan).expect_err("prepare failure");
+        clear_release_failpoint();
+
+        assert!(matches!(error, Error::WriteFile { .. }));
+        assert!(!temp.path().join("nested").exists());
+        assert!(!temp.path().join("failure.txt").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn mutation_apply_failure_discards_remaining_prepared_writes_before_rollback() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        let participants = [
+            "nested/deep/first.txt",
+            "nested/second.txt",
+            "remaining.txt",
+        ]
+        .into_iter()
+        .map(|path| ReleaseFileChange {
+            path: PathBuf::from(path),
+            before: ReleaseFileState::Missing,
+            after: ReleaseFileState::Present(format!("{path}\n")),
+        })
+        .collect();
+        let plan = RepositoryMutationPlan {
+            command: MutationCommand::Carry,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: Vec::new(),
+        };
+        let _lock = acquire_mutation_lock(&repo).expect("mutation lock");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("nested/second.txt"));
+
+        let error = apply_repository_mutation(&repo, &plan).expect_err("apply failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert!(!temp.path().join("nested").exists());
+        assert!(!temp.path().join("remaining.txt").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn mutation_apply_failure_removes_current_descendants_before_rollback() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        let participants = [
+            "nested/first.txt",
+            "nested/deep/second.txt",
+            "remaining.txt",
+        ]
+        .into_iter()
+        .map(|path| ReleaseFileChange {
+            path: PathBuf::from(path),
+            before: ReleaseFileState::Missing,
+            after: ReleaseFileState::Present(format!("{path}\n")),
+        })
+        .collect();
+        let plan = RepositoryMutationPlan {
+            command: MutationCommand::Carry,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: Vec::new(),
+        };
+        let _lock = acquire_mutation_lock(&repo).expect("mutation lock");
+        set_release_failpoint(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("nested/deep/second.txt"),
+        );
+
+        let error = apply_repository_mutation(&repo, &plan).expect_err("apply failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert!(!temp.path().join("nested").exists());
+        assert!(!temp.path().join("remaining.txt").exists());
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
+    fn first_mutation_apply_failure_retries_shared_directory_cleanup() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        let participants = [
+            "nested/deep/first.txt",
+            "nested/second.txt",
+            "remaining.txt",
+        ]
+        .into_iter()
+        .map(|path| ReleaseFileChange {
+            path: PathBuf::from(path),
+            before: ReleaseFileState::Missing,
+            after: ReleaseFileState::Present(format!("{path}\n")),
+        })
+        .collect();
+        let plan = RepositoryMutationPlan {
+            command: MutationCommand::Carry,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: Vec::new(),
+        };
+        let _lock = acquire_mutation_lock(&repo).expect("mutation lock");
+        set_release_failpoint(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("nested/deep/first.txt"),
+        );
+
+        let error = apply_repository_mutation(&repo, &plan).expect_err("first apply failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert!(!temp.path().join("nested").exists());
+        assert!(!temp.path().join("remaining.txt").exists());
+        assert_no_release_artifacts(temp.path());
     }
 
     #[test]
@@ -6369,7 +6935,162 @@ mod tests {
     }
 
     #[test]
-    fn carry_preserves_historical_item_formatting() {
+    fn carry_overwrites_a_malformed_existing_target_before_parsing() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/carried-from-1.1.5.md"),
+            "not a fragment\n",
+        )
+        .expect("malformed carried target");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry repairs malformed target");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![PathBuf::from("changes.d/carried-from-1.1.5.md")]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
+                .expect("repaired fragment"),
+            " -  Fixed carry.\n"
+        );
+    }
+
+    #[test]
+    fn carry_overwrites_an_invalid_utf8_existing_target() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/carried-from-1.1.5.md"), [0xff])
+            .expect("invalid UTF-8 carried target");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry replaces invalid UTF-8 target");
+
+        assert_eq!(
+            fs::read(temp.path().join("changes.d/carried-from-1.1.5.md"))
+                .expect("carried fragment"),
+            b" -  Fixed carry.\n"
+        );
+    }
+
+    #[test]
+    fn carry_ignores_an_unrelated_malformed_fragment_without_materialization() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let unrelated = temp.path().join("changes.d/unrelated.md");
+        fs::write(&unrelated, "not a fragment\n").expect("malformed unrelated fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry ignores unrelated malformed fragment");
+
+        assert_eq!(result.sync, None);
+        assert_eq!(
+            fs::read_to_string(unrelated).expect("unrelated fragment"),
+            "not a fragment\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
+                .expect("carried fragment"),
+            " -  Fixed carry.\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn carry_accepts_existing_non_utf8_fragments_in_discovery_order() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let fragments = temp.path().join("changes.d");
+        fs::create_dir_all(&fragments).expect("fragments dir");
+        fs::write(
+            fragments.join(OsString::from_vec(vec![0x80, b'.', b'm', b'd'])),
+            " -  Invalid UTF-8 filename.\n",
+        )
+        .expect("non-UTF-8 fragment");
+        fs::write(fragments.join("é.md"), " -  Unicode filename.\n").expect("Unicode fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry with non-UTF-8 fragment names");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![PathBuf::from("changes.d/carried-from-1.1.5.md")]
+        );
+        assert!(temp.path().join("changes.d/é.md").exists());
+        assert!(
+            temp.path()
+                .join("changes.d")
+                .join(OsString::from_vec(vec![0x80, b'.', b'm', b'd']))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn carry_normalizes_historical_item_formatting() {
         let (temp, repo) = repo_with_config(
             r#"
             [changelog]
@@ -6393,7 +7114,12 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
                 .expect("fragment"),
-            "*   Fixed historical wrapping.\n    This continuation keeps old spacing.\n"
+            " -  Fixed historical wrapping.\n    This continuation keeps old spacing.\n"
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
         );
     }
 
@@ -6470,6 +7196,203 @@ mod tests {
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
         assert!(changelog.contains(" -  Fixed carry.\n"));
         assert!(temp.path().join("changes.d/carried-from-1.1.5.md").exists());
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn carry_materialization_preserves_sections_for_existing_and_carried_fragments() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("core dir");
+        fs::create_dir_all(temp.path().join("changes.d/cli")).expect("cli dir");
+        fs::write(
+            temp.path().join("changes.d/core/existing.md"),
+            " -  Existing core.\n",
+        )
+        .expect("core fragment");
+        fs::write(
+            temp.path().join("changes.d/cli/existing.md"),
+            " -  Existing CLI.\n",
+        )
+        .expect("cli fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n### core\n\n -  Carried core.\n\n### cli\n\n -  Carried CLI.\n",
+        )
+        .expect("changelog");
+        let sync = plan_sync(&repo, SyncOptions { force: true }).expect("sync plan");
+        apply_sync(&repo, sync).expect("initial sync");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        let core_heading = changelog.find("### core").expect("core heading");
+        let cli_heading = changelog.find("### cli").expect("cli heading");
+        assert!(
+            changelog[core_heading..cli_heading].contains(" -  Carried core.\n")
+                && changelog[core_heading..cli_heading].contains(" -  Existing core.\n")
+        );
+        assert!(changelog[cli_heading..].contains(" -  Carried CLI.\n"));
+        assert!(changelog[cli_heading..].contains(" -  Existing CLI.\n"));
+    }
+
+    #[test]
+    fn carry_nth_write_failure_restores_earlier_fragments_without_materialization() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("core dir");
+        fs::write(
+            temp.path().join("changes.d/core/carried-from-1.1.5.md"),
+            " -  Original core.\n",
+        )
+        .expect("old core");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n### core\n\n -  Fixed core.\n\n### cli\n\n -  Fixed CLI.\n",
+        )
+        .expect("changelog");
+        set_release_failpoint(
+            ReleaseApplyStage::Apply,
+            PathBuf::from("changes.d/core/carried-from-1.1.5.md"),
+        );
+
+        let error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect_err("second fragment write failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/core/carried-from-1.1.5.md"))
+                .expect("restored core"),
+            " -  Original core.\n"
+        );
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/cli/carried-from-1.1.5.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn carry_sync_failure_restores_every_fragment_and_the_changelog() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let changelog = "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("CHANGES.md"));
+
+        let error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect_err("sync write failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert!(!temp.path().join("changes.d/carried-from-1.1.5.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn carry_rolls_back_when_a_new_fragment_appears_during_apply() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let changelog = "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            "CHANGES.md",
+            "changes.d/late.md",
+            " -  Added concurrently.\n",
+        );
+
+        let error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect_err("late fragment");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Carry,
+                ..
+            }
+        ));
+        assert!(!temp.path().join("changes.d/carried-from-1.1.5.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/late.md")).expect("late fragment"),
+            " -  Added concurrently.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
     }
 
     #[test]
@@ -8584,6 +9507,28 @@ mod tests {
     }
 
     #[test]
+    fn mutation_state_error_classification_preserves_genuine_read_failures() {
+        let read_error = |kind| Error::ReadFile {
+            path: PathBuf::from("changes.d/change.md"),
+            source: std::io::Error::from(kind),
+        };
+
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+            ErrorKind::IsADirectory,
+        ] {
+            assert!(mutation_state_error_is_stale(&read_error(kind)));
+        }
+        assert!(!mutation_state_error_is_stale(&read_error(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(mutation_state_error_is_stale(&Error::ReleasePathConflict {
+            path: PathBuf::from("changes.d/change.md"),
+        }));
+    }
+
+    #[test]
     fn release_claim_paths_avoid_participants_and_their_ancestors() {
         let claim = Path::new("/repo/.sacho-claim-1");
         let exact = vec![claim.to_path_buf()];
@@ -8659,7 +9604,7 @@ mod tests {
         let (temp, repo) = repo_with_config("");
         fs::write(temp.path().join("CHANGES.md"), "concurrent\n").expect("destination");
 
-        let error = install_rollback_file_if_absent(&repo, Path::new("CHANGES.md"), "before\n")
+        let error = install_rollback_file_if_absent(&repo, Path::new("CHANGES.md"), b"before\n")
             .expect_err("conditional install collision");
 
         assert!(matches!(error, Error::ReleaseRollbackConflict { .. }));
@@ -9646,6 +10591,139 @@ mod tests {
     }
 
     #[test]
+    fn next_rejects_multiple_nonempty_version_lines_before_writing() {
+        for materialize in [false, true] {
+            let config = format!("[changelog]\nmaterialize = {materialize}\n",);
+            let (temp, repo) = repo_with_config(&config);
+            let changelog = "Unreleased\n----------\n\nTo be released.\n";
+            if materialize {
+                fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+            }
+
+            let error = set_next_version(
+                &repo,
+                NextOptions {
+                    version: String::from("1.2.0\n2.0.0"),
+                },
+            )
+            .expect_err("multiple next versions");
+
+            assert!(matches!(
+                error,
+                Error::InvalidNextVersion { path }
+                    if path == temp.path().join("changes.d/next")
+            ));
+            assert!(!temp.path().join("changes.d/next").exists());
+            if materialize {
+                assert_eq!(
+                    fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+                    changelog
+                );
+                assert!(
+                    check(&repo, CheckOptions::default())
+                        .expect("check")
+                        .is_clean()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_ignores_a_malformed_fragment_without_materialization() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let malformed = temp.path().join("changes.d/malformed.md");
+        fs::write(&malformed, "not a fragment\n").expect("malformed fragment");
+
+        let result = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next ignores malformed fragment");
+
+        assert_eq!(result.sync, None);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.2.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(malformed).expect("malformed fragment"),
+            "not a fragment\n"
+        );
+    }
+
+    #[test]
+    fn next_overwrites_an_invalid_utf8_next_file_without_materialization() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let next_file = temp.path().join("changes.d/next");
+        fs::write(&next_file, [0xff]).expect("invalid UTF-8 next file");
+
+        let result = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next replaces invalid UTF-8 file");
+
+        assert_eq!(result.sync, None);
+        assert_eq!(fs::read(next_file).expect("next file"), b"1.2.0\n");
+    }
+
+    #[test]
+    fn next_rollback_restores_invalid_utf8_bytes() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let next_file = temp.path().join("changes.d/next");
+        fs::write(&next_file, [0xff, 0xfe]).expect("invalid UTF-8 next file");
+        set_release_failpoint(
+            ReleaseApplyStage::DiscardClaimed,
+            PathBuf::from("changes.d/next"),
+        );
+
+        let error = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect_err("commit preflight failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Next,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert_eq!(
+            fs::read(next_file).expect("restored next file"),
+            [0xff, 0xfe]
+        );
+        assert_no_release_artifacts(temp.path());
+    }
+
+    #[test]
     fn next_rejects_the_repository_mutation_lock_as_its_destination() {
         let temp = TempDir::new().expect("tempdir");
         fs::write(
@@ -9707,7 +10785,7 @@ mod tests {
         )
         .expect("changelog");
 
-        set_next_version(
+        let result = set_next_version(
             &repo,
             NextOptions {
                 version: String::from(" 1.2.0 "),
@@ -9715,6 +10793,7 @@ mod tests {
         )
         .expect("next");
 
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
             "1.2.0\n"
@@ -9723,6 +10802,11 @@ mod tests {
             fs::read_to_string(temp.path().join("CHANGES.md"))
                 .expect("changelog")
                 .contains("Version 1.2.0\n-------------")
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
         );
     }
 
@@ -9745,6 +10829,138 @@ mod tests {
 
         assert!(matches!(error, Error::SyncNeedsConfirmation { .. }));
         assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn next_reports_a_missing_materialized_changelog_instead_of_panicking() {
+        let (temp, repo) = repo_with_config("");
+
+        let error = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect_err("missing changelog");
+
+        assert!(matches!(
+            error,
+            Error::ReadFile { path, source }
+                if path == temp.path().join("CHANGES.md")
+                    && source.kind() == ErrorKind::NotFound
+        ));
+        assert!(!temp.path().join("changes.d/next").exists());
+    }
+
+    #[test]
+    fn next_sync_failure_restores_the_original_next_file() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.0.0\n").expect("next");
+        let changelog = "Version 1.0.0\n-------------\n\nTo be released.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("CHANGES.md"));
+
+        let error = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.1.0"),
+            },
+        )
+        .expect_err("injected sync failure");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Next,
+                rollback_failures,
+                ..
+            } if rollback_failures.is_empty()
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.0.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn next_rollback_preserves_an_external_edit_and_reports_the_conflict() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.0.0\n").expect("next");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.0.0\n-------------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            "CHANGES.md",
+            "changes.d/next",
+            "external edit\n",
+        );
+        set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("CHANGES.md"));
+
+        let error = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.1.0"),
+            },
+        )
+        .expect_err("rollback conflict");
+        clear_release_failpoint();
+
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Next,
+                rollback_failures,
+                ..
+            } if rollback_failures.len() == 1
+                && rollback_failures[0].contains("changed after next wrote it")
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("external next"),
+            "external edit\n"
+        );
+    }
+
+    #[test]
+    fn next_reports_cleanup_failure_as_a_success_warning() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.0.0\n").expect("next");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.0.0\n-------------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        set_release_failpoint(
+            ReleaseApplyStage::CommittedDiscardClaimed,
+            PathBuf::from("changes.d/next"),
+        );
+
+        let result = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.1.0"),
+            },
+        )
+        .expect("committed next");
+        clear_release_failpoint();
+
+        assert_eq!(result.cleanup_warnings.len(), 1);
+        assert_eq!(result.cleanup_warnings[0].path, Path::new("changes.d/next"));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
     }
 
     #[test]
@@ -9869,6 +11085,77 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn no_op_format_accepts_a_read_only_fragment_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let fragments = temp.path().join("changes.d");
+        fs::create_dir_all(&fragments).expect("fragments dir");
+        fs::write(fragments.join("clean.md"), " -  Already normalized.\n").expect("fragment");
+        let original_permissions = fs::metadata(&fragments)
+            .expect("fragment directory metadata")
+            .permissions();
+        fs::set_permissions(&fragments, fs::Permissions::from_mode(0o555))
+            .expect("read-only fragments");
+
+        let result = format_fragments(&repo, FormatOptions);
+
+        fs::set_permissions(&fragments, original_permissions).expect("restore fragments");
+        assert_eq!(result.expect("no-op format").changed, Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_does_not_probe_an_unchanged_read_only_section_for_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "writable"
+            directory = "writable"
+
+            [[sections]]
+            id = "read-only"
+            directory = "read-only"
+            "#,
+        );
+        let writable = temp.path().join("changes.d/writable");
+        let read_only = temp.path().join("changes.d/read-only");
+        fs::create_dir_all(&writable).expect("writable section");
+        fs::create_dir_all(&read_only).expect("read-only section");
+        fs::write(writable.join("change.md"), "- Needs formatting.\n").expect("changed fragment");
+        fs::write(read_only.join("clean.md"), " -  Already normalized.\n")
+            .expect("unchanged fragment");
+        let original_permissions = fs::metadata(&read_only)
+            .expect("read-only section metadata")
+            .permissions();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555))
+            .expect("read-only section");
+
+        let result = format_fragments(&repo, FormatOptions);
+
+        fs::set_permissions(&read_only, original_permissions).expect("restore section");
+        assert_eq!(
+            result.expect("format").changed,
+            vec![PathBuf::from("changes.d/writable/change.md")]
+        );
+        assert_eq!(
+            fs::read_to_string(read_only.join("clean.md")).expect("unchanged fragment"),
+            " -  Already normalized.\n"
+        );
+    }
+
     #[test]
     fn format_apply_rejects_a_fragment_changed_after_planning_without_other_writes() {
         let (temp, repo) = repo_with_config("");
@@ -9883,9 +11170,13 @@ mod tests {
 
         let error = apply_format(&repo, plan).expect_err("stale format plan");
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
-        );
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::Format,
+                path,
+            } if path == Path::new("changes.d/b.md")
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
             "- Added first.\n"
@@ -9894,6 +11185,37 @@ mod tests {
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
             changelog
         );
+    }
+
+    #[test]
+    fn format_apply_classifies_invalid_utf8_after_planning_as_stale() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let fragment = temp.path().join("changes.d/change.md");
+        fs::write(&fragment, "- Needs formatting.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+        let plan = plan_format(&repo, FormatOptions).expect("format plan");
+        fs::write(&fragment, [0xff]).expect("invalid UTF-8 replacement");
+
+        let error = apply_format(&repo, plan).expect_err("stale format plan");
+
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::Format,
+                path,
+            } if path == Path::new("changes.d/change.md")
+        ));
+        assert_eq!(fs::read(fragment).expect("concurrent contents"), [0xff]);
     }
 
     #[test]
@@ -9912,7 +11234,12 @@ mod tests {
         let error = apply_format(&repo, plan).expect_err("move probe failure");
         clear_release_failpoint();
 
-        assert!(matches!(error, Error::FormatTransactionUnsupported));
+        assert!(matches!(
+            error,
+            Error::MutationTransactionUnsupported {
+                command: MutationCommand::Format,
+            }
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
             first
@@ -9938,14 +11265,23 @@ mod tests {
         fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
         let plan = plan_format(&repo, FormatOptions).expect("format plan");
         let concurrent = " -  Concurrent edit.\n";
-        set_format_apply_interference("changes.d/b.md", concurrent);
+        set_release_interference(
+            ReleaseApplyStage::Apply,
+            "changes.d/b.md",
+            "changes.d/b.md",
+            concurrent,
+        );
 
         let error = apply_format(&repo, plan).expect_err("stale format plan");
-        clear_format_apply_interference();
+        clear_release_failpoint();
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
-        );
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Format,
+                ..
+            }
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
             "- Added first.\n"
@@ -9970,14 +11306,23 @@ mod tests {
         fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
         let plan = plan_format(&repo, FormatOptions).expect("format plan");
         let concurrent = " -  Concurrent atomic save.\n";
-        set_format_apply_interference_after_claim("changes.d/b.md", concurrent);
+        set_release_interference(
+            ReleaseApplyStage::ApplyClaimed,
+            "changes.d/b.md",
+            "changes.d/b.md",
+            concurrent,
+        );
 
         let error = apply_format(&repo, plan).expect_err("stale format plan");
-        clear_format_apply_interference();
+        clear_release_failpoint();
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/b.md"))
-        );
+        assert!(matches!(
+            error,
+            Error::MutationApply {
+                command: MutationCommand::Format,
+                ..
+            }
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/a.md")).expect("first"),
             "- Added first.\n"
@@ -9993,7 +11338,7 @@ mod tests {
         assert!(
             fs::read_dir(temp.path().join("changes.d"))
                 .expect("fragments")
-                .all(|entry| !entry
+                .any(|entry| entry
                     .expect("entry")
                     .file_name()
                     .to_string_lossy()
@@ -10018,9 +11363,13 @@ mod tests {
 
         let error = apply_format(&repo, plan).expect_err("stale fragment set");
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/late.md"))
-        );
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::Format,
+                path,
+            } if path == Path::new("changes.d/late.md")
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/planned.md")).expect("planned"),
             "- Added planned.\n"
@@ -10044,9 +11393,13 @@ mod tests {
 
         let error = apply_format(&repo, plan).expect_err("stale next file");
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("changes.d/next"))
-        );
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::Format,
+                path,
+            } if path == Path::new("changes.d/next")
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
             "- Fixed issue.\n"
@@ -10073,9 +11426,13 @@ mod tests {
 
         let error = apply_format(&repo, plan).expect_err("stale changelog");
 
-        assert!(
-            matches!(error, Error::StaleFormatPlan { path } if path == Path::new("CHANGES.md"))
-        );
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::Format,
+                path,
+            } if path == Path::new("CHANGES.md")
+        ));
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/fmt.md")).expect("fragment"),
             "- Fixed issue.\n"
@@ -10423,6 +11780,46 @@ priority: 0
             fs::read_to_string(temp.path().join("CHANGES.md"))
                 .expect("changelog")
                 .contains(" -  Fixed issue.\n")
+        );
+    }
+
+    #[test]
+    fn check_fix_preserves_post_commit_cleanup_warnings() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/fix.md"), "- Fixed issue.\n").expect("fragment");
+        set_release_failpoint(
+            ReleaseApplyStage::CommittedDiscardClaimed,
+            PathBuf::from("changes.d/fix.md"),
+        );
+
+        let report = check(
+            &repo,
+            CheckOptions {
+                fix: true,
+                base: None,
+                staged: false,
+            },
+        )
+        .expect("committed check --fix");
+        clear_release_failpoint();
+
+        assert_eq!(report.status(), CheckStatus::HasWarnings);
+        assert!(report.warnings.iter().any(|warning| {
+            warning
+                .message
+                .contains("check --fix committed successfully")
+                && warning.message.contains("changes.d/fix.md")
+                && warning.message.contains("cleanup failed")
+        }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/fix.md")).expect("fragment"),
+            " -  Fixed issue.\n"
         );
     }
 

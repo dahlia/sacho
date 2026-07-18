@@ -35,5 +35,5 @@ pub use crate::config::{
     ChangelogConfig, CheckConfig, Config, FragmentsConfig, ReferenceSigil, RegionDetection,
     SectionConfig, UrlTemplate, VcsCommand, VcsCommandOverrides, VcsConfig, VcsPreset, VcsQuery,
 };
-pub use crate::error::{ConfigError, Error, FragmentError, Result};
+pub use crate::error::{ConfigError, Error, FragmentError, MutationCommand, Result};
 pub use crate::repo::Repository;
