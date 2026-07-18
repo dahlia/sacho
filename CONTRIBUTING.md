@@ -36,8 +36,8 @@ mise install
 ~~~~
 
 The project requires the Rust toolchain configured in *mise.toml*. The mise
-installation also provides supporting tools such as Hongdown, Nushell, and
-cargo-mutants.
+installation also provides supporting tools such as Hongdown, Nushell,
+cargo-mutants, Jujutsu, and Mercurial.
 
 After installing tools, mise runs the repository post-install hook. This fetches
 Cargo dependencies and writes a Git pre-commit hook that runs the `check` task.
@@ -86,8 +86,9 @@ Run tests:
 mise run test
 ~~~~
 
-Run the ignored smoke tests against locally installed Jujutsu and Mercurial
-executables (Git is exercised by the regular test suite):
+Run the ignored smoke tests against Git plus the mise-managed Jujutsu and
+Mercurial executables. These cover VCS repository discovery and repository URL
+inference:
 
 ~~~~ sh
 mise run test:vcs

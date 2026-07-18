@@ -11,9 +11,9 @@ use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     InitOptions, InitResult, MutationCleanupWarning, NextOptions, ReleaseDate, ReleaseOptions,
     SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver, apply_release,
-    apply_sync, carry, check, commit_message_hook, compile_unreleased, init_repository,
-    mercurial_update_hook, plan_format, plan_release, plan_sync, reference_transaction_hook,
-    set_next_version,
+    apply_sync, carry, check, commit_message_hook, compile_unreleased, infer_repository_url,
+    init_repository, mercurial_update_hook, plan_format, plan_release, plan_sync,
+    reference_transaction_hook, set_next_version,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
@@ -40,6 +40,14 @@ enum Command {
         /// Install or update Git commit hooks that run Sacho checks.
         #[arg(long, help = "Install Git commit hooks")]
         install_hook: bool,
+
+        /// Repository URL used for issue-reference links in new configuration.
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Repository URL for # links in new configuration"
+        )]
+        repository_url: Option<String>,
     },
 
     /// Create a new changelog fragment.
@@ -168,8 +176,14 @@ impl Cli {
                 interactive,
                 no_interactive,
                 install_hook,
+                repository_url,
             } => {
-                let options = resolve_init_options(interactive, no_interactive, install_hook)?;
+                let options = resolve_init_options(
+                    interactive,
+                    no_interactive,
+                    install_hook,
+                    repository_url,
+                )?;
                 let result = init_repository(".", options)?;
                 print_init_result(&result);
                 Ok(ExitCode::SUCCESS)
@@ -440,6 +454,7 @@ fn resolve_init_options(
     interactive: bool,
     no_interactive: bool,
     install_hook: bool,
+    repository_url: Option<String>,
 ) -> Result<InitOptions, CliReport> {
     let should_prompt = init_should_prompt(
         interactive,
@@ -452,7 +467,7 @@ fn resolve_init_options(
         let changelog_path = prompt("Changelog path", "CHANGES.md")?;
         let fragment_directory = prompt("Fragment directory", "changes.d")?;
         let materialize = prompt_bool("Materialize unreleased changelog", true)?;
-        let repository_url = prompt("Repository URL for # links", "")?;
+        let repository_url = resolve_interactive_repository_url(repository_url)?;
         let install_hook = if install_hook {
             true
         } else {
@@ -469,7 +484,7 @@ fn resolve_init_options(
             materialize: Some(materialize),
             install_hook,
             append_existing_hook,
-            repository_url: optional_prompt_value(repository_url),
+            repository_url,
         })
     } else {
         Ok(InitOptions {
@@ -478,8 +493,27 @@ fn resolve_init_options(
             materialize: None,
             install_hook,
             append_existing_hook: false,
-            repository_url: None,
+            repository_url,
         })
+    }
+}
+
+fn resolve_interactive_repository_url(
+    explicit: Option<String>,
+) -> Result<Option<String>, CliReport> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    let Some(inferred) = infer_repository_url(".") else {
+        return prompt("Repository URL for # links", "").map(optional_prompt_value);
+    };
+    if prompt_bool(
+        &format!("Use inferred repository URL {inferred} for # links"),
+        true,
+    )? {
+        Ok(Some(inferred))
+    } else {
+        prompt("Repository URL for # links (leave blank to omit)", "").map(optional_prompt_value)
     }
 }
 

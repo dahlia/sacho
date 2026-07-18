@@ -28,6 +28,7 @@ pub mod merge;
 pub mod released;
 /// Repository discovery and path helpers.
 pub mod repo;
+mod repository_url;
 /// Version-control integration types.
 pub mod vcs;
 

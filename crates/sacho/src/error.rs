@@ -449,6 +449,10 @@ pub enum Error {
         message: String,
     },
 
+    /// A repository URL supplied to initialization is not safe to use.
+    #[snafu(display("repository URL is not a supported HTTPS or forge clone URL"))]
+    InvalidRepositoryUrl,
+
     /// A pre-commit hook exists and cannot be changed non-interactively.
     #[snafu(display("{} already exists without a Sacho marker; add the marked block manually or rerun interactively", path.display()))]
     HookNeedsManualInstall {

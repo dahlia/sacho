@@ -3248,7 +3248,8 @@ mod tests {
         )));
     }
 
-    #[cfg(unix)]
+    // APFS rejects the deliberately non-UTF-8 path before Mercurial can inspect it.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     #[ignore = "requires the hg executable"]
     fn hg_vcs_probes_non_utf8_fragment_paths() {
@@ -3576,7 +3577,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn git_vcs_preserves_non_utf8_filename_bytes() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};

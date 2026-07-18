@@ -642,6 +642,17 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     Ok(result)
 }
 
+/// Infers a sanitized repository web URL from local VCS configuration.
+///
+/// Missing, ambiguous, unsupported, and malformed remote configuration all
+/// return `None` without turning VCS inspection failures into diagnostics.
+pub fn infer_repository_url(start: impl AsRef<Path>) -> Option<String> {
+    let root = init_root(start.as_ref());
+    let preset =
+        repository_preset(&root).or_else(|| is_git_repository(&root).then_some(VcsPreset::Git))?;
+    crate::repository_url::infer(&root, preset).map(|url| url.web_url)
+}
+
 fn load_init_config(
     root: &Path,
     config_path: &Path,
@@ -649,7 +660,7 @@ fn load_init_config(
 ) -> Result<(bool, Config)> {
     let created = !config_path.exists();
     let config = if created {
-        let config = default_init_config(root, options);
+        let config = default_init_config(root, options)?;
         config.validate().map_err(|source| Error::Config {
             path: config_path.to_path_buf(),
             source: Box::new(source),
@@ -4598,7 +4609,7 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn default_init_config(root: &Path, options: &InitOptions) -> Config {
+fn default_init_config(root: &Path, options: &InitOptions) -> Result<Config> {
     let mut config = Config::parse("").expect("default config parses");
     if let Some(name) = root.file_name().and_then(|name| name.to_str()) {
         config.changelog.title = format!("{name} changelog");
@@ -4615,18 +4626,17 @@ fn default_init_config(root: &Path, options: &InitOptions) -> Config {
     config.vcs.preset = repository_preset(root)
         .or_else(|| is_git_repository(root).then_some(VcsPreset::Git))
         .unwrap_or(VcsPreset::None);
-    if let Some(url) = options
-        .repository_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
+    if let Some(url) = options.repository_url.as_deref().map(str::trim)
+        && !url.is_empty()
     {
+        let url =
+            crate::repository_url::normalize_explicit(url).ok_or(Error::InvalidRepositoryUrl)?;
         config.links.insert(
             ReferenceSigil::new("#"),
-            UrlTemplate::new(format!("{}/issues/{{n}}", url.trim_end_matches('/'))),
+            UrlTemplate::new(url.issue_template),
         );
     }
-    config
+    Ok(config)
 }
 
 fn render_init_config(config: &Config) -> String {
@@ -5560,7 +5570,8 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: Some(String::from("   ")),
             },
-        );
+        )
+        .expect("blank repository URL");
 
         assert!(config.links.is_empty());
         assert!(!render_init_config(&config).contains("[links]"));
@@ -5575,6 +5586,7 @@ mod tests {
         assert_eq!(repository_preset(temp.path()), Some(VcsPreset::Jj));
         assert_eq!(
             default_init_config(temp.path(), &InitOptions::default())
+                .expect("default init config")
                 .vcs
                 .preset,
             VcsPreset::Jj
@@ -5646,7 +5658,10 @@ mod tests {
         let nested = temp.path().join("one/two");
         fs::create_dir_all(&nested).expect("nested directory");
 
-        assert_eq!(init_root(&nested), temp.path());
+        assert_eq!(
+            init_root(&nested),
+            fs::canonicalize(temp.path()).expect("canonical repository root")
+        );
     }
 
     #[test]
@@ -5658,7 +5673,10 @@ mod tests {
         fs::write(temp.path().join("one/.jj"), "ordinary file\n").expect("jj file");
         fs::write(nested.join(".hg"), "ordinary file\n").expect("hg file");
 
-        assert_eq!(init_root(&nested), temp.path());
+        assert_eq!(
+            init_root(&nested),
+            fs::canonicalize(temp.path()).expect("canonical repository root")
+        );
     }
 
     #[test]
@@ -5669,7 +5687,10 @@ mod tests {
         fs::create_dir_all(sibling_a.join(".git")).expect("Git marker");
         fs::create_dir(&sibling_b).expect("sibling directory");
 
-        assert_eq!(init_root(&sibling_a.join("../b")), sibling_b);
+        assert_eq!(
+            init_root(&sibling_a.join("../b")),
+            fs::canonicalize(sibling_b).expect("canonical sibling")
+        );
     }
 
     #[test]

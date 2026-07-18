@@ -7,6 +7,8 @@ experimental = true
 "aqua:dahlia/hongdown" = "0.5.1"
 "aqua:nushell/nushell" = "0.114.0"
 "cargo:cargo-mutants" = "27.1.0"
+jj = "0.43.0"
+"pipx:mercurial" = "7.2.3"
 
 [tools.rust]
 version = "1.96.1"
@@ -55,8 +57,11 @@ description = "Run the Rust tests"
 run = "cargo test --workspace"
 
 [tasks."test:vcs"]
-description = "Run live VCS adapter smoke tests"
-run = "cargo test --workspace vcs::tests:: -- --ignored"
+description = "Run live VCS adapter and repository URL smoke tests"
+run = [
+  "cargo test --workspace vcs::tests:: -- --ignored",
+  "cargo test --workspace repository_url::tests:: -- --ignored",
+]
 
 [tasks.mutants]
 description = "Run mutation tests"

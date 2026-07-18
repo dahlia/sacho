@@ -78,6 +78,20 @@ fn help_lists_commands() {
 }
 
 #[test]
+fn init_help_describes_the_repository_url_option() {
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--repository-url <URL>"))
+        .stdout(predicate::str::contains(
+            "Repository URL for # links in new configuration",
+        ));
+}
+
+#[test]
 fn check_rejects_base_with_staged_mode() {
     let mut command = Command::cargo_bin("sacho").expect("binary");
 
@@ -157,6 +171,159 @@ fn init_scaffolds_empty_git_repository() {
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
         "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_non_interactive_only_uses_an_explicit_repository_url() {
+    let inferred = tempfile::TempDir::new().expect("inferred tempdir");
+    git(inferred.path(), ["init"]);
+    git(
+        inferred.path(),
+        [
+            "remote",
+            "add",
+            "origin",
+            "ssh://git@codeberg.org/team/project.git",
+        ],
+    );
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(inferred.path())
+        .args(["init", "--no-interactive"])
+        .assert()
+        .success();
+    assert!(
+        !std::fs::read_to_string(inferred.path().join("sacho.toml"))
+            .expect("inferred config")
+            .contains("[links]")
+    );
+
+    let explicit = tempfile::TempDir::new().expect("explicit tempdir");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(explicit.path())
+        .args([
+            "init",
+            "--no-interactive",
+            "--repository-url",
+            "https://user:password@gitlab.com/group/project.git?token=secret#branch",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("password").not())
+        .stdout(predicate::str::contains("secret").not())
+        .stderr(predicate::str::contains("password").not())
+        .stderr(predicate::str::contains("secret").not());
+    let config =
+        std::fs::read_to_string(explicit.path().join("sacho.toml")).expect("explicit config");
+    assert!(
+        config.contains(r##""#" = "https://gitlab.com/group/project/-/issues/{n}""##),
+        "{config}"
+    );
+    assert!(!config.contains("password"));
+    assert!(!config.contains("secret"));
+}
+
+#[test]
+fn init_rejects_an_invalid_explicit_repository_url_without_echoing_it() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let secret = "file:///private/token-secret/project";
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["init", "--no-interactive", "--repository-url", secret])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "repository URL is not a supported HTTPS or forge clone URL",
+        ))
+        .stderr(predicate::str::contains("token-secret").not());
+
+    assert!(!temp.path().join("sacho.toml").exists());
+    assert!(!temp.path().join("CHANGES.md").exists());
+    assert!(!temp.path().join("changes.d").exists());
+}
+
+#[test]
+fn init_interactive_accepts_edits_or_omits_the_inferred_repository_url() {
+    let cases = [
+        (
+            "\n\n\n\n\n",
+            Some("https://codeberg.org/team/project/issues/{n}"),
+        ),
+        (
+            "\n\n\nn\nhttps://gitlab.com/group/project.git\n\n",
+            Some("https://gitlab.com/group/project/-/issues/{n}"),
+        ),
+        ("\n\n\nn\n\n\n", None),
+    ];
+
+    for (input, expected_link) in cases {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        git(temp.path(), ["init"]);
+        git(
+            temp.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@codeberg.org/team/project.git",
+            ],
+        );
+
+        let (success, output) = run_in_terminal(temp.path(), &["init"], input);
+
+        assert!(success, "{output}");
+        let config =
+            std::fs::read_to_string(temp.path().join("sacho.toml")).expect("interactive config");
+        if let Some(expected_link) = expected_link {
+            assert!(config.contains(expected_link), "{config}");
+        } else {
+            assert!(!config.contains("[links]"), "{config}");
+        }
+    }
+}
+
+#[test]
+fn init_interactive_infers_a_git_worktree_remote() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let main = temp.path().join("main");
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir(&main).expect("main directory");
+    git(&main, ["init"]);
+    git(&main, ["config", "user.email", "test@example.com"]);
+    git(&main, ["config", "user.name", "Test User"]);
+    std::fs::write(main.join("README.md"), "test\n").expect("readme");
+    git(&main, ["add", "README.md"]);
+    git(&main, ["commit", "-m", "Initial"]);
+    git(
+        &main,
+        [
+            "remote",
+            "add",
+            "origin",
+            "ssh://git@github.com/team/project.git",
+        ],
+    );
+    git(
+        &main,
+        [
+            "worktree",
+            "add",
+            worktree.to_str().expect("UTF-8 worktree"),
+        ],
+    );
+
+    let (success, output) = run_in_terminal(&worktree, &["init"], "\n\n\n\n\n");
+
+    assert!(success, "{output}");
+    let config =
+        std::fs::read_to_string(worktree.join("sacho.toml")).expect("worktree configuration");
+    assert!(
+        config.contains("https://github.com/team/project/issues/{n}"),
+        "{config}"
     );
 }
 
@@ -1040,6 +1207,8 @@ fn run_in_terminal(dir: &std::path::Path, args: &[&str], input: &str) -> (bool, 
 }
 
 fn run_command_in_terminal(command: CommandBuilder, input: &str) -> (bool, String) {
+    static PTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _pty_guard = PTY_LOCK.lock().expect("PTY test lock");
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -1054,13 +1223,17 @@ fn run_command_in_terminal(command: CommandBuilder, input: &str) -> (bool, Strin
         .expect("spawn in terminal");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("terminal reader");
+    let reader_thread = std::thread::spawn(move || {
+        let mut output = String::new();
+        reader.read_to_string(&mut output).expect("terminal output");
+        output
+    });
     let mut writer = pair.master.take_writer().expect("terminal writer");
     writer.write_all(input.as_bytes()).expect("terminal input");
     writer.flush().expect("flush terminal input");
     drop(writer);
     let status = child.wait().expect("terminal child");
-    let mut output = String::new();
-    reader.read_to_string(&mut output).expect("terminal output");
+    let output = reader_thread.join().expect("terminal reader thread");
     (status.success(), output)
 }
 

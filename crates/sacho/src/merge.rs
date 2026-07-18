@@ -1020,6 +1020,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn git_stdout(root: &std::path::Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(["-c", "commit.gpgSign=false", "-c", "tag.gpgSign=false"])
@@ -1196,7 +1197,7 @@ Released on July 1, 2026.
             .expect("snapshot reads must retain the source Git lock location");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn merged_snapshot_preserves_a_non_utf8_resolved_fragment_directory() {
         use std::ffi::OsString;
@@ -1232,7 +1233,7 @@ Released on July 1, 2026.
         assert_eq!(discovered.candidates.len(), 1);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn merged_snapshot_materializes_a_non_utf8_next_file_alias() {
         use std::ffi::OsString;
@@ -1266,7 +1267,7 @@ Released on July 1, 2026.
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn merged_snapshot_materializes_a_non_utf8_section_alias() {
         use std::ffi::OsString;
@@ -1307,7 +1308,7 @@ Released on July 1, 2026.
         assert_eq!(discovered.candidates[0].section.as_deref(), Some("core"));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn merged_snapshot_overlays_changes_under_a_non_utf8_fragment_directory() {
         use std::ffi::OsString;
