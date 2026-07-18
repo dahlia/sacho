@@ -34,6 +34,15 @@ shell = "nu -c"
 run = """
 mise deps
 mise generate git-pre-commit --write --task=check
+'#!/bin/sh
+cargo run hook-commit-msg "$1"' | save --force .git/hooks/commit-msg
+'#!/bin/sh
+if test "$1" = prepared; then
+  sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?
+  if test -f "$sacho_state"; then
+    cargo run hook-reference-transaction "$1"
+  fi
+fi' | save --force .git/hooks/reference-transaction
 """
 
 [tasks.check]
@@ -45,6 +54,7 @@ run = [
   "cargo fmt --check",
   "hongdown --check",
   "mise fmt --check",
+  "cargo run check",
 ]
 
 [tasks.fmt]
