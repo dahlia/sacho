@@ -1,0 +1,413 @@
+name: Main
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-24.04
+    outputs:
+      base-version: ${{ steps.version.outputs.base-version }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell
+          experimental: true
+      - name: Determine the package version
+        id: version
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          base_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "sacho") | .version'
+          )"
+          if [[ -z "$base_version" || "$base_version" == "null" ]]; then
+            echo "Unable to determine the sacho package version." >&2
+            exit 1
+          fi
+
+          short_sha="${GITHUB_SHA:0:7}"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "Unable to determine the pull request number." >&2
+              exit 1
+            fi
+            version="${base_version}-pr.${PR_NUMBER}.${GITHUB_RUN_NUMBER}+${short_sha}"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$base_version"
+          else
+            version="${base_version}-dev.${GITHUB_RUN_NUMBER}+${short_sha}"
+          fi
+
+          {
+            echo "base-version=$base_version"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Package version: $version" >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    name: Check
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Validate the tag version
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          CARGO_VERSION: ${{ needs.version.outputs.base-version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != "$CARGO_VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo version $CARGO_VERSION." >&2
+            exit 1
+          fi
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: >-
+            rust
+            aqua:nushell/nushell
+            aqua:dahlia/hongdown
+            aqua:rhysd/actionlint
+          experimental: true
+      - name: Check the project
+        run: mise check
+
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell
+          experimental: true
+      - name: Build the project
+        run: mise build
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell
+          experimental: true
+      - name: Test the project
+        run: mise test
+
+  mutants:
+    name: Mutation tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell cargo:cargo-mutants
+          experimental: true
+      - name: Run mutation tests
+        run: mise mutants
+
+  dist:
+    name: Dist (${{ matrix.os }}-${{ matrix.arch }})
+    needs: [version, check, build, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: sacho
+            archive-extension: tar.xz
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: sacho
+            archive-extension: tar.xz
+          - os: macos
+            arch: amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: sacho
+            archive-extension: tar.xz
+          - os: macos
+            arch: aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: sacho
+            archive-extension: tar.xz
+          - os: windows
+            arch: amd64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: sacho.exe
+            archive-extension: zip
+          - os: windows
+            arch: aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: sacho.exe
+            archive-extension: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell
+          experimental: true
+      - name: Install Linux build tools
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes binutils file musl-tools
+          cargo_target="${TARGET^^}"
+          cargo_target="${cargo_target//-/_}"
+          cc_target="${TARGET//-/_}"
+          {
+            echo "CARGO_TARGET_${cargo_target}_LINKER=musl-gcc"
+            echo "CC_${cc_target}=musl-gcc"
+            echo "AR_${cc_target}=ar"
+          } >> "$GITHUB_ENV"
+      - name: Install the Rust target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+      - name: Apply the package version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          nu -c '
+            open Cargo.toml
+            | update workspace.package.version $env.VERSION
+            | to toml
+            | save --force Cargo.toml
+          '
+          cargo update --offline --package sacho
+      - name: Build the distribution binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --package sacho --target "$TARGET"
+      - name: Verify the distribution binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          binary_path="target/$TARGET/release/$BINARY"
+          actual_version="$("$binary_path" --version)"
+          expected_version="sacho $VERSION"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "Expected '$expected_version', got '$actual_version'." >&2
+            exit 1
+          fi
+      - name: Verify static Linux linkage
+        if: matrix.os == 'linux'
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary_path="target/$TARGET/release/$BINARY"
+          file "$binary_path"
+          if readelf --program-headers "$binary_path" | grep --quiet INTERP; then
+            echo "Linux distribution binary has a dynamic interpreter." >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary_path" | grep --quiet '(NEEDED)'; then
+            echo "Linux distribution binary has dynamic library dependencies." >&2
+            exit 1
+          fi
+      - name: Stage the distribution
+        id: stage
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARCHIVE_EXTENSION: ${{ matrix.archive-extension }}
+          BINARY: ${{ matrix.binary }}
+          OS: ${{ matrix.os }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dist_name="sacho-${VERSION}-${OS}-${ARCH}"
+          archive="${dist_name}.${ARCHIVE_EXTENSION}"
+          mkdir "$dist_name"
+          cp "target/$TARGET/release/$BINARY" "$dist_name/$BINARY"
+          cp README.md LICENSE "$dist_name/"
+          {
+            echo "archive=$archive"
+            echo "dist-name=$dist_name"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create the POSIX archive
+        if: matrix.os != 'windows'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.stage.outputs.archive }}
+          DIST_NAME: ${{ steps.stage.outputs.dist-name }}
+        run: tar --create --xz --file "$ARCHIVE" "$DIST_NAME"
+      - name: Create the Windows archive
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.stage.outputs.archive }}
+          DIST_NAME: ${{ steps.stage.outputs.dist-name }}
+        run: Compress-Archive -Path $env:DIST_NAME -DestinationPath $env:ARCHIVE
+      - name: Upload the distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.stage.outputs.dist-name }}
+          path: ${{ steps.stage.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish to crates.io
+    if: github.event_name == 'push'
+    needs: [version, check, build, test]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install tools
+        uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
+        with:
+          version: 2026.7.7
+          install_args: rust aqua:nushell/nushell
+          experimental: true
+      - name: Apply the package version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          nu -c '
+            open Cargo.toml
+            | update workspace.package.version $env.VERSION
+            | to toml
+            | save --force Cargo.toml
+          '
+          cargo update --offline --package sacho
+      - name: Check for an existing publication
+        id: existing
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 - <<'PY'
+          import io
+          import json
+          import os
+          import tarfile
+          from urllib.error import HTTPError
+          from urllib.parse import quote, urljoin
+          from urllib.request import Request, urlopen
+
+          crate = "sacho"
+          version = os.environ["VERSION"]
+          current_sha = os.environ["GITHUB_SHA"]
+          output_path = os.environ["GITHUB_OUTPUT"]
+          api_url = f"https://crates.io/api/v1/crates/{crate}/{quote(version, safe='')}"
+          request = Request(api_url, headers={"User-Agent": "sacho GitHub Actions"})
+
+          try:
+              with urlopen(request) as response:
+                  metadata = json.load(response)
+          except HTTPError as error:
+              if error.code == 404:
+                  with open(output_path, "a", encoding="utf-8") as output:
+                      output.write("already-published=false\n")
+                  raise SystemExit(0)
+              raise
+
+          download_url = urljoin("https://crates.io", metadata["version"]["dl_path"])
+          download = Request(download_url, headers={"User-Agent": "sacho GitHub Actions"})
+          with urlopen(download) as response:
+              crate_bytes = response.read()
+
+          with tarfile.open(fileobj=io.BytesIO(crate_bytes), mode="r:gz") as archive:
+              members = [
+                  member
+                  for member in archive.getmembers()
+                  if member.name.endswith("/.cargo_vcs_info.json")
+              ]
+              if len(members) != 1:
+                  raise SystemExit("published crate has no unique Cargo VCS metadata")
+              vcs_file = archive.extractfile(members[0])
+              if vcs_file is None:
+                  raise SystemExit("unable to read published Cargo VCS metadata")
+              vcs_info = json.load(vcs_file)
+
+          published_sha = vcs_info.get("git", {}).get("sha1")
+          if published_sha != current_sha:
+              raise SystemExit(
+                  f"version {version} is already published from {published_sha}, "
+                  f"not {current_sha}"
+              )
+
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write("already-published=true\n")
+          PY
+      - name: Record the existing publication
+        if: steps.existing.outputs.already-published == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: echo "sacho $VERSION is already published from $GITHUB_SHA." >> "$GITHUB_STEP_SUMMARY"
+      - name: Authenticate with crates.io
+        if: steps.existing.outputs.already-published != 'true'
+        id: crates-io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish the crate
+        if: steps.existing.outputs.already-published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+        run: cargo publish --allow-dirty --locked --package sacho

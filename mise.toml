@@ -6,6 +6,7 @@ experimental = true
 [tools]
 "aqua:dahlia/hongdown" = "0.5.1"
 "aqua:nushell/nushell" = "0.114.0"
+"aqua:rhysd/actionlint" = "1.7.12"
 "cargo:cargo-mutants" = "27.1.0"
 jj = "0.43.0"
 "pipx:mercurial" = "7.2.3"
@@ -37,6 +38,7 @@ mise generate git-pre-commit --write --task=check
 [tasks.check]
 description = "Run type check, lint, and check Markdown format"
 run = [
+  "actionlint",
   "cargo check",
   "cargo clippy",
   "cargo fmt --check",
