@@ -23,6 +23,88 @@ one output style, and one set of invariants. Configuration exists to describe
 your repository, not to customize the philosophy.
 
 
+How it works
+------------
+
+Each user-visible change lives in a small Markdown file under *changes.d/*.
+These files are called fragments. They are the source of truth for the next
+release; the unreleased section in *CHANGES.md* is generated output. Sacho
+sorts and formats the fragments, then turns them into a dated version section
+when you release. The consumed fragment files are deleted, while the released
+section is left untouched.
+
+A fragment contains exactly one top-level unordered list. One item is usual,
+but related changes may share a fragment:
+
+~~~~ markdown
+ -  Added `clear()` to remove every entry at once.
+ -  Added `is_empty()` for checking whether a collection has entries.
+~~~~
+
+Name fragments after the change itself, such as *clear-function.md*, rather
+than after an issue or pull request number. A later change to the same feature
+can then update the existing fragment instead of documenting an intermediate
+state that never shipped.
+
+
+Basic workflow
+--------------
+
+With `sacho` on your `PATH`, initialize it at the repository root and choose
+the version you are preparing:
+
+~~~~ sh
+sacho init
+sacho next 1.2.0
+~~~~
+
+Initialization creates *sacho.toml*, *changes.d/*, and *CHANGES.md*. It also
+sets up the merge integration supported by the detected version-control
+system. The interactive setup can infer an issue-link template from the
+repository URL and offer to install a Git pre-commit hook.
+
+Create one fragment for each user-visible change, then edit the path printed by
+the command:
+
+~~~~ sh
+sacho add clear-function
+~~~~
+
+Repositories configured with sections, such as packages in a monorepo, select
+the section by its configured id:
+
+~~~~ sh
+sacho add --section core clear-function
+~~~~
+
+Format the fragments, inspect the compiled release, and check the repository
+before committing:
+
+~~~~ sh
+sacho fmt
+sacho preview
+sacho check
+~~~~
+
+`sacho fmt` also refreshes the materialized unreleased section. Do not edit
+that section in *CHANGES.md* by hand; edit its fragments and run `sacho sync`
+if the generated copy falls out of date. To enforce fragment coverage for
+source changes, configure `[check].paths` and use `sacho check --staged` for
+staged Git changes or `sacho check --base <revision>` in CI.
+
+When the version is ready, compile and consume its fragments. This command
+releases the version stored by `sacho next`, uses the current local date, and
+starts the next version:
+
+~~~~ sh
+sacho release --next 1.3.0
+~~~~
+
+If no next version has been set, pass the release version explicitly, for
+example `sacho release 1.2.0`. Use `--date YYYY-MM-DD` when the release date
+must be supplied rather than taken from the local clock.
+
+
 Version-control integration
 ---------------------------
 
