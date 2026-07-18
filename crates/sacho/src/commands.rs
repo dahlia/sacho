@@ -58,6 +58,11 @@ pub struct InitOptions {
     /// Materialization policy for newly generated configuration.
     pub materialize: Option<bool>,
 
+    /// Executable used by installed VCS integrations.
+    ///
+    /// The current process executable is used when this is absent.
+    pub integration_executable: Option<PathBuf>,
+
     /// Whether to install or update Sacho's Git commit hook blocks.
     pub install_hook: bool,
 
@@ -550,6 +555,7 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     let lock = acquire_mutation_lock_at_path(lock_path)?;
     let (created_config, mut config) = load_init_config(&root, &config_path, &options)?;
     validate_init_config_paths(&root, &mut config, &lock.path)?;
+    let integration_executable = resolve_integration_executable(&options)?;
     let mut result = InitResult::default();
     let fragment_dir = root.join(&config.fragments.directory);
     let fragment_dir_exists = fragment_dir.exists();
@@ -617,8 +623,12 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     }
 
     match config.vcs.preset {
-        VcsPreset::Git => apply_git_integration(&root, &config, &mut result)?,
-        VcsPreset::Hg => apply_hg_integration(&root, &config, &mut result)?,
+        VcsPreset::Git => {
+            apply_git_integration(&root, &config, &integration_executable, &mut result)?;
+        }
+        VcsPreset::Hg => {
+            apply_hg_integration(&root, &config, &integration_executable, &mut result)?;
+        }
         VcsPreset::Jj => result.manual_actions_required.push(String::from(
             "Jujutsu does not support per-path merge drivers; after resolving concurrent fragment changes, run `sacho sync --force`",
         )),
@@ -626,7 +636,12 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     }
     if options.install_hook {
         if config.vcs.preset == VcsPreset::Git && is_git_repository(&root) {
-            install_commit_hooks(&root, options.append_existing_hook, &mut result)?;
+            install_commit_hooks(
+                &root,
+                &integration_executable,
+                options.append_existing_hook,
+                &mut result,
+            )?;
         } else if config.vcs.preset == VcsPreset::Git {
             result.manual_actions_required.push(String::from(
                 "commit hooks not installed: automatic installation requires a Git repository",
@@ -640,6 +655,38 @@ pub fn init_repository(root: impl AsRef<Path>, options: InitOptions) -> Result<I
     }
 
     Ok(result)
+}
+
+fn resolve_integration_executable(options: &InitOptions) -> Result<String> {
+    let path = match &options.integration_executable {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().map_err(|source| Error::CurrentExecutable { source })?,
+    };
+    let Some(executable) = path.to_str() else {
+        return Err(Error::InvalidIntegrationExecutable {
+            path,
+            reason: "path is not valid UTF-8",
+        });
+    };
+    if executable.is_empty() {
+        return Err(Error::InvalidIntegrationExecutable {
+            path,
+            reason: "path must not be empty",
+        });
+    }
+    if executable.trim() != executable {
+        return Err(Error::InvalidIntegrationExecutable {
+            path,
+            reason: "path must not begin or end with whitespace",
+        });
+    }
+    if executable.contains(['\n', '\r']) {
+        return Err(Error::InvalidIntegrationExecutable {
+            path,
+            reason: "path must not contain a newline",
+        });
+    }
+    Ok(executable.to_owned())
 }
 
 /// Infers a sanitized repository web URL from local VCS configuration.
@@ -4786,7 +4833,12 @@ fn initial_materialized_changelog(config: &Config) -> String {
     changelog
 }
 
-fn apply_git_integration(root: &Path, config: &Config, result: &mut InitResult) -> Result<()> {
+fn apply_git_integration(
+    root: &Path,
+    config: &Config,
+    integration_executable: &str,
+    result: &mut InitResult,
+) -> Result<()> {
     if config.vcs.preset != VcsPreset::Git || !is_git_repository(root) {
         return Ok(());
     }
@@ -4832,7 +4884,10 @@ fn apply_git_integration(root: &Path, config: &Config, result: &mut InitResult) 
     set_git_config(
         root,
         "merge.sacho.driver",
-        "sacho merge-driver %O %A %B %P",
+        &format!(
+            "{} merge-driver %O %A %B %P",
+            shell_quote(integration_executable)
+        ),
         result,
     )?;
     if git_config_get(root, "merge.ours.driver").is_err() {
@@ -4844,7 +4899,12 @@ fn apply_git_integration(root: &Path, config: &Config, result: &mut InitResult) 
 const HG_INTEGRATION_BEGIN: &str = "# sacho integration begin";
 const HG_INTEGRATION_END: &str = "# sacho integration end";
 
-fn apply_hg_integration(root: &Path, config: &Config, result: &mut InitResult) -> Result<()> {
+fn apply_hg_integration(
+    root: &Path,
+    config: &Config,
+    integration_executable: &str,
+    result: &mut InitResult,
+) -> Result<()> {
     let hg_dir = root.join(".hg");
     if !hg_dir.is_dir() {
         result.manual_actions_required.push(String::from(
@@ -4870,13 +4930,14 @@ fn apply_hg_integration(root: &Path, config: &Config, result: &mut InitResult) -
     } else {
         None
     };
+    let hook_command = format!("{} hook-hg-update", shell_quote(integration_executable));
     let block = if let Some(changelog) = &changelog {
         format!(
-            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{changelog} = sacho\nfilepath:{next} = :local\n\n[merge-tools]\nsacho.executable = sacho\nsacho.args = merge-driver $base $output $other $output\nsacho.premerge = false\nsacho.priority = -100\n\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{changelog} = sacho\nfilepath:{next} = :local\n\n[merge-tools]\nsacho.executable = {integration_executable}\nsacho.args = merge-driver $base $output $other $output\nsacho.premerge = false\nsacho.priority = -100\n\n[hooks]\nupdate.sacho = {hook_command}\n{HG_INTEGRATION_END}\n"
         )
     } else {
         format!(
-            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{next} = :local\n\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
+            "{HG_INTEGRATION_BEGIN}\n[merge-patterns]\nfilepath:{next} = :local\n\n[hooks]\nupdate.sacho = {hook_command}\n{HG_INTEGRATION_END}\n"
         )
     };
     let hgrc = hg_dir.join("hgrc");
@@ -4885,7 +4946,13 @@ fn apply_hg_integration(root: &Path, config: &Config, result: &mut InitResult) -
         Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
         Err(source) => return Err(Error::ReadFile { path: hgrc, source }),
     };
-    let edited = match edit_hgrc(&old, &block, changelog.as_deref(), &next) {
+    let edited = match edit_hgrc(
+        &old,
+        &block,
+        changelog.as_deref(),
+        &next,
+        integration_executable,
+    ) {
         Ok(edited) => edited,
         Err(reason) => {
             result.manual_actions_required.push(format!(
@@ -4928,6 +4995,7 @@ fn edit_hgrc(
     block: &str,
     changelog: Option<&str>,
     next: &str,
+    integration_executable: &str,
 ) -> std::result::Result<String, String> {
     match (
         source.find(HG_INTEGRATION_BEGIN),
@@ -4942,11 +5010,11 @@ fn edit_hgrc(
             if !output.ends_with('\n') {
                 output.push('\n');
             }
-            validate_hgrc_integration_settings(&output, changelog, next)?;
+            validate_hgrc_integration_settings(&output, changelog, next, integration_executable)?;
             Ok(output)
         }
         (None, None) => {
-            validate_hgrc_integration_settings(source, changelog, next)?;
+            validate_hgrc_integration_settings(source, changelog, next, integration_executable)?;
             let mut output = source.to_owned();
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
@@ -4965,12 +5033,18 @@ fn validate_hgrc_integration_settings(
     source: &str,
     changelog: Option<&str>,
     next: &str,
+    integration_executable: &str,
 ) -> std::result::Result<(), String> {
+    let hook_command = format!("{} hook-hg-update", shell_quote(integration_executable));
     let mut settings = Vec::new();
     if let Some(changelog) = changelog {
         settings.extend([
             ("merge-patterns", format!("filepath:{changelog}"), "sacho"),
-            ("merge-tools", String::from("sacho.executable"), "sacho"),
+            (
+                "merge-tools",
+                String::from("sacho.executable"),
+                integration_executable,
+            ),
             (
                 "merge-tools",
                 String::from("sacho.args"),
@@ -4982,11 +5056,7 @@ fn validate_hgrc_integration_settings(
     }
     settings.extend([
         ("merge-patterns", format!("filepath:{next}"), ":local"),
-        (
-            "hooks",
-            String::from("update.sacho"),
-            "sacho hook-hg-update",
-        ),
+        ("hooks", String::from("update.sacho"), hook_command.as_str()),
     ]);
     for (section, key, value) in settings {
         if let Some(existing) = hgrc_value(source, section, &key)
@@ -5123,27 +5193,35 @@ fn gitattributes_path_end(line: &str) -> Option<usize> {
 
 fn install_commit_hooks(
     root: &Path,
+    integration_executable: &str,
     append_existing_hook: bool,
     result: &mut InitResult,
 ) -> Result<()> {
+    let executable = shell_quote(integration_executable);
     install_git_hook(
         root,
         "pre-commit",
-        "# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n",
+        &format!(
+            "# sacho pre-commit begin\n{executable} hook-pre-commit\n# sacho pre-commit end\n"
+        ),
         append_existing_hook,
         result,
     )?;
     install_git_hook(
         root,
         "commit-msg",
-        "# sacho commit-msg begin\nsacho hook-commit-msg \"$1\"\n# sacho commit-msg end\n",
+        &format!(
+            "# sacho commit-msg begin\n{executable} hook-commit-msg \"$1\"\n# sacho commit-msg end\n"
+        ),
         append_existing_hook,
         result,
     )?;
     install_git_hook(
         root,
         "reference-transaction",
-        "# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        sacho hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n",
+        &format!(
+            "# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        {executable} hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n"
+        ),
         append_existing_hook,
         result,
     )
@@ -5339,6 +5417,18 @@ fn quote_git_attr_path(path: &str) -> String {
     } else {
         path.to_owned()
     }
+}
+
+fn shell_quote(argument: &str) -> String {
+    if !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_@%+=:,./-".contains(character))
+    {
+        return argument.to_owned();
+    }
+
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
 }
 
 fn git<I, S>(root: &Path, args: I) -> Result<()>
@@ -5566,6 +5656,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: Some(String::from("   ")),
@@ -5698,8 +5789,12 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir(temp.path().join(".hg")).expect("hg marker");
 
-        let first = init_repository(temp.path(), InitOptions::default()).expect("first init");
-        let second = init_repository(temp.path(), InitOptions::default()).expect("second init");
+        let options = InitOptions {
+            integration_executable: Some(PathBuf::from("sacho")),
+            ..InitOptions::default()
+        };
+        let first = init_repository(temp.path(), options.clone()).expect("first init");
+        let second = init_repository(temp.path(), options).expect("second init");
         let hgrc = fs::read_to_string(temp.path().join(".hg/hgrc")).expect("hgrc");
 
         assert_eq!(hgrc.matches(HG_INTEGRATION_BEGIN).count(), 1);
@@ -5708,6 +5803,86 @@ mod tests {
         assert!(hgrc.contains("update.sacho = sacho hook-hg-update"));
         assert!(!first.local_hg_config_changes.is_empty());
         assert!(second.local_hg_config_changes.is_empty());
+    }
+
+    #[test]
+    fn init_uses_the_current_executable_for_git_integration() {
+        let temp = TempDir::new().expect("tempdir");
+        init_test_git_repository(temp.path());
+
+        init_repository(temp.path(), InitOptions::default()).expect("init");
+
+        let driver = git_config_get(temp.path(), "merge.sacho.driver").expect("merge driver");
+        let executable = std::env::current_exe().expect("current executable");
+        assert!(
+            driver.contains(&executable.to_string_lossy().into_owned()),
+            "driver {driver:?} does not contain {executable:?}"
+        );
+    }
+
+    #[test]
+    fn init_uses_an_explicit_executable_for_git_integration_and_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        init_test_git_repository(temp.path());
+
+        init_repository(
+            temp.path(),
+            InitOptions {
+                integration_executable: Some(PathBuf::from("tools/Sacho driver")),
+                install_hook: true,
+                ..InitOptions::default()
+            },
+        )
+        .expect("init");
+
+        assert_eq!(
+            git_config_get(temp.path(), "merge.sacho.driver")
+                .expect("merge driver")
+                .trim(),
+            "'tools/Sacho driver' merge-driver %O %A %B %P"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("pre-commit hook"),
+            "#!/bin/sh\n# sacho pre-commit begin\n'tools/Sacho driver' hook-pre-commit\n# sacho pre-commit end\n"
+        );
+        assert!(
+            fs::read_to_string(temp.path().join(".git/hooks/commit-msg"))
+                .expect("commit-msg hook")
+                .contains("'tools/Sacho driver' hook-commit-msg \"$1\"")
+        );
+        assert!(
+            fs::read_to_string(temp.path().join(".git/hooks/reference-transaction"))
+                .expect("reference-transaction hook")
+                .contains("'tools/Sacho driver' hook-reference-transaction \"$1\"")
+        );
+    }
+
+    #[test]
+    fn integration_executable_rejects_empty_and_multiline_paths() {
+        for path in ["", " tools/sacho", "tools/sacho ", "tools/sacho\nother"] {
+            let error = resolve_integration_executable(&InitOptions {
+                integration_executable: Some(PathBuf::from(path)),
+                ..InitOptions::default()
+            })
+            .expect_err("invalid integration executable");
+
+            assert!(matches!(error, Error::InvalidIntegrationExecutable { .. }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_executable_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = resolve_integration_executable(&InitOptions {
+            integration_executable: Some(PathBuf::from(OsString::from_vec(vec![0x80]))),
+            ..InitOptions::default()
+        })
+        .expect_err("non-UTF-8 integration executable");
+
+        assert!(matches!(error, Error::InvalidIntegrationExecutable { .. }));
     }
 
     #[test]
@@ -5720,7 +5895,14 @@ mod tests {
         )
         .expect("config");
 
-        let result = init_repository(temp.path(), InitOptions::default()).expect("init");
+        let result = init_repository(
+            temp.path(),
+            InitOptions {
+                integration_executable: Some(PathBuf::from("sacho")),
+                ..InitOptions::default()
+            },
+        )
+        .expect("init");
         let hgrc = fs::read_to_string(temp.path().join(".hg/hgrc")).expect("hgrc");
 
         assert!(!hgrc.contains("filepath:CHANGES.md = sacho"));
@@ -5744,8 +5926,14 @@ mod tests {
             "{HG_INTEGRATION_BEGIN}\n[hooks]\nupdate.sacho = sacho hook-hg-update\n{HG_INTEGRATION_END}\n"
         );
 
-        let error = edit_hgrc(source, &block, Some("CHANGES.md"), "changes.d/next")
-            .expect_err("conflicting hook must not be overwritten");
+        let error = edit_hgrc(
+            source,
+            &block,
+            Some("CHANGES.md"),
+            "changes.d/next",
+            "sacho",
+        )
+        .expect_err("conflicting hook must not be overwritten");
 
         assert!(error.contains("incompatible value"));
         assert_eq!(source, "[hooks]\nupdate.sacho = other-command\n");
@@ -5759,8 +5947,14 @@ mod tests {
         for (key, value) in [("sacho.premerge", "true"), ("sacho.priority", "0")] {
             let source = format!("[merge-tools]\n{key} = {value}\n");
 
-            let error = edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next")
-                .expect_err("incompatible merge-tool setting must not be overwritten");
+            let error = edit_hgrc(
+                &source,
+                &block,
+                Some("CHANGES.md"),
+                "changes.d/next",
+                "sacho",
+            )
+            .expect_err("incompatible merge-tool setting must not be overwritten");
 
             assert!(error.contains(key), "{error}");
             assert!(error.contains("incompatible value"), "{error}");
@@ -5774,8 +5968,14 @@ mod tests {
         );
         let source = format!("{block}update.sacho = false\n");
 
-        let error = edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next")
-            .expect_err("later conflicting hook must remain visible");
+        let error = edit_hgrc(
+            &source,
+            &block,
+            Some("CHANGES.md"),
+            "changes.d/next",
+            "sacho",
+        )
+        .expect_err("later conflicting hook must remain visible");
 
         assert!(error.contains("update.sacho"), "{error}");
         assert!(error.contains("incompatible value"), "{error}");
@@ -5806,7 +6006,13 @@ mod tests {
             format!("{HG_INTEGRATION_END}\n{HG_INTEGRATION_BEGIN}\n"),
         ] {
             assert_eq!(
-                edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next"),
+                edit_hgrc(
+                    &source,
+                    &block,
+                    Some("CHANGES.md"),
+                    "changes.d/next",
+                    "sacho",
+                ),
                 Err(String::from("existing Sacho marker block is malformed"))
             );
         }
@@ -5817,15 +6023,27 @@ mod tests {
         let block = format!("{HG_INTEGRATION_BEGIN}\nvalue\n{HG_INTEGRATION_END}\n");
 
         assert_eq!(
-            edit_hgrc("", &block, Some("CHANGES.md"), "changes.d/next"),
+            edit_hgrc("", &block, Some("CHANGES.md"), "changes.d/next", "sacho",),
             Ok(block.clone())
         );
         assert_eq!(
-            edit_hgrc("[ui]\n", &block, Some("CHANGES.md"), "changes.d/next",),
+            edit_hgrc(
+                "[ui]\n",
+                &block,
+                Some("CHANGES.md"),
+                "changes.d/next",
+                "sacho",
+            ),
             Ok(format!("[ui]\n\n{block}"))
         );
         assert_eq!(
-            edit_hgrc("[ui]", &block, Some("CHANGES.md"), "changes.d/next"),
+            edit_hgrc(
+                "[ui]",
+                &block,
+                Some("CHANGES.md"),
+                "changes.d/next",
+                "sacho",
+            ),
             Ok(format!("[ui]\n\n{block}"))
         );
     }
@@ -5837,7 +6055,13 @@ mod tests {
         let block = format!("{HG_INTEGRATION_BEGIN}\nnew\n{HG_INTEGRATION_END}\n");
 
         assert_eq!(
-            edit_hgrc(&source, &block, Some("CHANGES.md"), "changes.d/next",),
+            edit_hgrc(
+                &source,
+                &block,
+                Some("CHANGES.md"),
+                "changes.d/next",
+                "sacho",
+            ),
             Ok(format!("[ui]\n{block}[extensions]\n"))
         );
     }
@@ -5894,6 +6118,7 @@ mod tests {
                 changelog_path: Some(PathBuf::from("docs/changes.md")),
                 fragment_directory: None,
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -5924,6 +6149,7 @@ mod tests {
                 changelog_path: Some(PathBuf::from("docs/changes.md")),
                 fragment_directory: Some(PathBuf::from("fragments")),
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -5947,6 +6173,7 @@ mod tests {
                 changelog_path: Some(PathBuf::from(MUTATION_LOCK_FILE)),
                 fragment_directory: Some(PathBuf::from("fragments")),
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -5976,6 +6203,7 @@ mod tests {
                 changelog_path: Some(lock_path.clone()),
                 fragment_directory: Some(PathBuf::from("fragments")),
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6004,6 +6232,7 @@ mod tests {
                     changelog_path: None,
                     fragment_directory: Some(PathBuf::from(marker)),
                     materialize: None,
+                    integration_executable: None,
                     install_hook: false,
                     append_existing_hook: false,
                     repository_url: None,
@@ -6034,6 +6263,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: Some(PathBuf::from(".git")),
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6077,6 +6307,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6105,6 +6336,7 @@ mod tests {
                 changelog_path: Some(PathBuf::from(Repository::CONFIG_FILE)),
                 fragment_directory: Some(PathBuf::from("fragments")),
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6136,6 +6368,7 @@ mod tests {
                 changelog_path: Some(alias.clone()),
                 fragment_directory: Some(PathBuf::from("fragments")),
                 materialize: Some(true),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6204,6 +6437,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6230,6 +6464,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6251,6 +6486,7 @@ mod tests {
                 changelog_path: Some(PathBuf::from("CHANGES.md")),
                 fragment_directory: None,
                 materialize: Some(false),
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6278,6 +6514,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6306,6 +6543,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6328,6 +6566,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
@@ -6372,6 +6611,17 @@ mod tests {
             quote_git_attr_path("docs/change log.md"),
             "\"docs/change log.md\""
         );
+    }
+
+    #[test]
+    fn shell_arguments_are_quoted_only_when_needed() {
+        assert_eq!(shell_quote("tools/sacho-1"), "tools/sacho-1");
+        assert_eq!(shell_quote("tools/Sacho driver"), "'tools/Sacho driver'");
+        assert_eq!(
+            shell_quote("tools/Sacho's driver"),
+            "'tools/Sacho'\"'\"'s driver'"
+        );
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
@@ -7063,7 +7313,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // APFS rejects the deliberately non-UTF-8 path before carry can inspect it.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn carry_accepts_existing_non_utf8_fragments_in_discovery_order() {
         use std::ffi::OsString;
@@ -9367,6 +9618,7 @@ mod tests {
                 changelog_path: None,
                 fragment_directory: None,
                 materialize: None,
+                integration_executable: None,
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,

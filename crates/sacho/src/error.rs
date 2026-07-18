@@ -33,6 +33,23 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// The current Sacho executable could not be located for repository integration.
+    #[snafu(display("failed to determine the current Sacho executable: {source}"))]
+    CurrentExecutable {
+        /// Underlying executable lookup error.
+        source: std::io::Error,
+    },
+
+    /// The executable selected for repository integration cannot be represented safely.
+    #[snafu(display("invalid integration executable {}: {reason}", path.display()))]
+    InvalidIntegrationExecutable {
+        /// Invalid executable path.
+        path: PathBuf,
+
+        /// Reason the executable cannot be used.
+        reason: &'static str,
+    },
+
     /// A file could not be read.
     #[snafu(display("failed to read {}: {source}", path.display()))]
     ReadFile {

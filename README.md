@@ -61,7 +61,9 @@ sacho next 1.2.0
 Initialization creates *sacho.toml*, *changes.d/*, and *CHANGES.md*. It also
 sets up the merge integration supported by the detected version-control
 system. The interactive setup can infer an issue-link template from the
-repository URL and offer to install a Git pre-commit hook.
+repository URL and offer to install a Git pre-commit hook. Repository
+integrations use the executable that ran `init`; pass
+`--integration-executable PATH` to use another executable.
 
 Create one fragment for each user-visible change, then edit the path printed by
 the command:
@@ -162,8 +164,10 @@ The query output contracts are:
 `sacho init` installs Git merge attributes and drivers in Git repositories. In
 Mercurial repositories it installs an idempotent block in *.hg/hgrc* containing
 a successful-merge update hook and, when changelog materialization is enabled,
-the changelog merge driver. Jujutsu has no per-path merge-driver hook; after
-resolving a concurrent fragment merge, run `sacho sync --force`.
+the changelog merge driver. These integrations invoke the executable that ran
+`init` unless `--integration-executable` selects another one. Jujutsu has no
+per-path merge-driver hook; after resolving a concurrent fragment merge, run
+`sacho sync --force`.
 
 
 Etymology

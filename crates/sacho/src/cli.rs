@@ -48,6 +48,14 @@ enum Command {
             help = "Repository URL for # links in new configuration"
         )]
         repository_url: Option<String>,
+
+        /// Executable used by installed VCS integrations.
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Executable used by installed VCS integrations"
+        )]
+        integration_executable: Option<PathBuf>,
     },
 
     /// Create a new changelog fragment.
@@ -177,12 +185,14 @@ impl Cli {
                 no_interactive,
                 install_hook,
                 repository_url,
+                integration_executable,
             } => {
                 let options = resolve_init_options(
                     interactive,
                     no_interactive,
                     install_hook,
                     repository_url,
+                    integration_executable,
                 )?;
                 let result = init_repository(".", options)?;
                 print_init_result(&result);
@@ -455,6 +465,7 @@ fn resolve_init_options(
     no_interactive: bool,
     install_hook: bool,
     repository_url: Option<String>,
+    integration_executable: Option<PathBuf>,
 ) -> Result<InitOptions, CliReport> {
     let should_prompt = init_should_prompt(
         interactive,
@@ -482,6 +493,7 @@ fn resolve_init_options(
             changelog_path: Some(PathBuf::from(changelog_path)),
             fragment_directory: Some(PathBuf::from(fragment_directory)),
             materialize: Some(materialize),
+            integration_executable,
             install_hook,
             append_existing_hook,
             repository_url,
@@ -491,6 +503,7 @@ fn resolve_init_options(
             changelog_path: None,
             fragment_directory: None,
             materialize: None,
+            integration_executable,
             install_hook,
             append_existing_hook: false,
             repository_url,
@@ -726,6 +739,22 @@ mod tests {
         assert!(!init_should_prompt(false, false, true, false).expect("no prompt"));
         assert!(!init_should_prompt(false, false, false, true).expect("no prompt"));
         assert!(!init_should_prompt(false, true, true, true).expect("disabled"));
+    }
+
+    #[test]
+    fn init_accepts_an_integration_executable_override() {
+        let cli =
+            Cli::try_parse_from(["sacho", "init", "--integration-executable", "tools/sacho-1"])
+                .expect("integration executable option");
+
+        let Command::Init {
+            integration_executable,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(integration_executable, Some(PathBuf::from("tools/sacho-1")));
     }
 
     #[test]

@@ -78,7 +78,7 @@ fn help_lists_commands() {
 }
 
 #[test]
-fn init_help_describes_the_repository_url_option() {
+fn init_help_describes_repository_and_integration_options() {
     let mut command = Command::cargo_bin("sacho").expect("binary");
 
     command
@@ -88,6 +88,10 @@ fn init_help_describes_the_repository_url_option() {
         .stdout(predicate::str::contains("--repository-url <URL>"))
         .stdout(predicate::str::contains(
             "Repository URL for # links in new configuration",
+        ))
+        .stdout(predicate::str::contains("--integration-executable <PATH>"))
+        .stdout(predicate::str::contains(
+            "Executable used by installed VCS integrations",
         ));
 }
 
@@ -154,10 +158,9 @@ fn init_scaffolds_empty_git_repository() {
         std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
         "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
     );
-    assert_eq!(
-        git_output(temp.path(), ["config", "--get", "merge.sacho.driver"]).trim(),
-        "sacho merge-driver %O %A %B %P"
-    );
+    let merge_driver = git_output(temp.path(), ["config", "--get", "merge.sacho.driver"]);
+    assert!(merge_driver.contains(env!("CARGO_BIN_EXE_sacho")));
+    assert!(merge_driver.trim().ends_with("merge-driver %O %A %B %P"));
     assert!(!temp.path().join(".git/hooks/pre-commit").exists());
 
     let mut command = Command::cargo_bin("sacho").expect("binary");
@@ -171,6 +174,29 @@ fn init_scaffolds_empty_git_repository() {
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".gitattributes")).expect("attributes"),
         "CHANGES.md merge=sacho\nchanges.d/next merge=ours\n"
+    );
+}
+
+#[test]
+fn init_uses_an_explicit_integration_executable() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args([
+            "init",
+            "--no-interactive",
+            "--integration-executable",
+            "sacho-1",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        git_output(temp.path(), ["config", "--get", "merge.sacho.driver"]).trim(),
+        "sacho-1 merge-driver %O %A %B %P"
     );
 }
 
@@ -438,16 +464,25 @@ fn init_install_hook_writes_marked_hook() {
 
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".git/hooks/pre-commit")).expect("hook"),
-        "#!/bin/sh\n# sacho pre-commit begin\nsacho hook-pre-commit\n# sacho pre-commit end\n"
+        format!(
+            "#!/bin/sh\n# sacho pre-commit begin\n{} hook-pre-commit\n# sacho pre-commit end\n",
+            env!("CARGO_BIN_EXE_sacho")
+        )
     );
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".git/hooks/commit-msg")).expect("commit hook"),
-        "#!/bin/sh\n# sacho commit-msg begin\nsacho hook-commit-msg \"$1\"\n# sacho commit-msg end\n"
+        format!(
+            "#!/bin/sh\n# sacho commit-msg begin\n{} hook-commit-msg \"$1\"\n# sacho commit-msg end\n",
+            env!("CARGO_BIN_EXE_sacho")
+        )
     );
     assert_eq!(
         std::fs::read_to_string(temp.path().join(".git/hooks/reference-transaction"))
             .expect("reference hook"),
-        "#!/bin/sh\n# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        sacho hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n"
+        format!(
+            "#!/bin/sh\n# sacho reference-transaction begin\nif test \"$1\" = prepared\nthen\n    sacho_state=$(git rev-parse --git-path sacho-commit-state) || exit $?\n    if test -f \"$sacho_state\"\n    then\n        {} hook-reference-transaction \"$1\"\n    fi\nfi\n# sacho reference-transaction end\n",
+            env!("CARGO_BIN_EXE_sacho")
+        )
     );
 }
 
