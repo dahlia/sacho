@@ -5,6 +5,7 @@ experimental = true
 
 [tools]
 "aqua:dahlia/hongdown" = "0.5.1"
+"aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:nushell/nushell" = "0.114.0"
 "aqua:rhysd/actionlint" = "1.7.12"
 "cargo:cargo-mutants" = "27.1.0"

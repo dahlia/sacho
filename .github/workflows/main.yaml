@@ -85,6 +85,7 @@ jobs:
             rust
             aqua:nushell/nushell
             aqua:dahlia/hongdown
+            aqua:koalaman/shellcheck
             aqua:rhysd/actionlint
           experimental: true
       - name: Check the project
@@ -216,12 +217,12 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          nu -c '
+          nu -c "
             open Cargo.toml
-            | update workspace.package.version $env.VERSION
+            | update workspace.package.version \$env.VERSION
             | to toml
             | save --force Cargo.toml
-          '
+          "
           cargo update --offline --package sacho
       - name: Build the distribution binary
         shell: bash
@@ -328,12 +329,12 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          nu -c '
+          nu -c "
             open Cargo.toml
-            | update workspace.package.version $env.VERSION
+            | update workspace.package.version \$env.VERSION
             | to toml
             | save --force Cargo.toml
-          '
+          "
           cargo update --offline --package sacho
       - name: Check for an existing publication
         id: existing
