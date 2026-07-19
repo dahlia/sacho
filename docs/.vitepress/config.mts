@@ -9,6 +9,11 @@ if (!existsSync(philosophyPath)) {
   throw new Error("PHILOSOPHY.md is required by docs/philosophy.md");
 }
 
+const changesPath = new URL("../../CHANGES.md", import.meta.url);
+if (!existsSync(changesPath)) {
+  throw new Error("CHANGES.md is required by docs/changes.md");
+}
+
 const docsHostname = process.env.DOCS_HOSTNAME ?? "https://sacho.dev";
 
 const config = defineConfig({
@@ -57,8 +62,11 @@ const config = defineConfig({
     },
     editLink: {
       pattern: ({ filePath }) => {
-        const sourcePath =
-          filePath === "philosophy.md" ? "PHILOSOPHY.md" : `docs/${filePath}`;
+        const includedSources: Record<string, string> = {
+          "changes.md": "CHANGES.md",
+          "philosophy.md": "PHILOSOPHY.md",
+        };
+        const sourcePath = includedSources[filePath] ?? `docs/${filePath}`;
         return `https://github.com/dahlia/sacho/edit/main/${sourcePath}`;
       },
       text: "Edit this page on GitHub",
@@ -111,6 +119,7 @@ const config = defineConfig({
           { text: "Commands", link: "/reference/commands" },
           { text: "Configuration", link: "/reference/configuration" },
           { text: "Troubleshooting", link: "/troubleshooting" },
+          { text: "Changelog", link: "/changes" },
         ],
       },
     ],
