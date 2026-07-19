@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { defineConfig } from "vitepress";
 import { withFolderTree } from "vitepress-plugin-folder-tree";
+import llmstxt from "vitepress-plugin-llms";
 import { withMermaid } from "vitepress-plugin-mermaid";
 
 const philosophyPath = new URL("../../PHILOSOPHY.md", import.meta.url);
@@ -84,6 +85,9 @@ const config = defineConfig({
     socialLinks: [
       { icon: "github", link: "https://github.com/dahlia/sacho" },
     ],
+  },
+  vite: {
+    plugins: [llmstxt({ domain: docsHostname })],
   },
 });
 
