@@ -10,7 +10,7 @@ edition = "2024"
 authors = ["Hong Minhee <hong@minhee.org>"]
 license = "GPL-3.0-only"
 readme = "README.md"
-homepage = "https://github.com/dahlia/sacho"
+homepage = "https://sacho.dev/"
 repository = "https://github.com/dahlia/sacho"
 
 [workspace.lints.rust]

@@ -117,7 +117,7 @@ export async function stagePlatform({
     description: `The Sacho binary for ${target}`,
     license: "GPL-3.0-only",
     author: "Hong Minhee <hong@minhee.org>",
-    homepage: "https://github.com/dahlia/sacho",
+    homepage: "https://sacho.dev/",
     repository: {
       type: "git",
       url: "git+https://github.com/dahlia/sacho.git",
