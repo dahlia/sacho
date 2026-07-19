@@ -132,6 +132,44 @@ jobs:
       - name: Test the project
         run: mise test
 
+  docs:
+    name: Deploy documentation
+    if: github.event_name == 'push'
+    needs: [check, build, test]
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: docs-${{ github.ref_type == 'tag' && 'production' || 'canary' }}
+      cancel-in-progress: ${{ github.ref_type != 'tag' }}
+    environment:
+      name: docs-${{ github.ref_type == 'tag' && 'production' || 'canary' }}
+      url: ${{ github.ref_type == 'tag' && 'https://sacho.dev' || 'https://canary.sacho.dev' }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install documentation dependencies
+        working-directory: docs
+        run: npm ci
+      - name: Build the documentation
+        working-directory: docs
+        run: npm run build
+      - name: Deploy the documentation
+        working-directory: docs
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          DEPLOYMENT_BRANCH: ${{ github.ref_type == 'tag' && 'main' || 'canary' }}
+        run: >-
+          npm run deploy --
+          --project-name sacho
+          --branch "$DEPLOYMENT_BRANCH"
+          --commit-hash "$GITHUB_SHA"
+
   dist:
     name: Dist (${{ matrix.os }}-${{ matrix.arch }})
     needs: [version, check, build, test]

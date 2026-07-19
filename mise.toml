@@ -51,6 +51,7 @@ fi' | save --force .git/hooks/reference-transaction
 
 [tasks.check]
 description = "Run type check, lint, and check Markdown format"
+depends = ["docs:install"]
 run = [
   "actionlint",
   "cargo check",
@@ -60,6 +61,7 @@ run = [
   "mise fmt --check",
   "npm test --prefix npm",
   "npm pack --dry-run --json ./npm",
+  "npm run --prefix docs build",
   "cargo run check",
 ]
 
@@ -90,3 +92,26 @@ run = "cargo mutants --workspace"
 description = "Run the Rust project"
 raw_args = true
 run = "cargo run --package sacho --"
+
+[tasks."docs:install"]
+description = "Install documentation dependencies"
+run = "npm ci --prefix docs"
+sources = ["docs/package.json", "docs/package-lock.json"]
+outputs = ["docs/node_modules/.package-lock.json"]
+
+[tasks."docs:dev"]
+description = "Run the documentation development server"
+depends = ["docs:install"]
+raw = true
+run = "npm run --prefix docs dev --"
+
+[tasks."docs:build"]
+description = "Build the documentation site"
+depends = ["docs:install"]
+run = "npm run --prefix docs build"
+
+[tasks."docs:preview"]
+description = "Preview the built documentation site"
+depends = ["docs:build"]
+raw = true
+run = "npm run --prefix docs preview --"
