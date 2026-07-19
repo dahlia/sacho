@@ -225,3 +225,13 @@ is the same insistence this tool makes against generating changelogs from
 commit messages after the fact.
 
 [1]: https://en.wikipedia.org/wiki/Veritable_Records_of_the_Joseon_Dynasty#Compilation_process
+
+
+License
+-------
+
+Copyright (C) 2026 Hong Minhee.
+
+Sacho is free software licensed under the GNU General Public License version 3
+only. It comes with no warranty, to the extent permitted by law. See
+[*LICENSE*](./LICENSE) for the full terms.

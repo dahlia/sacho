@@ -18,8 +18,21 @@ use sacho::commands::{
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::{Error, Repository};
 
+const HELP_LICENSE_NOTICE: &str = "Copyright (C) 2026 Hong Minhee\n\
+Sacho is free software under GNU GPLv3 only and comes with ABSOLUTELY NO WARRANTY.\n\
+Run `sacho --license` for details.";
+const LICENSE_NOTICE: &str = "Sacho  Copyright (C) 2026  Hong Minhee\n\
+This program comes with ABSOLUTELY NO WARRANTY.\n\
+This is free software, and you are welcome to redistribute it under the terms\n\
+of the GNU General Public License, version 3 only. For details, see below.";
+const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
+
 #[derive(Debug, Parser)]
-#[command(version, about = "Manage unreleased changelog fragments")]
+#[command(
+    version,
+    about = "Manage unreleased changelog fragments",
+    after_help = HELP_LICENSE_NOTICE
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -180,6 +193,10 @@ enum Command {
         path: String,
     },
 
+    /// Print copyright and license information.
+    #[command(hide = true, long_flag = "license")]
+    License,
+
     /// Run filesystem checks from Git's pre-commit hook.
     #[command(hide = true)]
     HookPreCommit,
@@ -333,6 +350,10 @@ impl Cli {
                 other,
                 path,
             } => run_merge_driver(original, current, other, path),
+            Command::License => {
+                print!("{LICENSE_NOTICE}\n\n{LICENSE_TEXT}");
+                Ok(ExitCode::SUCCESS)
+            }
             Command::HookPreCommit => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let report = check(&repo, CheckOptions::default())?;

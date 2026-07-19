@@ -78,7 +78,30 @@ fn help_lists_commands() {
         ))
         .stdout(predicate::str::contains(
             "Print a released changelog section",
-        ));
+        ))
+        .stdout(predicate::str::contains("Copyright (C) 2026 Hong Minhee"))
+        .stdout(predicate::str::contains("GNU GPLv3 only"))
+        .stdout(predicate::str::contains("ABSOLUTELY NO WARRANTY"))
+        .stdout(predicate::str::contains("sacho --license"));
+}
+
+#[test]
+fn license_option_prints_the_project_notice_and_full_license() {
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .arg("--license")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            "Sacho  Copyright (C) 2026  Hong Minhee\n",
+        ))
+        .stdout(predicate::str::contains(
+            "This program comes with ABSOLUTELY NO WARRANTY.",
+        ))
+        .stdout(predicate::str::contains("GNU GENERAL PUBLIC LICENSE"))
+        .stdout(predicate::str::contains("Version 3, 29 June 2007"))
+        .stdout(predicate::str::ends_with(include_str!("../../../LICENSE")));
 }
 
 #[test]
