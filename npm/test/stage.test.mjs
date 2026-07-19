@@ -16,6 +16,7 @@ test("stages the wrapper at the requested version", async (context) => {
   );
   assert.equal(packageJson.name, "@sacho/sacho");
   assert.equal(packageJson.version, "1.2.3");
+  assert.equal(packageJson.homepage, "https://sacho.dev/");
   for (const version of Object.values(packageJson.optionalDependencies)) {
     assert.equal(version, "1.2.3");
   }
@@ -45,6 +46,7 @@ test("stages a platform-specific binary package", async (context) => {
   );
   assert.equal(packageJson.name, "@sacho/sacho-x86_64-unknown-linux-musl");
   assert.equal(packageJson.version, "1.2.3");
+  assert.equal(packageJson.homepage, "https://sacho.dev/");
   assert.deepEqual(packageJson.os, ["linux"]);
   assert.deepEqual(packageJson.cpu, ["x64"]);
   assert.deepEqual(packageJson.files, ["sacho"]);
