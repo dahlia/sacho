@@ -55,6 +55,41 @@ Without mise, npm, or Cargo, download the archive for your platform from
 [GitHub Releases]: https://github.com/dahlia/sacho/releases
 
 
+Agent Skill
+-----------
+
+Sacho ships an [Agent Skill] that teaches AI coding agents, such as Claude Code,
+how to adopt and operate Sacho: writing fragments for users, cutting releases,
+and forward-porting fixes across maintenance branches.
+
+In Claude Code, install it as a plugin. Add this repository as a plugin
+marketplace, then install the `sacho` plugin:
+
+~~~~ text
+/plugin marketplace add dahlia/sacho
+/plugin install sacho@sacho
+~~~~
+
+For other agents, or to install the skill without the plugin system, use the
+[`skills`] CLI, which reads the skill straight from this repository:
+
+~~~~ sh
+npx skills add dahlia/sacho
+~~~~
+
+Add `-a claude-code` to target one agent, `-g` to install it globally, and
+`--skill sacho` to select the skill by name.
+
+The skill is also bundled inside the `@sacho/sacho` npm package, following the
+[`skills-npm`] layout. In a project that depends on that package, run
+`npx skills-npm setup` once to link bundled skills from *node\_modules* into
+your agent on every install.
+
+[Agent Skill]: https://agentskills.io/
+[`skills`]: https://github.com/vercel-labs/skills
+[`skills-npm`]: https://github.com/antfu/skills-npm
+
+
 Documentation
 -------------
 

@@ -1,0 +1,12 @@
+{
+  "name": "sacho",
+  "description": "Adopt and operate Sacho, the opinionated changelog manager: write user-facing changelog fragments, cut releases, enforce coverage in CI, and forward-port fixes across maintenance branches.",
+  "author": {
+    "name": "Hong Minhee",
+    "email": "hong@minhee.org"
+  },
+  "homepage": "https://sacho.dev/",
+  "repository": "https://github.com/dahlia/sacho",
+  "license": "GPL-3.0-only",
+  "keywords": ["changelog", "release-notes", "changes", "sacho"]
+}

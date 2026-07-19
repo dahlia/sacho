@@ -1,0 +1,15 @@
+{
+  "name": "sacho",
+  "owner": {
+    "name": "Hong Minhee",
+    "email": "hong@minhee.org"
+  },
+  "description": "The Sacho agent skill, distributed as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "sacho",
+      "source": ".",
+      "description": "Adopt and operate Sacho, the opinionated changelog manager, from Claude Code."
+    }
+  ]
+}

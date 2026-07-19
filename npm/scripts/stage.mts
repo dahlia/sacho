@@ -93,6 +93,9 @@ export async function stageWrapper({
   await writePackageJson(output, packageJson);
   await cp(join(npmRoot, "bin"), join(output, "bin"), { recursive: true });
   await cp(join(npmRoot, "lib"), join(output, "lib"), { recursive: true });
+  await cp(join(repositoryRoot, "skills"), join(output, "skills"), {
+    recursive: true,
+  });
   await copyCommonFiles(output);
 }
 

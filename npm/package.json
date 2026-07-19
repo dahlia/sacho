@@ -17,7 +17,8 @@
   },
   "files": [
     "bin",
-    "lib"
+    "lib",
+    "skills"
   ],
   "engines": {
     "node": ">=18"
