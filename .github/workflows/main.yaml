@@ -157,6 +157,8 @@ jobs:
         run: npm ci
       - name: Build the documentation
         working-directory: docs
+        env:
+          DOCS_HOSTNAME: ${{ github.ref_type == 'tag' && 'https://sacho.dev' || 'https://canary.sacho.dev' }}
         run: npm run build
       - name: Deploy the documentation
         working-directory: docs

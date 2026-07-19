@@ -8,12 +8,17 @@ if (!existsSync(philosophyPath)) {
   throw new Error("PHILOSOPHY.md is required by docs/philosophy.md");
 }
 
+const docsHostname = process.env.DOCS_HOSTNAME ?? "https://sacho.dev";
+
 const config = defineConfig({
   base: "/",
   cleanUrls: true,
   description: "An opinionated changelog manager",
   head: [["meta", { name: "theme-color", content: "#7c3aed" }]],
   lang: "en-US",
+  sitemap: {
+    hostname: docsHostname,
+  },
   title: "Sacho",
   themeConfig: {
     editLink: {
