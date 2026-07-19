@@ -37,7 +37,7 @@ mise install
 
 The project requires the Rust toolchain configured in *mise.toml*. The mise
 installation also provides supporting tools such as Hongdown, Nushell,
-cargo-mutants, Jujutsu, and Mercurial.
+cargo-mutants, Jujutsu, Mercurial, Node.js, and npm.
 
 After installing tools, mise runs the repository post-install hook. This fetches
 Cargo dependencies and writes a Git pre-commit hook that runs the `check` task.
@@ -67,6 +67,8 @@ Runs the full local verification suite:
  -  `cargo fmt --check`
  -  `hongdown --check`
  -  `mise fmt --check`
+ -  `npm test`
+ -  `npm pack --dry-run`
 
 Format code and Markdown before committing:
 
@@ -94,7 +96,7 @@ inference:
 mise run test:vcs
 ~~~~
 
-Run mutation tests:
+Run mutation tests after changing Rust behavior or Rust tests:
 
 ~~~~ sh
 mise run mutants
@@ -183,7 +185,7 @@ If your change affects runtime behavior, also run:
 mise run test
 ~~~~
 
-If your change affects behavior or tests, run:
+If your change affects Rust behavior or Rust tests, run:
 
 ~~~~ sh
 mise run mutants
@@ -191,5 +193,8 @@ mise run mutants
 
 The mutation-testing result must have zero missed mutants and zero timed-out
 mutants before opening a pull request.
+
+Changes limited to documentation, packaging, CI configuration, or non-Rust
+tooling do not require mutation testing.
 
 Make sure generated formatting changes are included in your commit.

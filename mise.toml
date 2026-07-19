@@ -10,6 +10,7 @@ experimental = true
 "aqua:rhysd/actionlint" = "1.7.12"
 "cargo:cargo-mutants" = "27.1.0"
 jj = "0.43.0"
+node = "24.18.0"
 "pipx:mercurial" = "7.2.3"
 
 [tools.rust]
@@ -54,6 +55,8 @@ run = [
   "cargo fmt --check",
   "hongdown --check",
   "mise fmt --check",
+  "npm test --prefix npm",
+  "npm pack --dry-run --json ./npm",
   "cargo run check",
 ]
 

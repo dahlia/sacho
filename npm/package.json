@@ -1,0 +1,40 @@
+{
+  "name": "@sacho/sacho",
+  "version": "0.0.0",
+  "description": "An opinionated changelog manager",
+  "license": "GPL-3.0-only",
+  "author": "Hong Minhee <hong@minhee.org>",
+  "homepage": "https://github.com/dahlia/sacho",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dahlia/sacho.git"
+  },
+  "bugs": "https://github.com/dahlia/sacho/issues",
+  "funding": "https://github.com/sponsors/dahlia",
+  "type": "commonjs",
+  "bin": {
+    "sacho": "bin/sacho.js"
+  },
+  "files": [
+    "bin",
+    "lib"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@sacho/sacho-aarch64-apple-darwin": "0.0.0",
+    "@sacho/sacho-aarch64-pc-windows-msvc": "0.0.0",
+    "@sacho/sacho-aarch64-unknown-linux-musl": "0.0.0",
+    "@sacho/sacho-x86_64-apple-darwin": "0.0.0",
+    "@sacho/sacho-x86_64-pc-windows-msvc": "0.0.0",
+    "@sacho/sacho-x86_64-unknown-linux-musl": "0.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

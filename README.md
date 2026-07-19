@@ -33,13 +33,21 @@ mise use -g github:dahlia/sacho
 ~~~~
 
 This selects the release archive for the current platform and puts *sacho* on
-your `PATH`. Cargo can install the published crate from crates.io instead:
+your `PATH`. npm installs the same prebuilt binary:
+
+~~~~ sh
+npm install -g @sacho/sacho
+~~~~
+
+Development builds are available as `@sacho/sacho@canary`.
+
+Cargo can build and install the published crate from crates.io instead:
 
 ~~~~ sh
 cargo install sacho
 ~~~~
 
-Without mise or Cargo, download the archive for your platform from
+Without mise, npm, or Cargo, download the archive for your platform from
 [GitHub Releases], then extract
 *sacho* (*sacho.exe* on Windows) into a directory on your `PATH`.
 

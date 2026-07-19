@@ -87,6 +87,7 @@ jobs:
           version: 2026.7.7
           install_args: >-
             rust
+            node
             aqua:nushell/nushell
             aqua:dahlia/hongdown
             aqua:koalaman/shellcheck
@@ -146,36 +147,48 @@ jobs:
             target: x86_64-unknown-linux-musl
             binary: sacho
             archive-extension: tar.xz
+            npm-os: linux
+            npm-cpu: x64
           - os: linux
             arch: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             binary: sacho
             archive-extension: tar.xz
+            npm-os: linux
+            npm-cpu: arm64
           - os: macos
             arch: amd64
             runner: macos-15-intel
             target: x86_64-apple-darwin
             binary: sacho
             archive-extension: tar.xz
+            npm-os: darwin
+            npm-cpu: x64
           - os: macos
             arch: aarch64
             runner: macos-15
             target: aarch64-apple-darwin
             binary: sacho
             archive-extension: tar.xz
+            npm-os: darwin
+            npm-cpu: arm64
           - os: windows
             arch: amd64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             binary: sacho.exe
             archive-extension: zip
+            npm-os: win32
+            npm-cpu: x64
           - os: windows
             arch: aarch64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             binary: sacho.exe
             archive-extension: zip
+            npm-os: win32
+            npm-cpu: arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out the repository
@@ -184,7 +197,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust aqua:nushell/nushell
+          install_args: rust node aqua:nushell/nushell
           experimental: true
       - name: Install Linux build tools
         if: matrix.os == 'linux'
@@ -281,6 +294,27 @@ jobs:
             echo "archive=$archive"
             echo "dist-name=$dist_name"
           } >> "$GITHUB_OUTPUT"
+      - name: Stage the npm platform package
+        id: npm-package
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          NPM_CPU: ${{ matrix.npm-cpu }}
+          NPM_OS: ${{ matrix.npm-os }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          package_directory="npm-platform-package"
+          node npm/scripts/stage.mts platform \
+            --version "$VERSION" \
+            --target "$TARGET" \
+            --os "$NPM_OS" \
+            --cpu "$NPM_CPU" \
+            --binary "target/$TARGET/release/$BINARY" \
+            --output "$package_directory"
+          archive="$(npm pack --silent --pack-destination . "./$package_directory")"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Create the POSIX archive
         if: matrix.os != 'windows'
         shell: bash
@@ -305,6 +339,13 @@ jobs:
           path: ${{ steps.stage.outputs.archive }}
           if-no-files-found: error
           compression-level: 0
+      - name: Upload the npm platform package
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.target }}
+          path: ${{ steps.npm-package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
 
   release:
     name: Publish GitHub Release
@@ -321,6 +362,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dists
+          pattern: sacho-*
           merge-multiple: true
       - name: Extract the release notes
         shell: bash
@@ -366,6 +408,88 @@ jobs:
           fi
           gh release upload "$GITHUB_REF_NAME" dists/* --clobber
           gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  publish-npm:
+    name: Publish to npm
+    if: github.event_name == 'push'
+    needs: [version, dist]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download the npm platform packages
+        uses: actions/download-artifact@v8
+        with:
+          path: npm-platform-packages
+          pattern: npm-*
+          merge-multiple: true
+      - name: Publish the npm packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            dist_tag="latest"
+          else
+            dist_tag="canary"
+          fi
+
+          publish_package() {
+            local archive="$1"
+            local metadata
+            local name
+            local package_version
+            local published_version
+            local registry_version
+            metadata="$(tar --extract --gzip --to-stdout \
+              --file "$archive" package/package.json)"
+            name="$(jq -r .name <<< "$metadata")"
+            package_version="$(jq -r .version <<< "$metadata")"
+            if [[ "$package_version" != "$VERSION" ]]; then
+              echo "$name has version $package_version, expected $VERSION." >&2
+              return 1
+            fi
+            registry_version="${VERSION%%+*}"
+            published_version="$(npm view "$name@$VERSION" version 2>/dev/null || true)"
+            if [[ "$published_version" == "$VERSION" || \
+                  "$published_version" == "$registry_version" ]]; then
+              echo "$name@$VERSION is already published." >> "$GITHUB_STEP_SUMMARY"
+              return
+            fi
+            npm publish "./$archive" \
+              --access public \
+              --provenance \
+              --tag "$dist_tag"
+          }
+
+          shopt -s nullglob
+          platform_packages=(npm-platform-packages/*.tgz)
+          if (( ${#platform_packages[@]} != 6 )); then
+            echo "Expected 6 npm platform packages, found ${#platform_packages[@]}." >&2
+            exit 1
+          fi
+          for archive in "${platform_packages[@]}"; do
+            publish_package "$archive"
+          done
+
+          node npm/scripts/stage.mts wrapper \
+            --version "$VERSION" \
+            --output npm-wrapper-package
+          wrapper_archive="$(npm pack --silent \
+            --pack-destination . ./npm-wrapper-package)"
+          publish_package "$wrapper_archive"
 
   publish:
     name: Publish to crates.io
