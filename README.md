@@ -23,6 +23,30 @@ one output style, and one set of invariants. Configuration exists to describe
 your repository, not to customize the philosophy.
 
 
+Installation
+------------
+
+The recommended way to install Sacho is with [mise]'s GitHub backend:
+
+~~~~ sh
+mise use -g github:dahlia/sacho
+~~~~
+
+This selects the release archive for the current platform and puts *sacho* on
+your `PATH`. Cargo can install the published crate from crates.io instead:
+
+~~~~ sh
+cargo install sacho
+~~~~
+
+Without mise or Cargo, download the archive for your platform from
+[GitHub Releases], then extract
+*sacho* (*sacho.exe* on Windows) into a directory on your `PATH`.
+
+[mise]: https://mise.jdx.dev/
+[GitHub Releases]: https://github.com/dahlia/sacho/releases
+
+
 How it works
 ------------
 
