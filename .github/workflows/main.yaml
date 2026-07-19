@@ -8,8 +8,9 @@ permissions:
   contents: read
 
 env:
-  MISE_AUTO_INSTALL: "0"
+  MISE_ENABLE_TOOLS: rust,aqua:nushell/nushell
   MISE_NO_HOOKS: "1"
+  MISE_TOOLSET: rust
 
 jobs:
   version:
@@ -25,7 +26,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust aqua:nushell/nushell
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Determine the package version
         id: version
@@ -67,6 +68,9 @@ jobs:
     name: Check
     needs: version
     runs-on: ubuntu-24.04
+    env:
+      MISE_ENABLE_TOOLS: rust,node,aqua:nushell/nushell,aqua:dahlia/hongdown,aqua:koalaman/shellcheck,aqua:rhysd/actionlint
+      MISE_TOOLSET: check
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -85,13 +89,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: >-
-            rust
-            node
-            aqua:nushell/nushell
-            aqua:dahlia/hongdown
-            aqua:koalaman/shellcheck
-            aqua:rhysd/actionlint
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Validate the release notes
         if: github.ref_type == 'tag'
@@ -114,7 +112,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust aqua:nushell/nushell
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Build the project
         run: mise build
@@ -129,7 +127,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust aqua:nushell/nushell
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Test the project
         run: mise test
@@ -137,6 +135,9 @@ jobs:
   dist:
     name: Dist (${{ matrix.os }}-${{ matrix.arch }})
     needs: [version, check, build, test]
+    env:
+      MISE_ENABLE_TOOLS: rust,node,aqua:nushell/nushell
+      MISE_TOOLSET: dist
     strategy:
       fail-fast: false
       matrix:
@@ -197,7 +198,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust node aqua:nushell/nushell
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Install Linux build tools
         if: matrix.os == 'linux'
@@ -507,7 +508,7 @@ jobs:
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.7.7
-          install_args: rust aqua:nushell/nushell
+          cache_key: "{{default}}-{{env.MISE_TOOLSET}}"
           experimental: true
       - name: Apply the package version
         shell: bash
