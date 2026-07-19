@@ -15,13 +15,46 @@ const config = defineConfig({
   base: "/",
   cleanUrls: true,
   description: "An opinionated changelog manager",
-  head: [["meta", { name: "theme-color", content: "#7c3aed" }]],
+  head: [
+    ["meta", { name: "theme-color", content: "#b23a24" }],
+    ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
+    [
+      "link",
+      {
+        rel: "icon",
+        type: "image/png",
+        sizes: "32x32",
+        href: "/favicon.png",
+      },
+    ],
+    ["link", { rel: "apple-touch-icon", href: "/apple-touch-icon.png" }],
+    ["meta", { property: "og:type", content: "website" }],
+    [
+      "meta",
+      {
+        property: "og:description",
+        content: "An opinionated changelog manager",
+      },
+    ],
+    ["meta", { property: "og:image", content: `${docsHostname}/og.png` }],
+    ["meta", { name: "twitter:card", content: "summary_large_image" }],
+  ],
   lang: "en-US",
   sitemap: {
     hostname: docsHostname,
   },
+  srcExclude: ["DESIGN.md"],
   title: "Sacho",
+  transformHead({ pageData }) {
+    const title = pageData.title ? `${pageData.title} | Sacho` : "Sacho";
+    return [["meta", { property: "og:title", content: title }]];
+  },
   themeConfig: {
+    logo: {
+      light: "/logo.svg",
+      dark: "/logo-dark.svg",
+      alt: "A cinnabar seal bearing the character 史",
+    },
     editLink: {
       pattern: ({ filePath }) => {
         const sourcePath =
@@ -32,7 +65,6 @@ const config = defineConfig({
     },
     footer: {
       message: "Released under the GPL-3.0-only license.",
-      copyright: "Copyright © 2026 Hong Minhee",
     },
     nav: [
       { text: "Why Sacho?", link: "/why-sacho" },

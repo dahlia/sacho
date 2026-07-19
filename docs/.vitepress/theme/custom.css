@@ -1,0 +1,334 @@
+/**
+ * Sacho brand theme.
+ *
+ * The palette and typography follow docs/DESIGN.md: ink on warm paper,
+ * cinnabar as the single accent, serif for headings and declarations,
+ * sans for body text. Keep changes consistent with that document.
+ */
+
+:root {
+  --sacho-font-serif: "Source Serif 4 Variable", "Source Serif 4", Georgia,
+    "Times New Roman", serif;
+
+  --vp-font-family-base: "Inter Variable", "Inter", ui-sans-serif, system-ui,
+    -apple-system, sans-serif;
+
+  /* Paper */
+  --vp-c-bg: #faf7f0;
+  --vp-c-bg-alt: #f4f0e6;
+  --vp-c-bg-soft: #f1ece0;
+  --vp-c-bg-elv: #fdfbf6;
+
+  /* Ink */
+  --vp-c-text-1: #2b2620;
+  --vp-c-text-2: #5f584c;
+  --vp-c-text-3: #786f61;
+
+  /* Rules */
+  --vp-c-divider: #e5dfd0;
+  --vp-c-gutter: #e5dfd0;
+  --vp-c-border: #d8d1bf;
+
+  /* Warm grays; the default theme's cool grays clash with the paper. */
+  --vp-c-gray-1: #d8d1bf;
+  --vp-c-gray-2: #e2dcc9;
+  --vp-c-gray-3: #ece6d4;
+  --vp-c-gray-soft: rgba(125, 113, 91, 0.14);
+
+  /* Cinnabar */
+  --vp-c-brand-1: #b23a24;
+  --vp-c-brand-2: #9d3018;
+  --vp-c-brand-3: #b23a24;
+  --vp-c-brand-soft: rgba(178, 58, 36, 0.14);
+
+  /* Flat hero name, no gradient (DESIGN.md bans gradients). */
+  --vp-home-hero-name-color: var(--vp-c-brand-1);
+  --vp-home-hero-name-background: none;
+
+  --vp-code-block-bg: #f1ece0;
+  --vp-code-bg: #ede7d8;
+  --vp-code-color: #8a2f1c;
+}
+
+.dark {
+  /* Paper at night: deep warm ink, never blue-gray. */
+  --vp-c-bg: #1c1915;
+  --vp-c-bg-alt: #16130f;
+  --vp-c-bg-soft: #24201a;
+  --vp-c-bg-elv: #24201a;
+
+  --vp-c-text-1: #ece5d8;
+  --vp-c-text-2: #b3aa99;
+  --vp-c-text-3: #8d8474;
+
+  --vp-c-divider: #3a342b;
+  --vp-c-gutter: #16130f;
+  --vp-c-border: #4a4336;
+
+  --vp-c-gray-1: #4a4336;
+  --vp-c-gray-2: #3a342b;
+  --vp-c-gray-3: #2f2a22;
+  --vp-c-gray-soft: rgba(170, 155, 130, 0.16);
+
+  --vp-c-brand-1: #d26a4a;
+  --vp-c-brand-2: #dd7f60;
+  --vp-c-brand-3: #b34a2e;
+  --vp-c-brand-soft: rgba(210, 106, 74, 0.16);
+
+  /*
+   * Dark-mode buttons keep light text, so their fills must stay dark
+   * enough for AA contrast; the lighter link hover color cannot be reused.
+   */
+  --vp-button-brand-hover-bg: #a8442a;
+  --vp-button-brand-active-bg: #9d3f27;
+
+  --vp-code-block-bg: #16130f;
+  --vp-code-bg: #2b2620;
+  --vp-code-color: #dd7f60;
+}
+
+/* The serif is the voice of the document: headings and the hero. */
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3,
+.VPHero .name,
+.VPHero .text {
+  font-family: var(--sacho-font-serif);
+  text-wrap: balance;
+}
+
+/* Break lines evenly in declarations; avoid orphan words in prose. */
+.VPHero .tagline,
+.vp-doc .sacho-closing-statement {
+  text-wrap: balance;
+}
+
+.vp-doc p {
+  text-wrap: pretty;
+}
+
+.vp-doc h1 {
+  font-weight: 600;
+}
+
+.vp-doc h2,
+.vp-doc h3 {
+  font-weight: 600;
+}
+
+/* Wordmark next to the seal in the nav bar. */
+.VPNavBarTitle .title {
+  font-family: var(--sacho-font-serif);
+  font-size: 18px;
+}
+
+/*
+ * Landing page. The markdown content below the hero reads as a single
+ * document: install, the credo, the practice, the tool, the name.
+ */
+
+/* No glow behind the hero seal; the mark is flat and modestly sized. */
+.VPHome {
+  --vp-home-hero-image-background-image: none;
+  --vp-home-hero-image-filter: none;
+}
+
+/*
+ * The hero is a title page: seal on top, declarations under it, all on the
+ * same centered axis as the prose that follows.
+ */
+.VPHome .VPHero .container {
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.VPHome .VPHero .main {
+  margin: 0 auto;
+  max-width: 688px;
+  text-align: center;
+}
+
+.VPHome .VPHero .heading {
+  align-items: center;
+  justify-content: center;
+}
+
+.VPHome .VPHero.has-image .actions,
+.VPHome .VPHero .actions {
+  justify-content: center;
+}
+
+.VPHome .VPHero .image {
+  order: -1;
+  margin: 0 0 16px;
+}
+
+.VPHome .VPHero .image-container {
+  width: 160px;
+  height: 160px;
+  margin: 0 auto;
+  transform: none;
+}
+
+.VPHome .VPHero .VPImage {
+  position: static;
+  max-width: 160px;
+  max-height: 160px;
+  transform: none;
+}
+
+/* Keep the home prose at a readable measure. */
+.VPHome .vp-doc > div {
+  max-width: 688px;
+  margin: 0 auto;
+}
+
+/* The credo: numbered declarations set in the serif. */
+.vp-doc ol.sacho-credo {
+  list-style: none;
+  counter-reset: credo;
+  margin: 32px 0;
+  padding: 0;
+}
+
+.vp-doc ol.sacho-credo > li {
+  margin: 28px 0;
+}
+
+.sacho-credo li {
+  counter-increment: credo;
+  position: relative;
+  margin: 28px 0;
+  padding: 0 0 0 56px;
+}
+
+.sacho-credo li + li {
+  border-top: 1px solid var(--vp-c-divider);
+  padding-top: 28px;
+}
+
+.sacho-credo li::before {
+  content: counter(credo);
+  position: absolute;
+  left: 8px;
+  font-family: var(--sacho-font-serif);
+  font-size: 22px;
+  line-height: 1.4;
+  color: var(--vp-c-brand-1);
+}
+
+.sacho-credo li + li::before {
+  top: 28px;
+}
+
+.sacho-credo li > a {
+  display: block;
+  font-family: var(--sacho-font-serif);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--vp-c-text-1);
+  text-decoration: none;
+  text-wrap: balance;
+}
+
+.sacho-credo li > a:hover {
+  color: var(--vp-c-brand-1);
+}
+
+.sacho-credo li > p {
+  margin: 8px 0 0;
+  color: var(--vp-c-text-2);
+}
+
+/* The mechanisms: four short claims, ruled rather than boxed. */
+.sacho-mechanisms {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 40px;
+  margin: 24px 0;
+}
+
+.sacho-mechanisms > div {
+  border-top: 1px solid var(--vp-c-divider);
+  padding: 20px 0 8px;
+}
+
+.sacho-mechanisms h3 {
+  margin: 0;
+  font-family: var(--sacho-font-serif);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.sacho-mechanisms p {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--vp-c-text-2);
+}
+
+@media (max-width: 640px) {
+  .sacho-mechanisms {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* The closing statement, sealed with the call to action. */
+.sacho-closing {
+  margin: 64px 0 32px;
+  text-align: center;
+}
+
+.sacho-closing-statement {
+  font-family: var(--sacho-font-serif);
+  font-size: 24px;
+  line-height: 1.6;
+  color: var(--vp-c-text-1);
+}
+
+.vp-doc .sacho-closing .sacho-closing-statement {
+  margin: 0;
+}
+
+.sacho-closing-action {
+  margin-top: 32px;
+}
+
+.sacho-closing-action a {
+  display: inline-block;
+  border-radius: 20px;
+  padding: 8px 24px;
+  background-color: var(--vp-button-brand-bg);
+  color: #faf7f0;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color 0.25s;
+}
+
+.sacho-closing-action a:hover {
+  background-color: var(--vp-button-brand-hover-bg);
+}
+
+/* The colophon: the etymology in passing, set small and dim. */
+.sacho-colophon {
+  margin: 72px auto 0;
+  max-width: 480px;
+  text-align: center;
+}
+
+.sacho-colophon p {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--vp-c-text-3);
+}
+
+.sacho-colophon a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.sacho-colophon a:hover {
+  color: var(--vp-c-brand-1);
+}
