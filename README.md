@@ -1,6 +1,27 @@
 Sacho: an opinionated changelog manager
 =======================================
 
+[![GitHub Releases][GitHub Releases badge]][GitHub Releases]
+[![crates.io][crates.io badge]][crates.io]
+[![npm][npm badge]][npm]
+[![GitHub Actions][GitHub Actions badge]][GitHub Actions]
+[![License: GPL-3.0-only][GPL-3.0 badge]][GPL-3.0]
+[![GitHub Sponsors][GitHub Sponsors badge]][GitHub Sponsors]
+
+[GitHub Releases badge]: https://img.shields.io/github/v/release/dahlia/sacho?logo=github
+[GitHub Releases]: https://github.com/dahlia/sacho/releases
+[crates.io badge]: https://img.shields.io/crates/v/sacho?logo=rust
+[crates.io]: https://crates.io/crates/sacho
+[npm badge]: https://img.shields.io/npm/v/@sacho/sacho?logo=npm
+[npm]: https://www.npmjs.com/package/@sacho/sacho
+[GitHub Actions badge]: https://github.com/dahlia/sacho/actions/workflows/main.yaml/badge.svg
+[GitHub Actions]: https://github.com/dahlia/sacho/actions/workflows/main.yaml
+[GPL-3.0 badge]: https://img.shields.io/github/license/dahlia/sacho
+[GPL-3.0]: https://www.gnu.org/licenses/gpl-3.0.html
+[GitHub Sponsors badge]: https://img.shields.io/github/sponsors/dahlia?logo=githubsponsors
+[GitHub Sponsors]: https://github.com/sponsors/dahlia
+
+
 Motivation
 ----------
 
@@ -52,7 +73,6 @@ Without mise, npm, or Cargo, download the archive for your platform from
 *sacho* (*sacho.exe* on Windows) into a directory on your `PATH`.
 
 [mise]: https://mise.jdx.dev/
-[GitHub Releases]: https://github.com/dahlia/sacho/releases
 
 
 Agent Skill
