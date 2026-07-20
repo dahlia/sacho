@@ -54,7 +54,7 @@ if $nu.os-info.name != 'windows' {
 
 [tasks.check]
 description = "Run type check, lint, and check Markdown format"
-depends = ["docs:install"]
+depends = ["check:package", "docs:install"]
 run = [
   "actionlint",
   "cargo check",
@@ -66,6 +66,25 @@ run = [
   "npm pack --dry-run --json ./npm",
   "npm run --prefix docs build",
   "cargo run check",
+]
+
+[tasks."check:package"]
+description = "Verify the crate package and its embedded license"
+shell = "nu -c"
+run = [
+  # Cargo packages this nested crate without files from the workspace root.
+  # Keep the crate-local copy explicit and fail before publishing if it drifts.
+  '''
+  let root_license = open --raw LICENSE
+  let crate_license = open --raw crates/sacho/LICENSE
+  if $root_license != $crate_license {
+    error make {
+      msg: "crates/sacho/LICENSE must match LICENSE"
+      help: "Copy the root license into the crate before packaging."
+    }
+  }
+  ''',
+  "cargo package --allow-dirty --locked --package sacho",
 ]
 
 [tasks.fmt]

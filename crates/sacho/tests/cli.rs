@@ -101,7 +101,7 @@ fn license_option_prints_the_project_notice_and_full_license() {
         ))
         .stdout(predicate::str::contains("GNU GENERAL PUBLIC LICENSE"))
         .stdout(predicate::str::contains("Version 3, 29 June 2007"))
-        .stdout(predicate::str::ends_with(include_str!("../../../LICENSE")));
+        .stdout(predicate::str::ends_with(include_str!("../LICENSE")));
 }
 
 #[test]

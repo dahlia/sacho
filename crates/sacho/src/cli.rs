@@ -25,7 +25,10 @@ const LICENSE_NOTICE: &str = "Sacho  Copyright (C) 2026  Hong Minhee\n\
 This program comes with ABSOLUTELY NO WARRANTY.\n\
 This is free software, and you are welcome to redistribute it under the terms\n\
 of the GNU General Public License, version 3 only. For details, see below.";
-const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
+// Cargo verifies the extracted crate without access to files at the workspace
+// root. Keep this path inside the crate; `mise run check` also verifies that
+// this packaged copy matches the repository's top-level license.
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
 
 #[derive(Debug, Parser)]
 #[command(
