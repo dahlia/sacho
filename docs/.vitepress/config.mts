@@ -21,6 +21,18 @@ const config = defineConfig({
   cleanUrls: true,
   description: "An opinionated changelog manager",
   head: [
+    [
+      "script",
+      {
+        async: "",
+        src: "https://plausible.io/js/pa-T9QHjSwRgqQXGc5nvPSiG.js",
+      },
+    ],
+    [
+      "script",
+      {},
+      "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()",
+    ],
     ["meta", { name: "theme-color", content: "#b23a24" }],
     ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
     [
