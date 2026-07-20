@@ -19,7 +19,10 @@ Git
 registers the corresponding drivers in the repository's local Git config.
 Concurrent fragment additions usually merge without conflict because they are
 different files. When the generated changelog conflicts, the driver recompiles
-its unreleased region from the merged fragments.
+its unreleased region from the merged fragments. It also accepts release-tag
+inputs whose changelog is closed and therefore has no heading-based unreleased
+region. If the merged state has no next version or fragments, the result stays
+closed.
 
 The driver also keeps frozen released sections from both sides. Incoming
 released sections with semantic versions are inserted at their descending

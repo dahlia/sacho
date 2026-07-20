@@ -26,7 +26,8 @@ The unreleased region
 ---------------------
 
 With the default `materialize = true` setting, *CHANGES.md* contains a generated
-unreleased region above the released history:
+unreleased region above the released history while a next version or any
+fragments exist:
 
 ~~~~ markdown
 Version 1.2.0
@@ -49,6 +50,12 @@ Several commands keep it current:
 
 `sacho sync` protects hand edits by default. If the generated replacement would
 discard them, inspect the proposed change before choosing `sacho sync --force`.
+
+A release without `--next` closes this region. With no next-version file and no
+fragments, a released-only *CHANGES.md* is consistent and `sacho check` passes.
+`sacho next`, `sacho add`, and `sacho carry` open the region again when the next
+development cycle starts. Marker-based repositories retain their marker pair
+with an empty body while closed.
 
 Set `materialize = false` when the repository should keep only released history
 in *CHANGES.md*. `sacho preview` still compiles the unreleased region on demand.
@@ -74,17 +81,21 @@ Releasing
 
 `sacho release` compiles the current fragments into a dated version section,
 inserts it before the older released sections, and removes the consumed
-fragments. Released sections are then left untouched by normal Sacho commands.
+fragments. Without `--next`, it also removes the next-version file and closes
+the materialized unreleased region, leaving a released-only state suitable for
+a release commit and tag:
 
 ~~~~ sh
-sacho release --next 1.3.0
+sacho release
 ~~~~
 
 The command above releases the version in *changes.d/next* with the current
-local date, then writes `1.3.0` as the next version. Pass a version when no next
-version has been set, or use `--date YYYY-MM-DD` when the date must be explicit.
-The first release may start the history without fragments; after a released
-section exists, an empty release requires `--allow-empty`.
+local date. Pass a version when no next version has been set, or use
+`--date YYYY-MM-DD` when the date must be explicit. After committing and tagging
+the release, run `sacho next 1.3.0` to open the next cycle. Alternatively,
+`sacho release --next 1.3.0` deliberately combines both transitions in one
+commit. The first release may start the history without fragments; after a
+released section exists, an empty release requires `--allow-empty`.
 
 The release mutation is transactional. Sacho checks that its inputs have not
 changed between planning and writing, and rolls back already-applied changes if

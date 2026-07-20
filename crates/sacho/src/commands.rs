@@ -955,24 +955,23 @@ fn plan_next_mutation(
             repo,
             &changelog_path,
             &changelog_before,
-            &compiled_before.markdown,
+            &compiled_before,
         )?;
         let compiled_after =
             compile_parsed_fragments(repo, CompileOptions::default(), next_label, parsed)?;
         let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
             .expect("materialized next planning requires an existing changelog");
-        let replacement = replace_unreleased_region(
+        let (new_contents, _) = synchronize_materialized_changelog(
+            repo,
             old_changelog,
-            &compiled_after.markdown,
-            repo.config().changelog.region_detection,
-            &repo.config().changelog.unreleased_heading,
-        )
-        .map_err(|source| changelog_error(changelog_path.clone(), source))?;
-        let changed = replacement.new_contents != *old_changelog;
+            &compiled_after,
+            &changelog_path,
+        )?;
+        let changed = new_contents != *old_changelog;
         participants.push(ReleaseFileChange {
             path: changelog_path,
             before: changelog_before,
-            after: ReleaseFileState::Present(replacement.new_contents),
+            after: ReleaseFileState::Present(new_contents),
         });
         Some(SyncResult { changed })
     } else {
@@ -1069,12 +1068,8 @@ pub fn plan_format(repo: &Repository, _options: FormatOptions) -> Result<FormatP
         path: repo.resolve(&changelog_path),
         source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
     })?;
-    let sync = plan_sync_from_contents(
-        repo,
-        &compiled.markdown,
-        old_contents,
-        SyncOptions { force: false },
-    )?;
+    let sync =
+        plan_sync_from_contents(repo, &compiled, old_contents, SyncOptions { force: false })?;
 
     Ok(FormatPlan {
         formatting,
@@ -1227,35 +1222,29 @@ fn plan_sync_unlocked(repo: &Repository, options: SyncOptions) -> Result<SyncPla
         path: absolute_path,
         source,
     })?;
-    plan_sync_from_contents(repo, &compiled.markdown, old_contents, options)
+    plan_sync_from_contents(repo, &compiled, old_contents, options)
 }
 
 fn plan_sync_from_contents(
     repo: &Repository,
-    compiled_markdown: &str,
+    compiled: &CompiledRegion,
     old_contents: String,
     options: SyncOptions,
 ) -> Result<SyncPlan> {
-    let config = repo.config();
-    let changelog_path = config.changelog.path.clone();
-    let replacement = replace_unreleased_region(
-        &old_contents,
-        compiled_markdown,
-        config.changelog.region_detection,
-        &config.changelog.unreleased_heading,
-    )
-    .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+    let changelog_path = repo.config().changelog.path.clone();
+    let (new_contents, safe_to_apply) =
+        synchronize_materialized_changelog(repo, &old_contents, compiled, &changelog_path)?;
 
-    if old_contents == replacement.new_contents {
+    if old_contents == new_contents {
         return Ok(SyncPlan::Skipped(SyncSkipReason::AlreadyCurrent));
     }
 
     let pending = PendingWrite {
         path: changelog_path,
         old_contents,
-        new_contents: replacement.new_contents,
+        new_contents,
     };
-    if options.force {
+    if options.force || safe_to_apply {
         Ok(SyncPlan::Apply(pending))
     } else {
         let diff = unified_diff(&pending.old_contents, &pending.new_contents);
@@ -1264,6 +1253,44 @@ fn plan_sync_from_contents(
             diff,
             reason: SyncRisk::PossibleHandEdits,
         })
+    }
+}
+
+fn synchronize_materialized_changelog(
+    repo: &Repository,
+    source: &str,
+    compiled: &CompiledRegion,
+    changelog_path: &Path,
+) -> Result<(String, bool)> {
+    let config = &repo.config().changelog;
+    if !compiled.is_active()
+        && let Ok(region) =
+            find_unreleased_region(source, config.region_detection, &config.unreleased_heading)
+        && source[region.start..region.end].trim().is_empty()
+    {
+        return Ok((source.to_owned(), true));
+    }
+    match replace_unreleased_region(
+        source,
+        &compiled.markdown,
+        config.region_detection,
+        &config.unreleased_heading,
+    ) {
+        Ok(replacement) => Ok((replacement.new_contents, false)),
+        Err(ChangelogError::RegionNotFound)
+            if !compiled.is_active() && config.region_detection == RegionDetection::Heading =>
+        {
+            Ok((source.to_owned(), true))
+        }
+        Err(ChangelogError::RegionNotFound)
+            if compiled.is_active() && config.region_detection == RegionDetection::Heading =>
+        {
+            Ok((
+                insert_unreleased_region(source, &compiled.markdown, &config.title),
+                true,
+            ))
+        }
+        Err(source) => Err(changelog_error(changelog_path.to_path_buf(), source)),
     }
 }
 
@@ -1355,7 +1382,7 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
         repo,
         &changelog_path,
         &changelog_before,
-        &compiled.markdown,
+        &compiled,
     )?;
     let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
         .map_or_else(
@@ -1363,14 +1390,15 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
             ToOwned::to_owned,
         );
     let unreleased_region = if repo.config().changelog.materialize {
-        Some(
-            find_unreleased_region(
-                &old_changelog,
-                repo.config().changelog.region_detection,
-                &repo.config().changelog.unreleased_heading,
-            )
-            .map_err(|source| changelog_error(changelog_path.clone(), source))?,
-        )
+        match find_unreleased_region(
+            &old_changelog,
+            repo.config().changelog.region_detection,
+            &repo.config().changelog.unreleased_heading,
+        ) {
+            Ok(region) => Some(region),
+            Err(ChangelogError::RegionNotFound) => None,
+            Err(source) => return Err(changelog_error(changelog_path.clone(), source)),
+        }
     } else {
         None
     };
@@ -1384,18 +1412,37 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
         return Err(Error::EmptyRelease);
     }
     let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
-    let next = options.next.map(|next| next.trim().to_owned());
+    let next = options
+        .next
+        .map(|next| next.trim().to_owned())
+        .filter(|next| !next.is_empty());
     let new_changelog = if repo.config().changelog.materialize {
-        let empty_unreleased = empty_unreleased_markdown(repo, next.as_deref());
-        replace_region_for_release(
-            &old_changelog,
-            &empty_unreleased,
-            &released_markdown,
-            repo.config().changelog.region_detection,
-            &repo.config().changelog.unreleased_heading,
-            &repo.config().changelog.title,
-        )
-        .map_err(|source| changelog_error(changelog_path.clone(), source))?
+        let next_unreleased = next
+            .as_deref()
+            .map(|next| empty_unreleased_markdown(repo, next));
+        if unreleased_region.is_some() {
+            replace_region_for_release(
+                &old_changelog,
+                next_unreleased.as_deref(),
+                &released_markdown,
+                repo.config().changelog.region_detection,
+                &repo.config().changelog.unreleased_heading,
+                &repo.config().changelog.title,
+            )
+            .map_err(|source| changelog_error(changelog_path.clone(), source))?
+        } else {
+            let released = insert_released_section(
+                &old_changelog,
+                &released_markdown,
+                &repo.config().changelog.title,
+            );
+            match next_unreleased {
+                Some(unreleased) => {
+                    insert_unreleased_region(&released, &unreleased, &repo.config().changelog.title)
+                }
+                None => released,
+            }
+        }
     } else {
         insert_released_section(
             &old_changelog,
@@ -1435,21 +1482,16 @@ fn ensure_materialized_release_snapshot_current(
     repo: &Repository,
     changelog_path: &Path,
     changelog: &ReleaseFileState,
-    compiled_markdown: &str,
+    compiled: &CompiledRegion,
 ) -> Result<()> {
     if !repo.config().changelog.materialize {
         return Ok(());
     }
     let contents = release_file_state_utf8(repo, changelog_path, changelog)?
         .expect("materialized release planning rejects a missing changelog");
-    let replacement = replace_unreleased_region(
-        contents,
-        compiled_markdown,
-        repo.config().changelog.region_detection,
-        &repo.config().changelog.unreleased_heading,
-    )
-    .map_err(|source| changelog_error(changelog_path.to_path_buf(), source))?;
-    if *contents == replacement.new_contents {
+    let (new_contents, _) =
+        synchronize_materialized_changelog(repo, contents, compiled, changelog_path)?;
+    if *contents == new_contents {
         Ok(())
     } else {
         Err(Error::SyncNeedsConfirmation {
@@ -1659,7 +1701,7 @@ fn plan_carry_mutation(
             repo,
             &changelog_path,
             &changelog_before,
-            &compiled_before.markdown,
+            &compiled_before,
         )?;
         let compiled_after = compile_parsed_fragments(
             repo,
@@ -1667,14 +1709,9 @@ fn plan_carry_mutation(
             version_label,
             parsed_after.expect("materialized carry parses the resulting fragment snapshot"),
         )?;
-        let replacement = replace_unreleased_region(
-            changelog,
-            &compiled_after.markdown,
-            repo.config().changelog.region_detection,
-            &repo.config().changelog.unreleased_heading,
-        )
-        .map_err(|source| changelog_error(changelog_path.clone(), source))?;
-        ReleaseFileState::Present(replacement.new_contents)
+        let (new_contents, _) =
+            synchronize_materialized_changelog(repo, changelog, &compiled_after, &changelog_path)?;
+        ReleaseFileState::Present(new_contents)
     } else {
         changelog_before.clone()
     };
@@ -4274,16 +4311,8 @@ fn released_markdown(
     markdown
 }
 
-fn empty_unreleased_markdown(repo: &Repository, next: Option<&str>) -> String {
-    let heading = next
-        .map(str::trim)
-        .filter(|next| !next.is_empty())
-        .map_or_else(String::new, |next| format!("Version {next}"));
-    let heading = if heading.is_empty() {
-        String::from("Unreleased")
-    } else {
-        heading
-    };
+fn empty_unreleased_markdown(repo: &Repository, next: &str) -> String {
+    let heading = format!("Version {next}");
     let mut markdown = String::new();
     markdown.push_str(&heading);
     markdown.push('\n');
@@ -4296,7 +4325,7 @@ fn empty_unreleased_markdown(repo: &Repository, next: Option<&str>) -> String {
 
 fn replace_region_for_release(
     source: &str,
-    empty_unreleased: &str,
+    next_unreleased: Option<&str>,
     released: &str,
     detection: RegionDetection,
     unreleased_heading: &str,
@@ -4304,20 +4333,39 @@ fn replace_region_for_release(
 ) -> std::result::Result<String, ChangelogError> {
     match detection {
         RegionDetection::Heading => {
-            let replacement = format!("{}\n\n{}", empty_unreleased.trim_end(), released);
+            let replacement = next_unreleased.map_or_else(
+                || released.to_owned(),
+                |unreleased| format!("{}\n\n{}", unreleased.trim_end(), released),
+            );
             replace_unreleased_region(source, &replacement, detection, unreleased_heading)
                 .map(|replacement| replacement.new_contents)
         }
         RegionDetection::Marker => {
-            let replacement =
-                replace_unreleased_region(source, empty_unreleased, detection, unreleased_heading)?;
+            let replacement = if let Some(unreleased) = next_unreleased {
+                replace_unreleased_region(source, unreleased, detection, unreleased_heading)?
+                    .new_contents
+            } else {
+                remove_unreleased_region(source, detection, unreleased_heading)?
+            };
             Ok(insert_released_after_marker_region(
-                &replacement.new_contents,
+                &replacement,
                 released,
                 document_title,
             ))
         }
     }
+}
+
+fn remove_unreleased_region(
+    source: &str,
+    detection: RegionDetection,
+    unreleased_heading: &str,
+) -> std::result::Result<String, ChangelogError> {
+    let span = find_unreleased_region(source, detection, unreleased_heading)?;
+    let mut output = String::with_capacity(source.len() - (span.end - span.start));
+    output.push_str(&source[..span.start]);
+    output.push_str(&source[span.end..]);
+    Ok(output)
 }
 
 fn insert_released_after_marker_region(
@@ -4364,6 +4412,26 @@ fn insert_released_section(source: &str, released: &str, document_title: &str) -
     output.push_str(released.trim_end());
     output.push_str("\n\n");
     output.push_str(source[insertion..].trim_start_matches(['\n', '\r']));
+    output
+}
+
+fn insert_unreleased_region(source: &str, unreleased: &str, document_title: &str) -> String {
+    let insertion = insertion_index_after_title(source, document_title);
+    let mut output = String::with_capacity(source.len() + unreleased.len() + 2);
+    output.push_str(&source[..insertion]);
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output.push_str(unreleased.trim_end());
+    output.push('\n');
+    let suffix = source[insertion..].trim_start_matches(['\n', '\r']);
+    if !suffix.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(suffix);
     output
 }
 
@@ -7528,6 +7596,33 @@ mod tests {
     }
 
     #[test]
+    fn carry_starts_materialized_region_after_closed_release() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Changelog\n=========\n\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+        )
+        .expect("changelog");
+
+        let result = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect("carry");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.starts_with(
+            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -  Fixed carry.\n"
+        ));
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
     fn carry_materialization_preserves_sections_for_existing_and_carried_fragments() {
         let (temp, repo) = repo_with_config(
             r#"
@@ -7767,7 +7862,7 @@ mod tests {
     }
 
     #[test]
-    fn release_leaves_empty_materialized_region() {
+    fn release_closes_materialized_region_without_next_version() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
@@ -7793,10 +7888,15 @@ mod tests {
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
         assert_eq!(
             changelog,
-            "Project changes\n===============\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
         );
         assert!(!temp.path().join("changes.d/add.md").exists());
         assert!(!temp.path().join("changes.d/next").exists());
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("post-release check")
+                .is_clean()
+        );
     }
 
     #[test]
@@ -7908,6 +8008,8 @@ mod tests {
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
             "1.1.0\n"
         );
+        let report = check(&repo, CheckOptions::default()).expect("post-release check");
+        assert!(report.is_clean(), "{report:?}");
     }
 
     #[test]
@@ -8070,6 +8172,123 @@ mod tests {
     }
 
     #[test]
+    fn release_rejects_empty_release_from_closed_materialized_changelog() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect_err("empty release");
+
+        assert!(matches!(error, Error::EmptyRelease));
+    }
+
+    #[test]
+    fn release_allows_intentional_empty_release_from_closed_materialized_changelog() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: true,
+            },
+        )
+        .expect("intentional empty release");
+        apply_release(&repo, plan).expect("apply release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn release_opens_next_version_from_closed_materialized_changelog() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: release_date(),
+                next: Some(String::from("1.3.0")),
+                allow_empty: true,
+            },
+        )
+        .expect("intentional empty release");
+        apply_release(&repo, plan).expect("apply release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Project changes\n===============\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.3.0\n"
+        );
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn release_does_not_treat_missing_markers_as_a_closed_region() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            region-detection = "marker"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n",
+        )
+        .expect("changelog");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: true,
+            },
+        )
+        .expect_err("missing markers");
+
+        assert!(matches!(error, Error::RegionNotFound { .. }));
+    }
+
+    #[test]
     fn release_rejects_fragment_containing_only_html_comment() {
         let (temp, repo) = repo_with_config(
             r#"
@@ -8185,7 +8404,7 @@ mod tests {
     }
 
     #[test]
-    fn release_with_blank_next_removes_next_file_and_uses_unreleased_heading() {
+    fn release_with_blank_next_removes_next_file_and_closes_materialized_region() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
@@ -8210,7 +8429,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Unreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
+            "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
         );
         assert!(!temp.path().join("changes.d/next").exists());
     }
@@ -8251,7 +8470,12 @@ mod tests {
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
         assert_eq!(
             changelog,
-            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\nUnreleased\n----------\n\nTo be released.\n<!-- sacho:unreleased:end -->\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n<!-- sacho:unreleased:end -->\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("post-release check")
+                .is_clean()
         );
     }
 
@@ -10766,6 +10990,36 @@ mod tests {
     }
 
     #[test]
+    fn unreleased_insertion_normalizes_title_and_history_spacing() {
+        let unreleased = "Unreleased\n----------\n\nTo be released.\n";
+
+        assert_eq!(
+            insert_unreleased_region("Version 1.2.0\n-------------\n", unreleased, "Changelog",),
+            "Unreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+        );
+        assert_eq!(
+            insert_unreleased_region(
+                "# Changelog\nVersion 1.2.0\n-------------\n",
+                unreleased,
+                "Changelog",
+            ),
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+        );
+        assert_eq!(
+            insert_unreleased_region("# Changelog", unreleased, "Changelog"),
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n"
+        );
+        assert_eq!(
+            insert_unreleased_region(
+                "# Changelog\n\nVersion 1.2.0\n-------------\n",
+                unreleased,
+                "Changelog",
+            ),
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+        );
+    }
+
+    #[test]
     fn release_line_scanning_helpers_classify_titles_and_blanks() {
         let lines = source_lines_with_offsets("Title\n=====\n\nBody\n");
 
@@ -10844,6 +11098,51 @@ mod tests {
                 .expect("read")
                 .contains(" -  Fixed sync.\n")
         );
+    }
+
+    #[test]
+    fn sync_starts_materialized_region_for_new_fragment_after_closed_release() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_sync(&repo, SyncOptions::default()).expect("plan");
+        assert!(matches!(plan, SyncPlan::Apply(_)));
+        let result = apply_sync(&repo, plan).expect("apply");
+
+        assert!(result.changed);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -  Fixed sync.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+        );
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn sync_does_not_invent_missing_markers_for_an_active_region() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            region-detection = "marker"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/sync.md"), " -  Fixed sync.\n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n",
+        )
+        .expect("changelog");
+
+        let error = plan_sync(&repo, SyncOptions::default()).expect_err("missing markers");
+
+        assert!(matches!(error, Error::RegionNotFound { .. }));
     }
 
     #[test]
@@ -10976,6 +11275,34 @@ mod tests {
                 .expect("check")
                 .is_clean()
         );
+    }
+
+    #[test]
+    fn add_starts_materialized_region_after_closed_release() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n",
+        )
+        .expect("changelog");
+
+        let result = add_fragment(
+            &repo,
+            AddOptions {
+                section: None,
+                name: String::from("next-change"),
+            },
+        )
+        .expect("add");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+        );
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
     }
 
     #[test]
@@ -11356,6 +11683,33 @@ mod tests {
                 .expect("check")
                 .is_clean()
         );
+    }
+
+    #[test]
+    fn next_starts_materialized_region_after_closed_release() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n",
+        )
+        .expect("changelog");
+
+        let result = set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.3.0"),
+            },
+        )
+        .expect("next");
+
+        assert_eq!(result.sync, Some(SyncResult { changed: true }));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+        );
+        let report = check(&repo, CheckOptions::default()).expect("check");
+        assert!(report.is_clean(), "{report:?}");
     }
 
     #[test]

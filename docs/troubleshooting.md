@@ -69,10 +69,15 @@ are not consumed accidentally; finish or remove them before releasing, or use
 The unreleased region cannot be found
 -------------------------------------
 
+After `sacho release` without `--next`, a heading-based changelog intentionally
+has no unreleased region until `sacho next`, `sacho add`, or `sacho carry`
+starts another cycle. That closed state is valid when neither a next-version
+file nor fragments exist.
+
 The configured `region-detection` strategy does not match *CHANGES.md*. With
 `heading`, check the version heading and the configured `unreleased-heading`
-date line. With `marker`, make sure exactly one marker pair encloses the
-generated region, for example:
+date line if a next version or fragments do exist. With `marker`, make sure
+exactly one marker pair encloses the generated region, for example:
 
 ~~~~ markdown
 <!-- sacho:unreleased:begin -->

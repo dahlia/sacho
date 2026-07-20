@@ -98,7 +98,13 @@ pub fn replace_unreleased_region(
     unreleased_heading: &str,
 ) -> std::result::Result<RegionReplacement, ChangelogError> {
     let span = find_unreleased_region(source, detection, unreleased_heading)?;
-    let replacement = normalize_compiled_region(compiled);
+    let mut replacement = normalize_compiled_region(compiled);
+    if detection == RegionDetection::Heading
+        && span.end < source.len()
+        && source[span.start..span.end].ends_with("\n\n")
+    {
+        replacement.push('\n');
+    }
     let mut new_contents =
         String::with_capacity(source.len() - (span.end - span.start) + replacement.len());
     new_contents.push_str(&source[..span.start]);
@@ -502,6 +508,21 @@ To be released.
     }
 
     #[test]
+    fn heading_replacement_does_not_add_a_separator_at_end_of_file() {
+        let source = "Unreleased\n----------\n\nTo be released.\n\n";
+
+        let replacement = replace_unreleased_region(
+            source,
+            COMPILED,
+            RegionDetection::Heading,
+            "To be released.",
+        )
+        .expect("replace");
+
+        assert_eq!(replacement.new_contents, COMPILED);
+    }
+
+    #[test]
     fn heading_mode_ignores_released_date_lines() {
         let source = "\
 Version 1.2.0
@@ -545,7 +566,7 @@ Released on July 1, 2026.
 
         assert_eq!(
             replacement.new_contents,
-            format!("{COMPILED}## Version 1.1.0\n\nReleased on July 1, 2026.\n")
+            format!("{COMPILED}\n## Version 1.1.0\n\nReleased on July 1, 2026.\n")
         );
     }
 
@@ -669,7 +690,7 @@ Released on July 1, 2026.
 
             assert_eq!(
                 replacement.new_contents,
-                format!("{COMPILED}Version 1.0.0\n-------------\n\nReleased on July 1, 2026.\n")
+                format!("{COMPILED}\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n")
             );
         }
     }
@@ -732,7 +753,7 @@ Released on July 1, 2026.
         assert_eq!(
             replacement.new_contents,
             format!(
-                "{COMPILED}Version 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n```markdown\n## Historical example\n"
+                "{COMPILED}\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n```markdown\n## Historical example\n"
             )
         );
     }

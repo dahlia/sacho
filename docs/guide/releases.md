@@ -42,26 +42,40 @@ Compile the release
 When *changes.d/next* already contains the release version, run:
 
 ~~~~ sh
-sacho release --next 1.3.0
+sacho release
 ~~~~
 
 Sacho uses the current local calendar date, consumes the released fragments,
-and starts the next version at `1.3.0`.
+removes the next-version file, and closes the materialized unreleased region.
+The resulting changelog contains only released history, ready for the release
+commit and tag.
 
 If no next version has been set, provide the release version:
 
 ~~~~ sh
-sacho release 1.2.0 --next 1.3.0
+sacho release 1.2.0
 ~~~~
 
 Supply the date when reproducibility or a release process requires it:
 
 ~~~~ sh
-sacho release 1.2.0 --date 2026-07-19 --next 1.3.0
+sacho release 1.2.0 --date 2026-07-19
 ~~~~
 
-Commit the changed changelog, removed fragments, and updated *changes.d/next*
-together.
+Commit the changed changelog, removed fragments, and removed *changes.d/next*
+together, then tag that commit. Afterward, start the next development cycle:
+
+~~~~ sh
+sacho next 1.3.0
+~~~~
+
+This recreates the materialized region with the new version heading. If the
+project deliberately wants the release commit to include that empty next-cycle
+region, combine the transitions explicitly:
+
+~~~~ sh
+sacho release --next 1.3.0
+~~~~
 
 
 Publish release notes

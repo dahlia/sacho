@@ -54,6 +54,12 @@ pub struct CompiledRegion {
     pub substantive_item_count: usize,
 }
 
+impl CompiledRegion {
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.version_label, VersionLabel::Version(_)) || !self.sections.is_empty()
+    }
+}
+
 /// Version label for an unreleased changelog region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionLabel {

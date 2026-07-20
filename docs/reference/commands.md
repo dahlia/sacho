@@ -141,14 +141,16 @@ nothing when materialization is disabled or the changelog is already current.
 sacho release [--date <DATE>] [--next <NEXT>] [--allow-empty] [VERSION]
 ~~~~
 
-Compiles and inserts a dated released section, removes the consumed fragments,
-and optionally sets the following version.
+Compiles and inserts a dated released section and removes the consumed
+fragments. Without `--next`, it also removes the next-version file and closes
+the materialized unreleased region. With `--next`, it opens the following cycle
+in the same operation.
 
 | Argument or option | Meaning                                                                |
 | ------------------ | ---------------------------------------------------------------------- |
 | `VERSION`          | Version to release. Defaults to the next-version file.                 |
 | `--date <DATE>`    | Release date in `YYYY-MM-DD` form. Defaults to the current local date. |
-| `--next <NEXT>`    | Version label to write after the release.                              |
+| `--next <NEXT>`    | Open this next version immediately after the release.                  |
 | `--allow-empty`    | Allow a release without substantive changelog items.                   |
 
 When both `VERSION` and the next-version file contain values, they must agree.
@@ -158,6 +160,10 @@ fragments contain no substantive changelog items unless `--allow-empty` is
 passed. Empty list items, whitespace, and complete HTML comments do not make a
 release nonempty; scaffold-only fragments still require the explicit option,
 even for the first release.
+
+The default release output is suitable for committing and tagging as a
+released-only changelog. Run `sacho next <version>` after the tag to open the
+next development cycle.
 
 
 `sacho carry`

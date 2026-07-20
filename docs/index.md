@@ -124,7 +124,7 @@ When the release is ready, one command compiles every fragment into a dated
 section of *CHANGES.md* and deletes the consumed files:
 
 ~~~~ sh
-sacho release --next 1.3.0
+sacho release
 ~~~~
 
 ~~~~ markdown
@@ -137,6 +137,9 @@ Released on July 19, 2026.
 ~~~~
 
 The released section is sealed. Sacho never rewrites it.
+
+The release commit contains no empty unreleased section. After tagging it,
+`sacho next 1.3.0` starts the next development cycle.
 
 
 Where the tool comes in

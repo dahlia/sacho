@@ -2823,6 +2823,59 @@ materialize = false
 }
 
 #[test]
+fn release_command_closes_materialized_region_until_next_cycle_starts() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(temp.path().join("changes.d/next"), "0.2.0\n").expect("next");
+    std::fs::write(
+        temp.path().join("changes.d/release.md"),
+        " -  Fixed release.\n",
+    )
+    .expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Changelog\n=========\n\nVersion 0.2.0\n-------------\n\nTo be released.\n\n -  Fixed release.\n",
+    )
+    .expect("changelog");
+
+    let mut release = Command::cargo_bin("sacho").expect("binary");
+    release
+        .current_dir(temp.path())
+        .args(["release", "--date", "2026-07-08"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        "Changelog\n=========\n\nVersion 0.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed release.\n"
+    );
+    let mut check = Command::cargo_bin("sacho").expect("binary");
+    check
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+
+    let mut next = Command::cargo_bin("sacho").expect("binary");
+    next.current_dir(temp.path())
+        .args(["next", "0.3.0"])
+        .assert()
+        .success();
+
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.starts_with(
+        "Changelog\n=========\n\nVersion 0.3.0\n-------------\n\nTo be released.\n\nVersion 0.2.0"
+    ));
+    let mut check = Command::cargo_bin("sacho").expect("binary");
+    check
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+}
+
+#[test]
 fn release_command_allows_an_intentional_empty_release() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(

@@ -173,10 +173,10 @@ staged Git changes or `sacho check --base <revision>` in CI.
 
 When the version is ready, compile and consume its fragments. This command
 releases the version stored by `sacho next`, uses the current local date, and
-starts the next version:
+closes the materialized unreleased region:
 
 ~~~~ sh
-sacho release --next 1.3.0
+sacho release
 ~~~~
 
 If no next version has been set, pass the release version explicitly, for
@@ -184,6 +184,16 @@ example `sacho release 1.2.0`. Use `--date YYYY-MM-DD` when the release date
 must be supplied rather than taken from the local clock. A repository with no
 released changelog sections can cut its first release without fragments. Later
 empty releases require an explicit `--allow-empty`.
+
+Commit and tag that released-only state. When development resumes, start the
+next cycle separately:
+
+~~~~ sh
+sacho next 1.3.0
+~~~~
+
+Pass `--next 1.3.0` to `sacho release` only when the release commit should also
+open the next cycle and retain its empty materialized region.
 
 After committing a release, print its frozen Markdown section with `show`:
 
