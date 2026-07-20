@@ -9,8 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use semver::Version;
 
-use crate::changelog::{ChangelogError, find_unreleased_region, version_heading_spans};
+use crate::changelog::{
+    ChangelogError, find_unreleased_region, marker_region_contents, set_hongdown_separator_before,
+    version_heading_spans,
+};
 use crate::commands::{CompileOptions, compile_unreleased};
+use crate::config::RegionDetection;
 use crate::error::{Error, Result};
 use crate::released::insertion_title_span;
 use crate::repo::{Repository, mutation_lock_path};
@@ -118,6 +122,7 @@ pub fn merge_driver(repo: &Repository, options: MergeDriverOptions) -> Result<Me
         current_parsed,
         other_parsed,
         compiled_unreleased,
+        config.region_detection,
     )
 }
 
@@ -182,6 +187,7 @@ fn merge_parsed_changelogs_with_unreleased(
     current: ParsedChangelog,
     other: ParsedChangelog,
     compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
 ) -> Result<MergeDriverResult> {
     let prefix = merge_text_region(&ancestor.prefix, &current.prefix, &other.prefix);
     let after_unreleased = merge_text_region(
@@ -241,6 +247,7 @@ fn merge_parsed_changelogs_with_unreleased(
                     &current_prefix,
                     &other_prefix,
                     compiled_unreleased,
+                    region_detection,
                     merged_or_current_text(after_unreleased, &current.after_unreleased),
                     ordered.iter().copied(),
                 ),
@@ -258,6 +265,7 @@ fn merge_parsed_changelogs_with_unreleased(
                 output_with_markers: reconstruct_with_after_unreleased_conflict(
                     prefix,
                     compiled_unreleased,
+                    region_detection,
                     &current_after,
                     &other_after,
                     ordered.iter().copied(),
@@ -270,6 +278,7 @@ fn merge_parsed_changelogs_with_unreleased(
         let output_with_markers = reconstruct_with_conflict(
             prefix,
             compiled_unreleased,
+            region_detection,
             after_unreleased,
             &current_block,
             &other_block,
@@ -287,6 +296,7 @@ fn merge_parsed_changelogs_with_unreleased(
         output: reconstruct(
             prefix,
             compiled_unreleased,
+            region_detection,
             after_unreleased,
             ordered.iter().copied(),
         ),
@@ -301,7 +311,13 @@ fn merge_parsed_changelogs(
     other: ParsedChangelog,
     compiled_unreleased: &str,
 ) -> Result<MergeDriverResult> {
-    merge_parsed_changelogs_with_unreleased(ancestor, current, other, Some(compiled_unreleased))
+    merge_parsed_changelogs_with_unreleased(
+        ancestor,
+        current,
+        other,
+        Some(compiled_unreleased),
+        RegionDetection::Heading,
+    )
 }
 
 enum MergedTextRegion<'a> {
@@ -358,6 +374,7 @@ fn merge_divergent_block(
 fn reconstruct_with_conflict<'a>(
     prefix: &str,
     compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
     after_unreleased: &str,
     current_block: &ReleasedBlock,
     other_block: &ReleasedBlock,
@@ -366,9 +383,17 @@ fn reconstruct_with_conflict<'a>(
     let conflict = conflict_block(current_block, other_block);
     let mut replaced = HashSet::new();
 
-    let mut output = start_output(prefix, compiled_unreleased, after_unreleased);
+    let mut output = start_output(
+        prefix,
+        compiled_unreleased,
+        region_detection,
+        after_unreleased,
+    );
+    let mut has_preceding_section =
+        compiled_unreleased.is_some() || region_detection == RegionDetection::Marker;
     for block in blocks {
-        append_block_separator(&mut output);
+        append_block_separator(&mut output, has_preceding_section, &block.body);
+        has_preceding_section = true;
         if block.heading == current_block.heading && replaced.insert(block.heading.clone()) {
             output.push_str(conflict.trim_end());
             output.push('\n');
@@ -384,14 +409,15 @@ fn reconstruct_with_prefix_conflict<'a>(
     current_prefix: &str,
     other_prefix: &str,
     compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
     after_unreleased: &str,
     blocks: impl Iterator<Item = &'a ReleasedBlock>,
 ) -> String {
     let mut output = conflict_text(current_prefix, other_prefix);
-    append_unreleased(&mut output, compiled_unreleased);
+    append_unreleased(&mut output, compiled_unreleased, region_detection);
     output.push_str(after_unreleased);
     for block in blocks {
-        append_block_separator(&mut output);
+        append_block_separator(&mut output, true, &block.body);
         output.push_str(block.body.trim_end());
         output.push('\n');
     }
@@ -401,16 +427,17 @@ fn reconstruct_with_prefix_conflict<'a>(
 fn reconstruct_with_after_unreleased_conflict<'a>(
     prefix: &str,
     compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
     current_after: &str,
     other_after: &str,
     blocks: impl Iterator<Item = &'a ReleasedBlock>,
 ) -> String {
     let mut output = String::new();
     output.push_str(prefix);
-    append_unreleased(&mut output, compiled_unreleased);
+    append_unreleased(&mut output, compiled_unreleased, region_detection);
     output.push_str(&conflict_text(current_after, other_after));
     for block in blocks {
-        append_block_separator(&mut output);
+        append_block_separator(&mut output, true, &block.body);
         output.push_str(block.body.trim_end());
         output.push('\n');
     }
@@ -485,35 +512,62 @@ fn order_released_blocks<'a>(
 fn reconstruct<'a>(
     prefix: &str,
     compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
     after_unreleased: &str,
     blocks: impl Iterator<Item = &'a ReleasedBlock>,
 ) -> String {
-    let mut output = start_output(prefix, compiled_unreleased, after_unreleased);
+    let mut output = start_output(
+        prefix,
+        compiled_unreleased,
+        region_detection,
+        after_unreleased,
+    );
+    let mut has_preceding_section =
+        compiled_unreleased.is_some() || region_detection == RegionDetection::Marker;
     for block in blocks {
-        append_block_separator(&mut output);
+        append_block_separator(&mut output, has_preceding_section, &block.body);
+        has_preceding_section = true;
         output.push_str(block.body.trim_end());
         output.push('\n');
     }
     output
 }
 
-fn start_output(prefix: &str, compiled_unreleased: Option<&str>, after_unreleased: &str) -> String {
+fn start_output(
+    prefix: &str,
+    compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
+    after_unreleased: &str,
+) -> String {
     let mut output = String::new();
     output.push_str(prefix);
-    append_unreleased(&mut output, compiled_unreleased);
+    append_unreleased(&mut output, compiled_unreleased, region_detection);
     output.push_str(after_unreleased);
     output
 }
 
-fn append_unreleased(output: &mut String, compiled_unreleased: Option<&str>) {
-    if let Some(compiled) = compiled_unreleased {
-        output.push_str(compiled.trim_end());
-        output.push('\n');
+fn append_unreleased(
+    output: &mut String,
+    compiled_unreleased: Option<&str>,
+    region_detection: RegionDetection,
+) {
+    match (compiled_unreleased, region_detection) {
+        (Some(compiled), RegionDetection::Heading) => {
+            output.push_str(compiled.trim_end());
+            output.push('\n');
+        }
+        (Some(compiled), RegionDetection::Marker) => {
+            output.push_str(&marker_region_contents(compiled));
+        }
+        (None, RegionDetection::Marker) => output.push('\n'),
+        (None, RegionDetection::Heading) => {}
     }
 }
 
-fn append_block_separator(output: &mut String) {
-    if !output.ends_with("\n\n") {
+fn append_block_separator(output: &mut String, has_preceding_section: bool, following: &str) {
+    if has_preceding_section {
+        set_hongdown_separator_before(output, following);
+    } else if !output.ends_with("\n\n") {
         if !output.ends_with('\n') {
             output.push('\n');
         }
@@ -1025,6 +1079,8 @@ mod tests {
 
     use super::*;
     use crate::Repository;
+    use crate::changelog::replace_unreleased_region;
+    use crate::markdown::format_markdown;
 
     fn repo_with_fragment(fragment: &str) -> (tempfile::TempDir, Repository) {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1122,6 +1178,25 @@ mod tests {
         .expect("merge")
     }
 
+    fn assert_normal_form_and_materialized_consistency(repo: &Repository, output: &str) {
+        assert_eq!(
+            output,
+            format_markdown(output).expect("format merged changelog")
+        );
+
+        let compiled = compile_unreleased(repo, CompileOptions::default()).expect("compile");
+        let changelog = &repo.config().changelog;
+        let synced = replace_unreleased_region(
+            output,
+            &compiled.markdown,
+            changelog.region_detection,
+            &changelog.unreleased_heading,
+        )
+        .expect("replace merged unreleased region")
+        .new_contents;
+        assert_eq!(output, synced);
+    }
+
     fn parsed_releases(source: &str) -> ParsedChangelog {
         ParsedChangelog {
             prefix: String::new(),
@@ -1169,6 +1244,117 @@ Released on July 1, 2026.
         assert!(output.contains(" -  Fixed merged fragment.\n"));
         assert!(!output.contains("Current stale"));
         assert!(!output.contains("Other stale"));
+    }
+
+    #[test]
+    fn heading_merge_output_is_normal_form_and_materialized_consistent() {
+        let (temp, repo) = repo_with_fragment(" -  Fixed merged fragment.\n");
+        let current = "\
+Project changes
+===============
+
+Unreleased
+----------
+
+To be released.
+
+ -  Current stale entry.
+
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+";
+        let other = current.replace("Current stale", "Other stale");
+        let (ancestor, current, other) = write_inputs(temp.path(), current, &other);
+
+        let result = merge(&repo, ancestor, current, other);
+
+        let MergeDriverResult::Clean { output, .. } = result else {
+            panic!("expected clean merge");
+        };
+        assert_normal_form_and_materialized_consistency(&repo, &output);
+    }
+
+    #[test]
+    fn marker_merge_output_is_normal_form_and_materialized_consistent() {
+        let (temp, repo) = repo_with_config_and_fragment(
+            "[changelog]\nregion-detection = \"marker\"\n",
+            " -  Fixed marker merge.\n",
+        );
+        let current = "\
+Project changes
+===============
+
+<!-- sacho:unreleased:begin -->
+
+
+Unreleased
+----------
+
+To be released.
+
+ -  Current stale entry.
+
+<!-- sacho:unreleased:end -->
+
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+";
+        let other = current.replace("Current stale", "Other stale");
+        let (ancestor, current, other) = write_inputs(temp.path(), current, &other);
+
+        let result = merge(&repo, ancestor, current, other);
+
+        let MergeDriverResult::Clean { output, .. } = result else {
+            panic!("expected clean merge");
+        };
+        assert_normal_form_and_materialized_consistency(&repo, &output);
+    }
+
+    #[test]
+    fn closed_marker_conflict_uses_hongdown_section_spacing() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nregion-detection = \"marker\"\n",
+        )
+        .expect("config");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+        let ancestor = "\
+Project changes
+===============
+
+<!-- sacho:unreleased:begin -->
+<!-- sacho:unreleased:end -->
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+ -  Original entry.
+";
+        let current = ancestor.replace("Original entry", "Current entry");
+        let other = ancestor.replace("Original entry", "Other entry");
+        let (ancestor, current, other) =
+            write_three_inputs(temp.path(), ancestor, &current, &other);
+
+        let result = merge(&repo, ancestor, current, other);
+
+        let MergeDriverResult::Conflict {
+            output_with_markers,
+            ..
+        } = result
+        else {
+            panic!("expected conflict");
+        };
+        assert!(output_with_markers.contains("<!-- sacho:unreleased:end -->\n\n\n<<<<<<< current"));
     }
 
     #[test]
@@ -1290,7 +1476,9 @@ Project changes
 ===============
 
 <!-- sacho:unreleased:begin -->
+
 <!-- sacho:unreleased:end -->
+
 
 Version 1.2.0
 -------------
@@ -2096,7 +2284,7 @@ Released on July 1, 2026.
     }
 
     #[test]
-    fn reconstruction_uses_single_blank_line_between_blocks() {
+    fn reconstruction_uses_hongdown_spacing_between_blocks() {
         let block = ReleasedBlock {
             heading: String::from("Version 1.0.0"),
             version: String::from("1.0.0"),
@@ -2106,6 +2294,7 @@ Released on July 1, 2026.
         let output = reconstruct(
             "Project changes\n===============\n\n",
             Some("Unreleased\n----------\n\nTo be released.\n"),
+            RegionDetection::Heading,
             "",
             [&block].into_iter(),
         );
@@ -2121,12 +2310,52 @@ Unreleased
 
 To be released.
 
+
 Version 1.0.0
 -------------
 
 Released on July 1, 2026.
 "
         );
+    }
+
+    #[test]
+    fn no_op_merge_preserves_atx_release_spacing() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("sacho.toml"), "").expect("config");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+        let source = "\
+Project changes
+===============
+
+### Version 2.0.0
+
+Released on July 2, 2026.
+
+### Version 1.0.0
+
+Released on July 1, 2026.
+";
+        assert_eq!(source, format_markdown(source).expect("format source"));
+        let (ancestor, current, other) = write_inputs(temp.path(), source, source);
+
+        let result = merge(&repo, ancestor, current, other);
+
+        let MergeDriverResult::Clean { output, .. } = result else {
+            panic!("expected clean merge");
+        };
+        assert_eq!(output, source);
+        assert_eq!(output, format_markdown(&output).expect("format output"));
+    }
+
+    #[test]
+    fn first_block_separator_completes_an_unterminated_prefix() {
+        let mut output = String::from("Project changes");
+
+        append_block_separator(&mut output, false, "Version 1.0.0\n-------------\n");
+
+        assert_eq!(output, "Project changes\n\n");
     }
 
     #[test]

@@ -98,12 +98,12 @@ pub fn replace_unreleased_region(
     unreleased_heading: &str,
 ) -> std::result::Result<RegionReplacement, ChangelogError> {
     let span = find_unreleased_region(source, detection, unreleased_heading)?;
-    let mut replacement = normalize_compiled_region(compiled);
-    if detection == RegionDetection::Heading
-        && span.end < source.len()
-        && source[span.start..span.end].ends_with("\n\n")
-    {
-        replacement.push('\n');
+    let mut replacement = match detection {
+        RegionDetection::Heading => normalize_compiled_region(compiled),
+        RegionDetection::Marker => marker_region_contents(compiled),
+    };
+    if detection == RegionDetection::Heading && span.end < source.len() {
+        set_hongdown_separator_before(&mut replacement, &source[span.end..]);
     }
     let mut new_contents =
         String::with_capacity(source.len() - (span.end - span.start) + replacement.len());
@@ -145,6 +145,46 @@ fn normalize_compiled_region(compiled: &str) -> String {
     let mut normalized = compiled.trim_end_matches(['\n', '\r']).to_owned();
     normalized.push('\n');
     normalized
+}
+
+pub(crate) fn marker_region_contents(compiled: &str) -> String {
+    let compiled = compiled.trim_end_matches(['\n', '\r']);
+    if compiled.is_empty() {
+        String::from("\n")
+    } else {
+        format!("\n\n{compiled}\n\n")
+    }
+}
+
+pub(crate) fn set_hongdown_separator_before(output: &mut String, following: &str) {
+    let following = following.trim_start_matches(['\n', '\r']);
+    let count = if starts_with_setext_heading(following) {
+        3
+    } else {
+        2
+    };
+    set_trailing_newline_count(output, count);
+}
+
+fn starts_with_setext_heading(source: &str) -> bool {
+    let arena = comrak::Arena::new();
+    let root = comrak::parse_document(&arena, source, &comrak::Options::default());
+    let Some(first_block) = root.first_child() else {
+        return false;
+    };
+    let block = first_block.data.borrow();
+    if !matches!(&block.value, comrak::nodes::NodeValue::Heading(_)) {
+        return false;
+    }
+
+    source_lines(source)
+        .get(block.sourcepos.end.line.saturating_sub(1))
+        .is_some_and(|line| !is_indented_code_line(line.text) && is_setext_underline(line.text))
+}
+
+pub(crate) fn set_trailing_newline_count(output: &mut String, count: usize) {
+    output.truncate(output.trim_end_matches(['\n', '\r']).len());
+    output.extend(std::iter::repeat_n('\n', count));
 }
 
 fn find_heading_region(
@@ -436,6 +476,7 @@ mod tests {
 
     use super::*;
     use crate::config::RegionDetection;
+    use crate::markdown::format_markdown;
 
     const COMPILED: &str = "Unreleased\n----------\n\nTo be released.\n\n -  Fixed sync.\n";
 
@@ -690,7 +731,9 @@ Released on July 1, 2026.
 
             assert_eq!(
                 replacement.new_contents,
-                format!("{COMPILED}\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n")
+                format!(
+                    "{COMPILED}\n\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n"
+                )
             );
         }
     }
@@ -753,7 +796,7 @@ Released on July 1, 2026.
         assert_eq!(
             replacement.new_contents,
             format!(
-                "{COMPILED}\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n```markdown\n## Historical example\n"
+                "{COMPILED}\n\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n```markdown\n## Historical example\n"
             )
         );
     }
@@ -868,9 +911,61 @@ After.
         assert_eq!(
             replacement.new_contents,
             format!(
-                "Before.\n<!-- sacho:unreleased:begin -->\n{COMPILED}<!-- sacho:unreleased:end -->\nAfter.\n"
+                "Before.\n<!-- sacho:unreleased:begin -->\n\n\n{}\n\n<!-- sacho:unreleased:end -->\nAfter.\n",
+                COMPILED.trim_end()
             )
         );
+    }
+
+    #[test]
+    fn empty_marker_replacement_preserves_markdown_normal_form() {
+        let source = "<!-- sacho:unreleased:begin -->\n\n<!-- sacho:unreleased:end -->\n";
+        assert_eq!(source, format_markdown(source).expect("format source"));
+
+        let replacement =
+            replace_unreleased_region(source, "", RegionDetection::Marker, "To be released.")
+                .expect("replace");
+
+        assert_eq!(replacement.new_contents, source);
+        assert_eq!(
+            replacement.new_contents,
+            format_markdown(&replacement.new_contents).expect("format replacement")
+        );
+    }
+
+    #[test]
+    fn heading_replacement_preserves_atx_history_spacing() {
+        let source = "Unreleased\n----------\n\nTo be released.\n\n### Version 1.0.0\n\nReleased on July 1, 2026.\n";
+        assert_eq!(source, format_markdown(source).expect("format source"));
+
+        let replacement = replace_unreleased_region(
+            source,
+            COMPILED,
+            RegionDetection::Heading,
+            "To be released.",
+        )
+        .expect("replace");
+
+        assert_eq!(
+            replacement.new_contents,
+            format_markdown(&replacement.new_contents).expect("format replacement")
+        );
+    }
+
+    #[test]
+    fn hongdown_separator_distinguishes_setext_headings_from_prose() {
+        for (following, expected) in [
+            ("Intro paragraph.\n", "Before.\n\n"),
+            ("### Version 1.0.0\n", "Before.\n\n"),
+            ("Version 1.0.0\n-------------\n", "Before.\n\n\n"),
+            ("<!--\n---\n-->\n", "Before.\n\n"),
+        ] {
+            let mut output = String::from("Before.\n");
+
+            set_hongdown_separator_before(&mut output, following);
+
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]

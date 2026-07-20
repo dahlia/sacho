@@ -2865,7 +2865,7 @@ fn release_command_closes_materialized_region_until_next_cycle_starts() {
 
     let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
     assert!(changelog.starts_with(
-        "Changelog\n=========\n\nVersion 0.3.0\n-------------\n\nTo be released.\n\nVersion 0.2.0"
+        "Changelog\n=========\n\nVersion 0.3.0\n-------------\n\nTo be released.\n\n\nVersion 0.2.0"
     ));
     let mut check = Command::cargo_bin("sacho").expect("binary");
     check
@@ -2899,7 +2899,7 @@ fn release_command_allows_an_intentional_empty_release() {
 
     assert_eq!(
         std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-        "Changelog\n=========\n\nVersion 0.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 0.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        "Changelog\n=========\n\nVersion 0.2.0\n-------------\n\nReleased on July 8, 2026.\n\n\nVersion 0.1.0\n-------------\n\nReleased on July 1, 2026.\n"
     );
 }
 

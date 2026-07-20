@@ -14,7 +14,8 @@ use similar::TextDiff;
 
 use crate::changelog::{
     BEGIN_MARKER, ChangelogError, END_MARKER, ReleasedSection, find_unreleased_region,
-    replace_unreleased_region,
+    marker_region_contents, replace_unreleased_region, set_hongdown_separator_before,
+    set_trailing_newline_count,
 };
 use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
 use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
@@ -4335,7 +4336,7 @@ fn replace_region_for_release(
         RegionDetection::Heading => {
             let replacement = next_unreleased.map_or_else(
                 || released.to_owned(),
-                |unreleased| format!("{}\n\n{}", unreleased.trim_end(), released),
+                |unreleased| format!("{}\n\n\n{}", unreleased.trim_end(), released),
             );
             replace_unreleased_region(source, &replacement, detection, unreleased_heading)
                 .map(|replacement| replacement.new_contents)
@@ -4364,6 +4365,9 @@ fn remove_unreleased_region(
     let span = find_unreleased_region(source, detection, unreleased_heading)?;
     let mut output = String::with_capacity(source.len() - (span.end - span.start));
     output.push_str(&source[..span.start]);
+    if detection == RegionDetection::Marker {
+        output.push('\n');
+    }
     output.push_str(&source[span.end..]);
     Ok(output)
 }
@@ -4387,15 +4391,15 @@ fn insert_released_after_marker_region(
 
     let mut output = String::with_capacity(source.len() + released.len() + 2);
     output.push_str(&source[..insertion]);
-    if !output.ends_with("\n\n") {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('\n');
-    }
+    set_hongdown_separator_before(&mut output, released);
     output.push_str(released.trim_end());
-    output.push_str("\n\n");
-    output.push_str(source[insertion..].trim_start_matches(['\n', '\r']));
+    let suffix = source[insertion..].trim_start_matches(['\n', '\r']);
+    if suffix.is_empty() {
+        output.push('\n');
+    } else {
+        set_hongdown_separator_before(&mut output, suffix);
+        output.push_str(suffix);
+    }
     output
 }
 
@@ -4403,15 +4407,17 @@ fn insert_released_section(source: &str, released: &str, document_title: &str) -
     let insertion = insertion_index_after_title(source, document_title);
     let mut output = String::with_capacity(source.len() + released.len() + 2);
     output.push_str(&source[..insertion]);
-    if !output.ends_with("\n\n") {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('\n');
+    if !output.is_empty() {
+        set_trailing_newline_count(&mut output, 2);
     }
     output.push_str(released.trim_end());
-    output.push_str("\n\n");
-    output.push_str(source[insertion..].trim_start_matches(['\n', '\r']));
+    let suffix = source[insertion..].trim_start_matches(['\n', '\r']);
+    if suffix.is_empty() {
+        output.push('\n');
+    } else {
+        set_hongdown_separator_before(&mut output, suffix);
+        output.push_str(suffix);
+    }
     output
 }
 
@@ -4419,19 +4425,17 @@ fn insert_unreleased_region(source: &str, unreleased: &str, document_title: &str
     let insertion = insertion_index_after_title(source, document_title);
     let mut output = String::with_capacity(source.len() + unreleased.len() + 2);
     output.push_str(&source[..insertion]);
-    if !output.is_empty() && !output.ends_with("\n\n") {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push('\n');
+    if !output.is_empty() {
+        set_trailing_newline_count(&mut output, 2);
     }
     output.push_str(unreleased.trim_end());
-    output.push('\n');
     let suffix = source[insertion..].trim_start_matches(['\n', '\r']);
-    if !suffix.is_empty() {
+    if suffix.is_empty() {
         output.push('\n');
+    } else {
+        set_hongdown_separator_before(&mut output, suffix);
+        output.push_str(suffix);
     }
-    output.push_str(suffix);
     output
 }
 
@@ -4939,16 +4943,17 @@ fn initial_changelog_for_config(config: &Config) -> String {
 
 fn initial_materialized_changelog(config: &Config) -> String {
     let mut changelog = initial_changelog(&config.changelog.title);
+    let mut unreleased = String::from("Unreleased\n----------\n\n");
+    unreleased.push_str(&config.changelog.unreleased_heading);
+    unreleased.push('\n');
     if config.changelog.region_detection == RegionDetection::Marker {
         changelog.push_str(BEGIN_MARKER);
         changelog.push('\n');
-    }
-    changelog.push_str("Unreleased\n----------\n\n");
-    changelog.push_str(&config.changelog.unreleased_heading);
-    changelog.push('\n');
-    if config.changelog.region_detection == RegionDetection::Marker {
+        changelog.push_str(&marker_region_contents(&unreleased));
         changelog.push_str(END_MARKER);
         changelog.push('\n');
+    } else {
+        changelog.push_str(&unreleased);
     }
     changelog
 }
@@ -6645,6 +6650,10 @@ mod tests {
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
         assert!(changelog.contains("<!-- sacho:unreleased:begin -->"));
         assert!(changelog.contains("<!-- sacho:unreleased:end -->"));
+        assert_eq!(
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
+        );
         assert!(
             check(&repo, CheckOptions::default())
                 .expect("check")
@@ -7572,7 +7581,7 @@ mod tests {
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(
             temp.path().join("CHANGES.md"),
-            "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
+            "Unreleased\n----------\n\nTo be released.\n\n\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n",
         )
         .expect("changelog");
 
@@ -7746,7 +7755,7 @@ mod tests {
     fn carry_sync_failure_restores_every_fragment_and_the_changelog() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
-        let changelog = "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\n\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
         fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
         set_release_failpoint(ReleaseApplyStage::Apply, PathBuf::from("CHANGES.md"));
 
@@ -7778,7 +7787,7 @@ mod tests {
     fn carry_rolls_back_when_a_new_fragment_appears_during_apply() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
-        let changelog = "Unreleased\n----------\n\nTo be released.\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\n\nVersion 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.\n";
         fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
         set_release_interference(
             ReleaseApplyStage::Apply,
@@ -7847,7 +7856,7 @@ mod tests {
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
         assert_eq!(
             changelog,
-            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed release.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
         assert!(!temp.path().join("changes.d/fix.md").exists());
         assert_eq!(
@@ -8002,7 +8011,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nTo be released.\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n"
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nTo be released.\n\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
@@ -8036,7 +8045,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Changelog\n=========\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+            "Changelog\n=========\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
     }
 
@@ -8070,7 +8079,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "<!-- Project release history. -->\n\n# Version history\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+            "<!-- Project release history. -->\n\n# Version history\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
     }
 
@@ -8167,7 +8176,7 @@ mod tests {
         assert!(!temp.path().join("changes.d/scaffold.md").exists());
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
     }
 
@@ -8219,7 +8228,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
         let report = check(&repo, CheckOptions::default()).expect("check");
         assert!(report.is_clean(), "{report:?}");
@@ -8249,7 +8258,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Project changes\n===============\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            "Project changes\n===============\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
@@ -8451,7 +8460,7 @@ mod tests {
         .expect("fragment");
         fs::write(
             temp.path().join("CHANGES.md"),
-            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Fixed marker release.\n<!-- sacho:unreleased:end -->\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Fixed marker release.\n\n<!-- sacho:unreleased:end -->\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
         )
         .expect("changelog");
 
@@ -8465,12 +8474,18 @@ mod tests {
             },
         )
         .expect("plan");
+        let expected = "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n\n<!-- sacho:unreleased:end -->\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n";
+        assert!(matches!(
+            &plan.changelog.after,
+            ReleaseFileState::Present(changelog) if changelog == expected
+        ));
         apply_release(&repo, plan).expect("release");
 
         let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(changelog, expected);
         assert_eq!(
-            changelog,
-            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n<!-- sacho:unreleased:end -->\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
         );
         assert!(
             check(&repo, CheckOptions::default())
@@ -10758,7 +10773,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n\n"
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Added release.\n"
         );
     }
 
@@ -10967,9 +10982,31 @@ mod tests {
 
     #[test]
     fn release_insertion_helpers_handle_boundary_spacing() {
+        let marker_release_source = "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\n -  Fixed marker release.\n\n<!-- sacho:unreleased:end -->\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n";
+        assert_eq!(
+            replace_region_for_release(
+                marker_release_source,
+                None,
+                "Version 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n",
+                RegionDetection::Marker,
+                "To be released.",
+                "Project changes",
+            )
+            .expect("replace marker release"),
+            "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n\n<!-- sacho:unreleased:end -->\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -  Fixed marker release.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+        );
+        assert_eq!(
+            remove_unreleased_region(
+                "<!-- sacho:unreleased:begin -->\n\n\nUnreleased\n----------\n\nTo be released.\n\n<!-- sacho:unreleased:end -->\n",
+                RegionDetection::Marker,
+                "To be released.",
+            )
+            .expect("remove marker region"),
+            "<!-- sacho:unreleased:begin -->\n\n<!-- sacho:unreleased:end -->\n"
+        );
         assert_eq!(
             insert_released_section("# Changelog", "Version 1.2.0\n-------------\n", "Changelog",),
-            "# Changelog\n\nVersion 1.2.0\n-------------\n\n"
+            "# Changelog\n\nVersion 1.2.0\n-------------\n"
         );
         assert_eq!(
             insert_released_section(
@@ -10977,15 +11014,47 @@ mod tests {
                 "Version 1.2.0\n-------------\n",
                 "Changelog",
             ),
-            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n-------------\n"
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\n\nVersion 1.1.0\n-------------\n"
         );
         assert_eq!(
-            insert_released_after_marker_region(
-                "Header\n<!-- sacho:unreleased:end --> trailer\nVersion 1.1.0\n",
+            insert_released_section(
+                "Changelog\n=========\n\n### Version 1.1.0\n",
                 "Version 1.2.0\n-------------\n",
                 "Changelog",
             ),
-            "Header\n<!-- sacho:unreleased:end --> trailer\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n"
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\n### Version 1.1.0\n"
+        );
+        assert_eq!(
+            insert_released_section(
+                "Changelog\n=========\n\nIntro paragraph.\n",
+                "Version 1.2.0\n-------------\n",
+                "Changelog",
+            ),
+            "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nIntro paragraph.\n"
+        );
+        assert_eq!(
+            insert_released_after_marker_region(
+                "Header\n<!-- sacho:unreleased:end --> trailer\nVersion 1.1.0\n-------------\n",
+                "Version 1.2.0\n-------------\n",
+                "Changelog",
+            ),
+            "Header\n<!-- sacho:unreleased:end --> trailer\n\n\nVersion 1.2.0\n-------------\n\n\nVersion 1.1.0\n-------------\n"
+        );
+        assert_eq!(
+            insert_released_after_marker_region(
+                "Header\n<!-- sacho:unreleased:end --> trailer\n### Version 1.1.0\n",
+                "Version 1.2.0\n-------------\n",
+                "Changelog",
+            ),
+            "Header\n<!-- sacho:unreleased:end --> trailer\n\n\nVersion 1.2.0\n-------------\n\n### Version 1.1.0\n"
+        );
+        assert_eq!(
+            insert_released_after_marker_region(
+                "<!-- sacho:unreleased:begin -->\n<!-- sacho:unreleased:end -->\n",
+                "Version 1.2.0\n-------------\n",
+                "Changelog",
+            ),
+            "<!-- sacho:unreleased:begin -->\n<!-- sacho:unreleased:end -->\n\n\nVersion 1.2.0\n-------------\n"
         );
     }
 
@@ -10995,7 +11064,7 @@ mod tests {
 
         assert_eq!(
             insert_unreleased_region("Version 1.2.0\n-------------\n", unreleased, "Changelog",),
-            "Unreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+            "Unreleased\n----------\n\nTo be released.\n\n\nVersion 1.2.0\n-------------\n"
         );
         assert_eq!(
             insert_unreleased_region(
@@ -11003,7 +11072,7 @@ mod tests {
                 unreleased,
                 "Changelog",
             ),
-            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\n\nVersion 1.2.0\n-------------\n"
         );
         assert_eq!(
             insert_unreleased_region("# Changelog", unreleased, "Changelog"),
@@ -11015,7 +11084,19 @@ mod tests {
                 unreleased,
                 "Changelog",
             ),
-            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n"
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\n\nVersion 1.2.0\n-------------\n"
+        );
+        assert_eq!(
+            insert_unreleased_region(
+                "# Changelog\n\n### Version 1.2.0\n",
+                unreleased,
+                "Changelog",
+            ),
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\n### Version 1.2.0\n"
+        );
+        assert_eq!(
+            insert_unreleased_region("# Changelog\n\nIntro paragraph.\n", unreleased, "Changelog",),
+            "# Changelog\n\nUnreleased\n----------\n\nTo be released.\n\nIntro paragraph.\n"
         );
     }
 
@@ -11118,7 +11199,7 @@ mod tests {
         assert!(result.changed);
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -  Fixed sync.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -  Fixed sync.\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
         let report = check(&repo, CheckOptions::default()).expect("check");
         assert!(report.is_clean(), "{report:?}");
@@ -11299,7 +11380,7 @@ mod tests {
         assert_eq!(result.sync, Some(SyncResult { changed: true }));
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+            "Changelog\n=========\n\nUnreleased\n----------\n\nTo be released.\n\n -\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
         let report = check(&repo, CheckOptions::default()).expect("check");
         assert!(report.is_clean(), "{report:?}");
@@ -11686,6 +11767,128 @@ mod tests {
     }
 
     #[test]
+    fn next_preserves_marker_changelog_markdown_normal_form() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            region-detection = "marker"
+            "#,
+        );
+        let changelog = "Project changes\n===============\n\n<!-- sacho:unreleased:begin -->\n\n\nUnreleased\n----------\n\nTo be released.\n\n<!-- sacho:unreleased:end -->\n";
+        assert_eq!(
+            format_markdown(changelog).expect("format changelog"),
+            changelog
+        );
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn next_preserves_changelog_section_spacing_with_released_history() {
+        let (temp, repo) = repo_with_config("");
+        let changelog = "Project changes\n===============\n\nUnreleased\n----------\n\nTo be released.\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n";
+        assert_eq!(
+            format_markdown(changelog).expect("format changelog"),
+            changelog
+        );
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn next_preserves_atx_history_markdown_normal_form() {
+        let (temp, repo) = repo_with_config("");
+        let changelog = "Project changes\n===============\n\nUnreleased\n----------\n\nTo be released.\n\n### Version 1.1.0\n\nReleased on July 1, 2026.\n";
+        assert_eq!(
+            format_markdown(changelog).expect("format changelog"),
+            changelog
+        );
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn next_preserves_html_comment_suffix_markdown_normal_form() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let changelog = "Project changes\n===============\n\n<!--\n---\n-->\n";
+        assert_eq!(
+            format_markdown(changelog).expect("format changelog"),
+            changelog
+        );
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        set_next_version(
+            &repo,
+            NextOptions {
+                version: String::from("1.2.0"),
+            },
+        )
+        .expect("next");
+
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert_eq!(
+            format_markdown(&changelog).expect("format changelog"),
+            changelog
+        );
+        assert!(changelog.contains("To be released.\n\n<!--\n---\n-->"));
+    }
+
+    #[test]
     fn next_starts_materialized_region_after_closed_release() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
@@ -11706,7 +11909,7 @@ mod tests {
         assert_eq!(result.sync, Some(SyncResult { changed: true }));
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
-            "Changelog\n=========\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
+            "Changelog\n=========\n\nVersion 1.3.0\n-------------\n\nTo be released.\n\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n"
         );
         let report = check(&repo, CheckOptions::default()).expect("check");
         assert!(report.is_clean(), "{report:?}");
