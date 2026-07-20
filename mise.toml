@@ -47,6 +47,9 @@ if test "$1" = prepared; then
     cargo run hook-reference-transaction "$1"
   fi
 fi' | save --force .git/hooks/reference-transaction
+if $nu.os-info.name != 'windows' {
+  chmod +x .git/hooks/commit-msg .git/hooks/reference-transaction
+}
 """
 
 [tasks.check]
