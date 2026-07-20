@@ -165,6 +165,10 @@ enum Command {
         /// Next unreleased version to write after release.
         #[arg(long, help = "Next unreleased version to write after release")]
         next: Option<String>,
+
+        /// Allow a release without substantive changelog items.
+        #[arg(long, help = "Allow a release without changelog items")]
+        allow_empty: bool,
     },
 
     /// Carry entries from a released section back into fragments.
@@ -324,6 +328,7 @@ impl Cli {
                 version,
                 date,
                 next,
+                allow_empty,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let date = resolve_release_date(date)?;
@@ -333,6 +338,7 @@ impl Cli {
                         version,
                         date,
                         next,
+                        allow_empty,
                     },
                 )?;
                 apply_release(&repo, plan)?;

@@ -54,11 +54,16 @@ accepted commit-message markers.
 `no changelog entries to release`
 ---------------------------------
 
-`sacho release` requires at least one substantive changelog item. An empty
-fragment directory, empty list items, whitespace, and complete HTML comments
-do not satisfy that requirement. Add or finish a fragment, then inspect it with
-`sacho preview` before releasing. Sacho has no option to create an empty
-release.
+After the first release, `sacho release` requires at least one substantive
+changelog item by default. Empty list items, whitespace, and complete HTML
+comments do not satisfy that requirement. Add or finish a fragment, then
+inspect it with `sacho preview` before releasing. If the empty release is
+intentional, pass `--allow-empty` explicitly.
+
+When the changelog has no released version sections, Sacho allows the first
+release without fragments. Scaffold-only fragments are still rejected so they
+are not consumed accidentally; finish or remove them before releasing, or use
+`--allow-empty` if consuming them is intentional.
 
 
 The unreleased region cannot be found

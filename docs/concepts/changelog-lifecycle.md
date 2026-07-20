@@ -83,6 +83,8 @@ sacho release --next 1.3.0
 The command above releases the version in *changes.d/next* with the current
 local date, then writes `1.3.0` as the next version. Pass a version when no next
 version has been set, or use `--date YYYY-MM-DD` when the date must be explicit.
+The first release may start the history without fragments; after a released
+section exists, an empty release requires `--allow-empty`.
 
 The release mutation is transactional. Sacho checks that its inputs have not
 changed between planning and writing, and rolls back already-applied changes if

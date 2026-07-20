@@ -20,9 +20,20 @@ Read the preview as a user upgrading from the previous release. Combine entries
 that describe the same change, remove development history, and check that each
 entry names the public behavior rather than its implementation.
 
-Sacho refuses to release when the compiled fragments contain no substantive
-items. Empty list items and complete HTML comments are scaffolding, not release
-notes. There is no option to create an empty release.
+Sacho normally refuses to release when the compiled fragments contain no
+substantive items. Empty list items and complete HTML comments are scaffolding,
+not release notes.
+
+The first release is different: when the changelog has no released version
+sections and the fragment directory is empty, Sacho records the initial version
+without requiring a fragment. If scaffold-only fragments exist, finish or
+remove them first so that the release does not consume unfinished notes.
+
+For an intentional empty release after the first one, opt in explicitly:
+
+~~~~ sh
+sacho release 1.2.1 --allow-empty
+~~~~
 
 
 Compile the release

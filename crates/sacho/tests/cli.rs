@@ -2823,6 +2823,48 @@ materialize = false
 }
 
 #[test]
+fn release_command_allows_an_intentional_empty_release() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Changelog\n=========\n\nVersion 0.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["release", "0.2.0", "--date", "2026-07-08", "--allow-empty"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        "Changelog\n=========\n\nVersion 0.2.0\n-------------\n\nReleased on July 8, 2026.\n\nVersion 0.1.0\n-------------\n\nReleased on July 1, 2026.\n"
+    );
+}
+
+#[test]
+fn release_help_describes_allow_empty() {
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .args(["release", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--allow-empty"))
+        .stdout(predicate::str::contains(
+            "Allow a release without changelog items",
+        ));
+}
+
+#[test]
 fn release_command_does_not_fall_back_to_utc_when_local_timezone_is_invalid() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(

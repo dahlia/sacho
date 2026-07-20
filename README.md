@@ -181,7 +181,9 @@ sacho release --next 1.3.0
 
 If no next version has been set, pass the release version explicitly, for
 example `sacho release 1.2.0`. Use `--date YYYY-MM-DD` when the release date
-must be supplied rather than taken from the local clock.
+must be supplied rather than taken from the local clock. A repository with no
+released changelog sections can cut its first release without fragments. Later
+empty releases require an explicit `--allow-empty`.
 
 After committing a release, print its frozen Markdown section with `show`:
 

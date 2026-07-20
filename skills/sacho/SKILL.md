@@ -208,10 +208,13 @@ sacho release 1.2.0 --date 2026-07-19 --next 1.3.0   # when the date must be fix
 ~~~~
 
 `release` stamps the dated section, deletes the consumed fragments, and sets the
-next version. It refuses to release when the fragments compile to nothing;
-empty list items and HTML comments are scaffolding, not release notes. There is
-no empty-release option. Commit the changed `CHANGES.md`, the removed fragments,
-and the updated `changes.d/next` together.
+next version. The first release may proceed without fragments when the changelog
+has no released version sections. Later releases refuse to proceed when the
+fragments compile to nothing unless `--allow-empty` is passed. Empty list items
+and HTML comments are scaffolding, not release notes, and scaffold-only
+fragments require the explicit option even on the first release. Commit the
+changed `CHANGES.md`, the removed fragments, and the updated `changes.d/next`
+together.
 
 
 Publishing release notes

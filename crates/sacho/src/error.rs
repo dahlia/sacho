@@ -208,7 +208,9 @@ pub enum Error {
     MissingReleaseVersion,
 
     /// No compiled changelog entries are available to release.
-    #[snafu(display("no changelog entries to release; add a fragment before releasing"))]
+    #[snafu(display(
+        "no changelog entries to release; add a fragment or pass --allow-empty if this is intentional"
+    ))]
     EmptyRelease,
 
     /// A release date was not a valid `YYYY-MM-DD` calendar date.

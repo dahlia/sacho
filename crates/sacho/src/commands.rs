@@ -25,7 +25,9 @@ use crate::fragment::{
 };
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
-use crate::released::{carry_release, render_released_section};
+use crate::released::{
+    carry_release, has_released_sections, insertion_title_span, render_released_section,
+};
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
 use crate::repo::{
@@ -287,6 +289,8 @@ pub struct ReleaseOptions {
     pub date: ReleaseDate,
     /// Next unreleased version to write after releasing.
     pub next: Option<String>,
+    /// Allow a release whose compiled changelog has no substantive items.
+    pub allow_empty: bool,
 }
 
 /// Planned release operation.
@@ -1353,16 +1357,34 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
         &changelog_before,
         &compiled.markdown,
     )?;
-    if compiled.substantive_item_count == 0 {
-        return Err(Error::EmptyRelease);
-    }
-    let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
-    let next = options.next.map(|next| next.trim().to_owned());
     let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
         .map_or_else(
             || initial_changelog(&repo.config().changelog.title),
             ToOwned::to_owned,
         );
+    let unreleased_region = if repo.config().changelog.materialize {
+        Some(
+            find_unreleased_region(
+                &old_changelog,
+                repo.config().changelog.region_detection,
+                &repo.config().changelog.unreleased_heading,
+            )
+            .map_err(|source| changelog_error(changelog_path.clone(), source))?,
+        )
+    } else {
+        None
+    };
+    let is_initial_release = consumed_fragments.is_empty()
+        && !has_released_sections(
+            &old_changelog,
+            unreleased_region,
+            &repo.config().changelog.title,
+        );
+    if compiled.substantive_item_count == 0 && !options.allow_empty && !is_initial_release {
+        return Err(Error::EmptyRelease);
+    }
+    let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
+    let next = options.next.map(|next| next.trim().to_owned());
     let new_changelog = if repo.config().changelog.materialize {
         let empty_unreleased = empty_unreleased_markdown(repo, next.as_deref());
         replace_region_for_release(
@@ -1371,10 +1393,15 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
             &released_markdown,
             repo.config().changelog.region_detection,
             &repo.config().changelog.unreleased_heading,
+            &repo.config().changelog.title,
         )
         .map_err(|source| changelog_error(changelog_path.clone(), source))?
     } else {
-        insert_released_section(&old_changelog, &released_markdown)
+        insert_released_section(
+            &old_changelog,
+            &released_markdown,
+            &repo.config().changelog.title,
+        )
     };
     let next_after = next
         .as_deref()
@@ -4273,6 +4300,7 @@ fn replace_region_for_release(
     released: &str,
     detection: RegionDetection,
     unreleased_heading: &str,
+    document_title: &str,
 ) -> std::result::Result<String, ChangelogError> {
     match detection {
         RegionDetection::Heading => {
@@ -4286,16 +4314,21 @@ fn replace_region_for_release(
             Ok(insert_released_after_marker_region(
                 &replacement.new_contents,
                 released,
+                document_title,
             ))
         }
     }
 }
 
-fn insert_released_after_marker_region(source: &str, released: &str) -> String {
+fn insert_released_after_marker_region(
+    source: &str,
+    released: &str,
+    document_title: &str,
+) -> String {
     const END_MARKER: &str = "<!-- sacho:unreleased:end -->";
 
     let Some(marker_index) = source.find(END_MARKER) else {
-        return insert_released_section(source, released);
+        return insert_released_section(source, released, document_title);
     };
     let after_marker = marker_index + END_MARKER.len();
     let insertion = source[after_marker..]
@@ -4318,8 +4351,8 @@ fn insert_released_after_marker_region(source: &str, released: &str) -> String {
     output
 }
 
-fn insert_released_section(source: &str, released: &str) -> String {
-    let insertion = insertion_index_after_title(source);
+fn insert_released_section(source: &str, released: &str, document_title: &str) -> String {
+    let insertion = insertion_index_after_title(source, document_title);
     let mut output = String::with_capacity(source.len() + released.len() + 2);
     output.push_str(&source[..insertion]);
     if !output.ends_with("\n\n") {
@@ -4334,18 +4367,16 @@ fn insert_released_section(source: &str, released: &str) -> String {
     output
 }
 
-fn insertion_index_after_title(source: &str) -> usize {
+fn insertion_index_after_title(source: &str, document_title: &str) -> usize {
     let lines = source_lines_with_offsets(source);
-    if lines.len() >= 2 && is_setext_title_underline(lines[1].text) {
-        return skip_blank_lines(&lines, 2).map_or(source.len(), |index| lines[index].start);
-    }
-    if lines
-        .first()
-        .is_some_and(|line| line.text.trim_start().starts_with("# "))
-    {
-        return skip_blank_lines(&lines, 1).map_or(source.len(), |index| lines[index].start);
-    }
-    0
+    let Some(title) = insertion_title_span(source, document_title) else {
+        return 0;
+    };
+    let after_title = lines
+        .iter()
+        .position(|line| line.start >= title.end)
+        .unwrap_or(lines.len());
+    skip_blank_lines(&lines, after_title).map_or(source.len(), |index| lines[index].start)
 }
 
 fn initial_changelog(title: &str) -> String {
@@ -4381,11 +4412,6 @@ fn skip_blank_lines(lines: &[SourceLine<'_>], start: usize) -> Option<usize> {
         .enumerate()
         .skip(start)
         .find_map(|(index, line)| (!line.text.trim().is_empty()).then_some(index))
-}
-
-fn is_setext_title_underline(text: &str) -> bool {
-    let text = text.trim();
-    text.starts_with('=') && text.trim_matches('=').is_empty()
 }
 
 fn month_name(month: u8) -> &'static str {
@@ -7717,6 +7743,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -7757,6 +7784,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -7796,6 +7824,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("retained hand edit");
@@ -7810,13 +7839,18 @@ mod tests {
     }
 
     #[test]
-    fn release_rejects_empty_materialized_repository_without_changes() {
+    fn release_rejects_empty_non_initial_release_without_override() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
         fs::write(temp.path().join("changes.d/next"), "1.2.0\n").expect("next");
-        let changelog =
-            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n";
-        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nTo be released.\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+        let sync = plan_sync(&repo, SyncOptions { force: true }).expect("sync plan");
+        apply_sync(&repo, sync).expect("sync");
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
 
         let error = plan_release(
             &repo,
@@ -7824,13 +7858,14 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect_err("empty release");
 
         assert_eq!(
             error.to_string(),
-            "no changelog entries to release; add a fragment before releasing"
+            "no changelog entries to release; add a fragment or pass --allow-empty if this is intentional"
         );
         assert_eq!(
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
@@ -7840,6 +7875,130 @@ mod tests {
             fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
             "1.2.0\n"
         );
+    }
+
+    #[test]
+    fn release_accepts_initial_release_without_fragments() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "1.0.0\n").expect("next");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.0.0\n-------------\n\nTo be released.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: release_date(),
+                next: Some(String::from("1.1.0")),
+                allow_empty: false,
+            },
+        )
+        .expect("initial release");
+        apply_release(&repo, plan).expect("apply initial release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nTo be released.\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "1.1.0\n"
+        );
+    }
+
+    #[test]
+    fn release_accepts_initial_release_without_fragments_or_changelog() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.0.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect("initial release");
+        apply_release(&repo, plan).expect("apply initial release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Changelog\n=========\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+        );
+    }
+
+    #[test]
+    fn release_ignores_version_prefixed_atx_document_title() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            title = "Version history"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "<!-- Project release history. -->\n\n# Version history\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.0.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect("initial release");
+        apply_release(&repo, plan).expect("apply initial release");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "<!-- Project release history. -->\n\n# Version history\n\nVersion 1.0.0\n-------------\n\nReleased on July 8, 2026.\n\n"
+        );
+    }
+
+    #[test]
+    fn release_rejects_empty_release_after_first_line_h1_version_section() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "# Version 1.0.0\n\nReleased on July 20, 2026.\n",
+        )
+        .expect("changelog");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.1.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect_err("empty non-initial release");
+
+        assert!(matches!(error, Error::EmptyRelease));
     }
 
     #[test]
@@ -7859,18 +8018,54 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("empty release");
 
         assert_eq!(
             error.to_string(),
-            "no changelog entries to release; add a fragment before releasing"
+            "no changelog entries to release; add a fragment or pass --allow-empty if this is intentional"
         );
         assert!(!temp.path().join("CHANGES.md").exists());
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/scaffold.md")).expect("fragment"),
             " -  \n"
+        );
+    }
+
+    #[test]
+    fn release_allow_empty_consumes_scaffold_fragments() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/scaffold.md"), " -  \n").expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Project changes\n===============\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("1.2.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: true,
+            },
+        )
+        .expect("intentional empty release");
+        apply_release(&repo, plan).expect("apply empty release");
+
+        assert!(!temp.path().join("changes.d/scaffold.md").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
     }
 
@@ -7892,13 +8087,14 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("comment-only release");
 
         assert_eq!(
             error.to_string(),
-            "no changelog entries to release; add a fragment before releasing"
+            "no changelog entries to release; add a fragment or pass --allow-empty if this is intentional"
         );
         assert!(!temp.path().join("CHANGES.md").exists());
         assert_eq!(
@@ -7933,6 +8129,7 @@ mod tests {
                     version: Some(String::from("1.2.0")),
                     date: release_date(),
                     next: None,
+                    allow_empty: false,
                 },
             )
             .expect("substantive content release");
@@ -7969,13 +8166,14 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("empty release");
 
         assert_eq!(
             error.to_string(),
-            "no changelog entries to release; add a fragment before releasing"
+            "no changelog entries to release; add a fragment or pass --allow-empty if this is intentional"
         );
         assert!(!temp.path().join("CHANGES.md").exists());
         assert!(temp.path().join("changes.d/core/scaffold.md").exists());
@@ -8004,6 +8202,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("  ")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8043,6 +8242,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8073,6 +8273,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8113,6 +8314,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8153,6 +8355,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8195,6 +8398,7 @@ mod tests {
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
+                    allow_empty: false,
                 },
             )
             .expect("plan");
@@ -8233,6 +8437,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8278,6 +8483,7 @@ mod tests {
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
+                    allow_empty: false,
                 },
             )
             .expect("plan");
@@ -8314,6 +8520,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8360,6 +8567,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8415,6 +8623,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8470,6 +8679,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8523,6 +8733,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8575,6 +8786,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8619,6 +8831,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8657,6 +8870,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8703,6 +8917,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8749,6 +8964,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8792,6 +9008,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8837,6 +9054,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8879,6 +9097,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8925,6 +9144,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -8974,6 +9194,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9020,6 +9241,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9065,6 +9287,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9117,6 +9340,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9159,6 +9383,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9210,6 +9435,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9259,6 +9485,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9294,6 +9521,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9334,6 +9562,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9386,6 +9615,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9456,6 +9686,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9494,6 +9725,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9537,6 +9769,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9574,6 +9807,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9611,6 +9845,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -9675,6 +9910,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         ));
         assert_mutation_locked(carry(
@@ -10028,6 +10264,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -10153,6 +10390,7 @@ mod tests {
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
+                    allow_empty: false,
                 },
             )
             .expect("plan");
@@ -10187,6 +10425,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -10224,6 +10463,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("symlink conflict");
@@ -10256,6 +10496,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -10285,6 +10526,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -10325,6 +10567,7 @@ mod tests {
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect("plan");
@@ -10352,6 +10595,7 @@ mod tests {
                 version: Some(String::from("1.2.1")),
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("mismatch");
@@ -10377,6 +10621,7 @@ mod tests {
                 version: None,
                 date: release_date(),
                 next: None,
+                allow_empty: false,
             },
         )
         .expect_err("missing version");
@@ -10460,6 +10705,7 @@ mod tests {
                     version: Some(String::from("1.2.0")),
                     date,
                     next: None,
+                    allow_empty: false,
                 },
             )
             .expect_err("invalid date");
@@ -10498,13 +10744,14 @@ mod tests {
     #[test]
     fn release_insertion_helpers_handle_boundary_spacing() {
         assert_eq!(
-            insert_released_section("# Changelog", "Version 1.2.0\n-------------\n"),
+            insert_released_section("# Changelog", "Version 1.2.0\n-------------\n", "Changelog",),
             "# Changelog\n\nVersion 1.2.0\n-------------\n\n"
         );
         assert_eq!(
             insert_released_section(
                 "Changelog\n=========\n\nVersion 1.1.0\n-------------\n",
                 "Version 1.2.0\n-------------\n",
+                "Changelog",
             ),
             "Changelog\n=========\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n-------------\n"
         );
@@ -10512,6 +10759,7 @@ mod tests {
             insert_released_after_marker_region(
                 "Header\n<!-- sacho:unreleased:end --> trailer\nVersion 1.1.0\n",
                 "Version 1.2.0\n-------------\n",
+                "Changelog",
             ),
             "Header\n<!-- sacho:unreleased:end --> trailer\n\nVersion 1.2.0\n-------------\n\nVersion 1.1.0\n"
         );
@@ -10522,9 +10770,10 @@ mod tests {
         let lines = source_lines_with_offsets("Title\n=====\n\nBody\n");
 
         assert_eq!(skip_blank_lines(&lines, 2), Some(3));
-        assert!(is_setext_title_underline("====="));
-        assert!(!is_setext_title_underline("=====x"));
-        assert_eq!(insertion_index_after_title("Plain one-line file"), 0);
+        assert_eq!(
+            insertion_index_after_title("Plain one-line file", "Changelog"),
+            0
+        );
     }
 
     #[test]

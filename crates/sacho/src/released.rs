@@ -1,6 +1,7 @@
 //! Released changelog section parsing for carry and merge workflows.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
 use std::path::PathBuf;
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
@@ -115,6 +116,37 @@ pub fn find_released_section(
         version: version.to_owned(),
         markdown: source[target.start..target.end].to_owned(),
     })
+}
+
+/// Reports whether the changelog contains any released version section.
+///
+/// A version heading inside `unreleased_region` is ignored when that span is
+/// supplied. The first Markdown heading is also ignored when its text exactly
+/// matches `document_title` and it is either a level-one ATX or Setext heading.
+pub fn has_released_sections(
+    source: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+    document_title: &str,
+) -> bool {
+    let lines = source_lines(source);
+    let document_title_start =
+        matching_document_title(&lines, document_title).map(|heading| heading.start);
+    version_heading_candidates(&lines)
+        .into_iter()
+        .any(|candidate| {
+            document_title_start != Some(candidate.start)
+                && !unreleased_region
+                    .is_some_and(|region| (region.start..region.end).contains(&candidate.start))
+        })
+}
+
+pub(crate) fn insertion_title_span(source: &str, document_title: &str) -> Option<Range<usize>> {
+    let lines = source_lines(source);
+    let heading = first_markdown_heading(&lines)?;
+    let matches_configured_title = heading.text == document_title
+        && (heading.level == 1 || heading.style == HeadingStyle::Setext);
+    let is_conventional_title = heading.level == 1 && !is_version_heading_text(heading.text);
+    (matches_configured_title || is_conventional_title).then_some(heading.start..heading.body_start)
 }
 
 pub(crate) fn render_released_section(
@@ -513,6 +545,78 @@ fn version_heading_candidates<'a>(lines: &'a [SourceLine<'a>]) -> Vec<VersionHea
     headings
 }
 
+fn matching_document_title<'a>(
+    lines: &'a [SourceLine<'a>],
+    document_title: &str,
+) -> Option<VersionHeading<'a>> {
+    let heading = first_markdown_heading(lines)?;
+    (heading.text == document_title
+        && (heading.level == 1 || heading.style == HeadingStyle::Setext))
+        .then_some(VersionHeading {
+            start: heading.start,
+            body_start: heading.body_start,
+            text: heading.text,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadingStyle {
+    Atx,
+    Setext,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownHeading<'a> {
+    start: usize,
+    body_start: usize,
+    text: &'a str,
+    level: usize,
+    style: HeadingStyle,
+}
+
+fn first_markdown_heading<'a>(lines: &'a [SourceLine<'a>]) -> Option<MarkdownHeading<'a>> {
+    let mut code_fence = None;
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(fence) = code_fence {
+            if is_closing_code_fence(line.text, fence) {
+                code_fence = None;
+            }
+            continue;
+        }
+        if let Some(fence) = opening_code_fence(line.text) {
+            code_fence = Some(fence);
+            continue;
+        }
+        if is_indented_code_line(line.text) {
+            continue;
+        }
+        if let Some((level, text)) = atx_heading(line.text) {
+            return Some(MarkdownHeading {
+                start: line.start,
+                body_start: line.end,
+                text,
+                level,
+                style: HeadingStyle::Atx,
+            });
+        }
+        if !line.text.trim().is_empty()
+            && let Some(next) = lines.get(index + 1)
+            && !is_indented_code_line(next.text)
+            && let Some(level) = setext_heading_level(next.text)
+        {
+            let text = line.text.trim();
+            return Some(MarkdownHeading {
+                start: line.start,
+                body_start: next.end,
+                text,
+                level,
+                style: HeadingStyle::Setext,
+            });
+        }
+    }
+    None
+}
+
 fn is_version_heading_text(text: &str) -> bool {
     text.starts_with("Version ")
 }
@@ -547,6 +651,17 @@ fn is_setext_underline(text: &str) -> bool {
     text.starts_with('-') && text.trim_matches('-').is_empty()
 }
 
+fn setext_heading_level(text: &str) -> Option<usize> {
+    let text = text.trim();
+    if text.starts_with('=') && text.trim_matches('=').is_empty() {
+        Some(1)
+    } else if text.starts_with('-') && text.trim_matches('-').is_empty() {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 fn opening_code_fence(text: &str) -> Option<CodeFence> {
     if is_indented_code_line(text) {
         return None;
@@ -577,6 +692,10 @@ fn is_closing_code_fence(text: &str, fence: CodeFence) -> bool {
 }
 
 fn atx_heading_text(line: &str) -> Option<&str> {
+    atx_heading(line).map(|(_, text)| text)
+}
+
+fn atx_heading(line: &str) -> Option<(usize, &str)> {
     let line = line.trim_start();
     let marker_count = line.bytes().take_while(|byte| *byte == b'#').count();
     if marker_count == 0 || marker_count > 6 {
@@ -591,7 +710,10 @@ fn atx_heading_text(line: &str) -> Option<&str> {
     {
         return None;
     }
-    Some(strip_atx_closing_sequence(after_markers.trim()))
+    Some((
+        marker_count,
+        strip_atx_closing_sequence(after_markers.trim()),
+    ))
 }
 
 fn strip_atx_closing_sequence(text: &str) -> &str {
@@ -761,6 +883,36 @@ Older release.
             released.markdown,
             "## Version 1.2.0\n\nReleased on July 19, 2026.\n\n -  Added show.\n\n"
         );
+    }
+
+    #[test]
+    fn reports_released_sections_outside_the_unreleased_region() {
+        let source = "\
+Version 1.2.0
+-------------
+
+To be released.
+
+Version 1.1.0
+-------------
+
+Released on July 1, 2026.
+";
+        let unreleased = UnreleasedRegionSpan {
+            start: 0,
+            end: source.find("Version 1.1.0").expect("released heading"),
+        };
+
+        assert!(has_released_sections(
+            source,
+            Some(unreleased),
+            "Project changes"
+        ));
+        assert!(!has_released_sections(
+            &source[..unreleased.end],
+            Some(unreleased),
+            "Project changes"
+        ));
     }
 
     #[test]
@@ -1002,6 +1154,56 @@ six hashes
         );
         assert_eq!(&source[headings[0].body_start..][..6], "\nbody\n");
         assert_eq!(&source[headings[1].body_start..][..10], "\nold body\n");
+    }
+
+    #[test]
+    fn released_sections_ignore_a_matching_atx_document_title() {
+        let source = "\
+# Version history
+
+## Version 1.0.0
+
+Released on July 20, 2026.
+";
+
+        assert!(has_released_sections(source, None, "Version history"));
+        assert!(has_released_sections(source, None, "Changelog"));
+        assert!(!has_released_sections(
+            "# Version history\n",
+            None,
+            "Version history"
+        ));
+        assert!(!has_released_sections(
+            "\n<!-- Project release history. -->\n\n# Version history\n",
+            None,
+            "Version history"
+        ));
+        assert!(!has_released_sections(
+            "Version history\n---------------\n",
+            None,
+            "Version history"
+        ));
+    }
+
+    #[test]
+    fn insertion_title_rejects_an_atx_h2_even_when_its_text_matches() {
+        assert_eq!(
+            insertion_title_span("## Project changes\n", "Project changes"),
+            None
+        );
+    }
+
+    #[test]
+    fn finds_first_line_h1_version_section() {
+        let source = "\
+# Version 1.0.0
+
+Released on July 20, 2026.
+";
+
+        let released = find_released_section(source, "1.0.0", None).expect("released section");
+
+        assert_eq!(released.markdown, source);
     }
 
     proptest! {
