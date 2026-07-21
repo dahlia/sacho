@@ -201,7 +201,7 @@ enum Command {
     },
 
     /// Print copyright and license information.
-    #[command(hide = true, long_flag = "license")]
+    #[command(long_flag = "license")]
     License,
 
     /// Run filesystem checks from Git's pre-commit hook.

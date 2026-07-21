@@ -82,6 +82,9 @@ fn help_lists_commands() {
         .stdout(predicate::str::contains("Copyright (C) 2026 Hong Minhee"))
         .stdout(predicate::str::contains("GNU GPLv3 only"))
         .stdout(predicate::str::contains("ABSOLUTELY NO WARRANTY"))
+        .stdout(predicate::str::contains(
+            "Print copyright and license information",
+        ))
         .stdout(predicate::str::contains("sacho --license"));
 }
 
