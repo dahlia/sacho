@@ -96,19 +96,35 @@ inference:
 mise run test:vcs
 ~~~~
 
-Run mutation tests after changing Rust behavior or Rust tests:
+Use mutation testing for changes to core Rust logic and the tests that protect
+it.  This includes parsing, ordering, normalization, reference resolution,
+repository discovery, changelog compilation, VCS checks, and repository
+mutations:
 
 ~~~~ sh
 mise run mutants
 ~~~~
 
 This runs cargo-mutants, which checks whether the test suite catches small
-changes injected into the Rust code.  Mutation testing is useful for finding
-weak assertions and untested behavior, but it is much slower than the normal
-checks, so it is available as a separate task rather than part of
-`mise run check`.  A successful mutation-testing run must report zero missed
-mutants and zero timed-out mutants.  Unviable mutants are acceptable; missed or
-timed-out mutants mean the test suite or implementation needs more work.
+changes injected into the Rust code.  A full workspace run can take tens of
+minutes or longer, depending on the machine and the number of mutants.  Treat
+it as a finishing-stage check after the implementation and normal tests are
+stable, not as part of the edit-compile-test loop.
+
+During active development, skip mutation testing or limit it to the code being
+worked on.  Pass cargo-mutants filters through the mise task, for example:
+
+~~~~ sh
+mise run mutants -- --file 'crates/sacho/src/fragment.rs'
+mise run mutants -- --in-diff HEAD~1
+mise run mutants -- --re 'fragment'
+~~~~
+
+The `--iterate` option skips mutants caught by previous runs.  Once the change
+is ready for final review, run the full workspace mutation suite without
+development-only filters.  A successful run must report zero missed mutants and
+zero timed-out mutants.  Unviable mutants are acceptable; missed or timed-out
+mutants mean the test suite or implementation needs more work.
 
 On a machine with spare CPU and memory, pass `-j` through the mise task to test
 several mutants in parallel:
@@ -201,7 +217,8 @@ If your change affects runtime behavior, also run:
 mise run test
 ~~~~
 
-If your change affects Rust behavior or Rust tests, run:
+If your change affects core Rust logic or the tests that protect it, run the
+mutation suite after the implementation is stable:
 
 ~~~~ sh
 mise run mutants
@@ -210,7 +227,8 @@ mise run mutants
 The mutation-testing result must have zero missed mutants and zero timed-out
 mutants before opening a pull request.
 
-Changes limited to documentation, packaging, CI configuration, or non-Rust
-tooling do not require mutation testing.
+Changes limited to documentation, packaging, CI configuration, non-Rust
+tooling, CLI help text, or other presentational metadata do not require
+mutation testing.
 
 Make sure generated formatting changes are included in your commit.
