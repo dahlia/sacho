@@ -4,8 +4,4 @@ Sacho changelog
 Version 0.1.0
 -------------
 
-To be released.
-
- -  Kept generated changelog output compatible with Hongdown when commands or
-    merge drivers open, update, release, or reconstruct changelog sections,
-    including marker-based regions.
+Initial release.  Released on July 21, 2026.
