@@ -80,13 +80,38 @@ sacho init
 Sacho creates *sacho.toml*, *changes.d/*, and *CHANGES.md*. In a Git repository
 it also registers merge drivers in *.gitattributes* and the local Git config.
 Interactive setup can infer issue links from the repository remote and offer to
-install commit hooks.
+install commit hooks. When *CHANGES.md* already exists, it can also offer
+level-three headings found across the changelog as section ids, then suggest
+fragment directories and source path globs for the selected sections.
 
 Use `sacho init --interactive` to ask the setup questions even when automatic
 detection would otherwise be enough. For scripts, `--no-interactive` prevents
 prompts.
 
-Set the version you are preparing:
+
+Import existing unreleased entries
+----------------------------------
+
+Skip this step when the changelog has no current unreleased entries. Otherwise,
+run the import before creating any fragments:
+
+~~~~ sh
+sacho import-unreleased
+~~~~
+
+The command reads the current `Unreleased` or `Version X` region, creates
+*changes.d/imported-unreleased.md*, and leaves released history unchanged.
+Repositories configured with sections receive one file in each populated
+section directory. A `Version X` heading also becomes the next-version value,
+so do not run `sacho next` separately unless the heading is `Unreleased`.
+
+Sacho shows a diff when compiling the imported fragments would normalize the
+region. Confirm it in a terminal, or use `--force` after reviewing the same
+change in a noninteractive workflow. `--force` does not permit existing
+Markdown fragments or top-level prose, headings, and lists that fragments
+cannot represent.
+
+If the import did not infer a version, set the version you are preparing:
 
 ~~~~ sh
 sacho next 1.2.0

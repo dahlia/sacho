@@ -89,13 +89,18 @@ Adopting Sacho in a project
 Run `sacho init` from the repository root. It creates `sacho.toml`,
 `changes.d/`, and `CHANGES.md`, and in a Git repository registers the merge
 drivers. Interactive setup infers issue-link templates from the remote and can
-install commit hooks; `sacho init --interactive` forces the questions and
-`--no-interactive` suppresses them.
+install commit hooks. When an existing changelog is present, it also offers
+level-three headings found across the changelog as section candidates and
+suggests directories and source path globs. `sacho init --interactive` forces
+the questions and `--no-interactive` suppresses them.
 
-Adoption needs no migration. Sacho never rewrites existing released sections, so
-leave the old `CHANGES.md` history exactly as it is and start using fragments
-for the next version. Set that version with `sacho next 1.2.0` so the unreleased
-heading and `release` know what is being prepared.
+Leave old released sections exactly as they are. If the current `Unreleased` or
+`Version X` region contains entries, run `sacho import-unreleased` before
+creating fragments. Inspect and confirm its normalization diff; in a
+noninteractive workflow, review the diff from the refused run before using
+`--force`. The command creates deterministic *imported-unreleased.md* fragments
+and infers the next version from `Version X`. If there are no current entries,
+skip the import and set the version with `sacho next 1.2.0`.
 
 Two configuration decisions matter early, both covered in
 `reference/configuration.md`: whether to enforce fragment coverage
