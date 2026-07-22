@@ -15,6 +15,12 @@ sacho init [OPTIONS]
 Creates the configuration, fragment directory, initial changelog, and
 version-control integration that do not already exist.
 
+During first-time interactive setup with an existing changelog, Sacho offers
+level-three headings found across the changelog as section candidates. For each
+selected candidate, it suggests a fragment directory and source path globs. The
+prompts remain editable, and selecting no candidates leaves `[[sections]]`
+absent.
+
 | Option                            | Meaning                                                          |
 | --------------------------------- | ---------------------------------------------------------------- |
 | `--interactive`                   | Ask setup questions even when automatic detection is sufficient. |
@@ -176,6 +182,27 @@ sacho carry <VERSION>
 Turns the entries from one released section back into editable fragments named
 *carried-from-VERSION.md*. Sectioned releases produce one fragment in each
 populated section. Existing carried fragment destinations are replaced.
+
+
+`sacho import-unreleased`
+-------------------------
+
+~~~~ text
+sacho import-unreleased [--force]
+~~~~
+
+Converts the materialized `Unreleased` or `Version X` region into deterministic
+*imported-unreleased.md* fragments. A sectioned repository receives one file
+per populated configured section. The `X` from a `Version X` heading is also
+written to the next-version file, which must be absent, empty, or already equal
+to `X`.
+
+The repository must use `materialize = true` and contain no Markdown fragments.
+Sacho rejects top-level content that fragments cannot represent and never
+changes released history. If normalized fragment output changes the unreleased
+region, an interactive invocation shows the diff and asks for confirmation. A
+noninteractive invocation exits with status 2; `--force` applies the reviewed
+normalization without a prompt. It does not bypass safety errors.
 
 
 `sacho merge-driver`

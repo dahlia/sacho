@@ -36,6 +36,29 @@ pub struct CarriedFragment {
     pub markdown: String,
 }
 
+/// Fragments decompiled from the current unreleased changelog region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedUnreleased {
+    /// Version inferred from a `Version X` heading, or `None` for `Unreleased`.
+    pub version: Option<String>,
+
+    /// Fragment outputs to write.
+    pub fragments: Vec<CarriedFragment>,
+}
+
+/// A possible Sacho section found in an existing changelog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogSectionCandidate {
+    /// Text of the direct level-three heading.
+    pub id: String,
+
+    /// Number of matching level-three heading occurrences.
+    pub occurrences: usize,
+
+    /// Whether the heading occurs in the current unreleased region.
+    pub appears_in_unreleased: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TargetSection<'a> {
     body: &'a str,
@@ -53,6 +76,96 @@ struct ParsedEntry {
 struct ReferenceDefinition {
     label: String,
     url: String,
+}
+
+#[derive(Debug, Clone)]
+struct SectionCandidateRegion {
+    unreleased: bool,
+    sections: Vec<String>,
+}
+
+/// Finds direct level-three headings inside changelog version regions.
+///
+/// The first level-one or Setext heading is ignored when it matches
+/// `document_title` so a title such as `Version history` does not open a
+/// version region.
+///
+/// Candidates from a region containing `unreleased_heading` are ordered before
+/// candidates found only in released history. Within each group, candidates
+/// retain their first-appearance order. Callers must still ask a person which
+/// headings represent stable repository sections because change categories
+/// such as `Added` have the same Markdown shape.
+pub fn discover_section_candidates(
+    changelog: &str,
+    document_title: &str,
+    unreleased_heading: &str,
+) -> Vec<ChangelogSectionCandidate> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, changelog, &comrak_options());
+    let mut regions = Vec::<SectionCandidateRegion>::new();
+    let mut current = None;
+    let mut first_heading = true;
+
+    for child in root.children() {
+        match &child.data().value {
+            NodeValue::Heading(heading) => {
+                let text = plain_text(child).trim().to_owned();
+                if first_heading && (heading.level == 1 || heading.setext) && text == document_title
+                {
+                    first_heading = false;
+                    continue;
+                }
+                first_heading = false;
+                if heading.level <= 2 && (text == "Unreleased" || is_version_heading_text(&text)) {
+                    regions.push(SectionCandidateRegion {
+                        unreleased: text == "Unreleased",
+                        sections: Vec::new(),
+                    });
+                    current = Some(regions.len() - 1);
+                } else if heading.level == 3
+                    && let Some(index) = current
+                    && !text.is_empty()
+                {
+                    regions[index].sections.push(text);
+                }
+            }
+            NodeValue::Paragraph
+                if current.is_some() && plain_text(child).trim() == unreleased_heading =>
+            {
+                regions[current.expect("checked above")].unreleased = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates = Vec::<ChangelogSectionCandidate>::new();
+    for unreleased in [true, false] {
+        for region in regions
+            .iter()
+            .filter(|region| region.unreleased == unreleased)
+        {
+            for id in &region.sections {
+                if candidates.iter().any(|candidate| candidate.id == *id) {
+                    continue;
+                }
+                let occurrences = regions
+                    .iter()
+                    .flat_map(|region| &region.sections)
+                    .filter(|section| *section == id)
+                    .count();
+                candidates.push(ChangelogSectionCandidate {
+                    id: id.clone(),
+                    occurrences,
+                    appears_in_unreleased: regions
+                        .iter()
+                        .filter(|region| region.unreleased)
+                        .flat_map(|region| &region.sections)
+                        .any(|section| section == id),
+                });
+            }
+        }
+    }
+    candidates
 }
 
 /// Parses a released version section and returns deterministic carry fragments.
@@ -99,6 +212,152 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
         version: version.to_owned(),
         fragments,
     })
+}
+
+/// Parses a materialized unreleased region into deterministic fragments.
+///
+/// Only the version heading, configured unreleased date line, direct
+/// level-three section headings, and top-level unordered lists are accepted.
+/// This conservative shape prevents an import from silently dropping hand
+/// edits that fragments cannot represent.
+pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<ImportedUnreleased> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, region, &comrak_options());
+    let line_starts = line_starts(region);
+    let references = reference_definitions(region);
+    let mut version = None;
+    let mut saw_heading = false;
+    let mut current_section = None;
+    let mut entries = Vec::new();
+
+    for child in root.children() {
+        let value = child.data().value.clone();
+        match value {
+            NodeValue::Heading(heading) if heading.level <= 2 && !saw_heading => {
+                let heading = plain_text(child).trim().to_owned();
+                if heading == "Unreleased" {
+                    version = None;
+                } else if let Some(inferred) = heading.strip_prefix("Version ")
+                    && !inferred.trim().is_empty()
+                {
+                    version = Some(inferred.trim().to_owned());
+                } else {
+                    return Err(import_incompatible(
+                        "expected `Unreleased` or `Version X` heading",
+                    ));
+                }
+                saw_heading = true;
+            }
+            NodeValue::Heading(heading)
+                if heading.level == 3 && !repo.config().sections.is_empty() =>
+            {
+                if !saw_heading {
+                    return Err(import_incompatible(
+                        "section heading appears before version heading",
+                    ));
+                }
+                let section = plain_text(child).trim().to_owned();
+                ensure_known_section(repo, &section)?;
+                current_section = Some(section);
+            }
+            NodeValue::Heading(heading) if heading.level == 3 => {
+                if !saw_heading {
+                    return Err(import_incompatible(
+                        "heading appears before version heading",
+                    ));
+                }
+                return Err(import_incompatible(
+                    "section headings are not supported without configured sections",
+                ));
+            }
+            NodeValue::Paragraph
+                if saw_heading
+                    && plain_text(child).trim() == repo.config().changelog.unreleased_heading => {}
+            NodeValue::List(list) if saw_heading && list.list_type == ListType::Bullet => {
+                if !repo.config().sections.is_empty() && current_section.is_none() {
+                    return Err(Error::ReleasedEntryWithoutSection);
+                }
+                for item in child.children() {
+                    let source = slice_item_sourcepos(region, &line_starts, item.data().sourcepos)
+                        .unwrap_or_default();
+                    entries.push(ParsedEntry {
+                        section: current_section.clone(),
+                        item_markdown: fold_item_references(
+                            source,
+                            item,
+                            &line_starts,
+                            &references,
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(import_incompatible(
+                    "only the version heading, unreleased date line, section headings, and unordered lists are supported",
+                ));
+            }
+        }
+    }
+    if !saw_heading {
+        return Err(import_incompatible("unreleased version heading is missing"));
+    }
+    if entries.is_empty() {
+        return Err(Error::UnreleasedImportEmpty);
+    }
+
+    Ok(ImportedUnreleased {
+        version,
+        fragments: fragments_from_entries(repo, entries, "imported-unreleased.md")?,
+    })
+}
+
+fn import_incompatible(message: &str) -> Error {
+    Error::UnreleasedImportIncompatible {
+        message: message.to_owned(),
+    }
+}
+
+fn fragments_from_entries(
+    repo: &Repository,
+    entries: Vec<ParsedEntry>,
+    filename: &str,
+) -> Result<Vec<CarriedFragment>> {
+    let mut grouped = BTreeMap::<Option<String>, Vec<String>>::new();
+    for entry in entries {
+        grouped
+            .entry(entry.section)
+            .or_default()
+            .push(entry.item_markdown);
+    }
+    let mut fragments = Vec::new();
+    if repo.config().sections.is_empty() {
+        let items = grouped.remove(&None).unwrap_or_default();
+        if !items.is_empty() {
+            fragments.push(CarriedFragment {
+                section: None,
+                path: repo.config().fragments.directory.join(filename),
+                markdown: fragment_markdown(items),
+            });
+        }
+    } else {
+        for section in &repo.config().sections {
+            let section_id = Some(section.id.clone());
+            let Some(items) = grouped.remove(&section_id) else {
+                continue;
+            };
+            fragments.push(CarriedFragment {
+                section: section_id,
+                path: repo
+                    .config()
+                    .fragments
+                    .directory
+                    .join(&section.directory)
+                    .join(filename),
+                markdown: fragment_markdown(items),
+            });
+        }
+    }
+    Ok(fragments)
 }
 
 /// Finds a released version section in changelog Markdown.
@@ -824,6 +1083,165 @@ mod tests {
     }
 
     #[test]
+    fn discovers_section_candidates_with_unreleased_entries_first() {
+        let changelog = "\
+Project changes
+===============
+
+Version 2.0.0
+-------------
+
+To be released.
+
+### core
+
+ -  Added a core feature.
+
+### Added
+
+ -  Added something else.
+
+### Version 9.9.9
+
+ -  This is a section heading, not a version region.
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+### cli
+
+ -  Added a command.
+
+### core
+
+ -  Fixed the core.
+
+ -  A nested heading:
+
+    ### ignored
+
+```markdown
+### also ignored
+```
+";
+
+        let candidates =
+            discover_section_candidates(changelog, "Project changes", "To be released.");
+
+        assert_eq!(
+            candidates,
+            vec![
+                ChangelogSectionCandidate {
+                    id: String::from("core"),
+                    occurrences: 2,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("Added"),
+                    occurrences: 1,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("Version 9.9.9"),
+                    occurrences: 1,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("cli"),
+                    occurrences: 1,
+                    appears_in_unreleased: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_candidates_below_a_literal_unreleased_heading() {
+        let candidates = discover_section_candidates(
+            "## Unreleased\n\n### server\n\n -  Added a server.\n",
+            "Project changes",
+            "To be released.",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![ChangelogSectionCandidate {
+                id: String::from("server"),
+                occurrences: 1,
+                appears_in_unreleased: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_a_version_shaped_document_title_and_its_preamble() {
+        for underline in ["===============", "---------------"] {
+            let changelog = format!(
+                "\
+Version history
+{underline}
+
+### Notation
+
+This heading describes the document.
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+### core
+
+ -  Added core.
+"
+            );
+
+            let candidates =
+                discover_section_candidates(&changelog, "Version history", "To be released.");
+
+            assert_eq!(
+                candidates,
+                vec![ChangelogSectionCandidate {
+                    id: String::from("core"),
+                    occurrences: 1,
+                    appears_in_unreleased: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_an_exact_version_shaped_document_title() {
+        let candidates = discover_section_candidates(
+            "# Version 9.9.9\n\n### Notation\n\nDocument notation.\n",
+            "Version 9.9.9",
+            "To be released.",
+        );
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_version_shaped_h1_that_is_not_the_document_title() {
+        let candidates = discover_section_candidates(
+            "# Version 9.9.9\n\n### core\n\n -  Added core.\n",
+            "Project changes",
+            "To be released.",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![ChangelogSectionCandidate {
+                id: String::from("core"),
+                occurrences: 1,
+                appears_in_unreleased: false,
+            }]
+        );
+    }
+
+    #[test]
     fn finds_setext_version_target() {
         let (_temp, repo) = repo_with_config(
             r##"
@@ -949,6 +1367,117 @@ Released on July 7, 2026.
             carried.fragments[0].markdown,
             " -  Fixed carry.\n -  Added carry.\n"
         );
+    }
+
+    #[test]
+    fn imports_unreleased_entries_into_stable_fragment_names() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        let region = "\
+Version 2.4.0
+-------------
+
+To be released.
+
+### core
+
+ -  Added core support.
+
+### cli
+
+ -  Added a command.
+";
+
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        assert_eq!(imported.version.as_deref(), Some("2.4.0"));
+        assert_eq!(
+            imported
+                .fragments
+                .iter()
+                .map(|fragment| fragment.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("changes.d/core/imported-unreleased.md"),
+                PathBuf::from("changes.d/cli/imported-unreleased.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_top_level_prose_during_unreleased_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\nHand-written note.\n",
+        )
+        .expect_err("top-level prose");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_section_headings_without_configured_sections_during_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\n### Fixed\n\n -  Fixed a bug.\n",
+        )
+        .expect_err("unrepresentable section heading");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+        assert!(error.to_string().contains("configured sections"));
+    }
+
+    #[test]
+    fn rejects_a_level_three_unreleased_region_heading() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(&repo, "### Unreleased\n\n -  Added a feature.\n")
+            .expect_err("level-three region heading");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_a_second_version_heading_during_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\n -  Added one feature.\n\n## Unreleased\n\n -  Added another feature.\n",
+        )
+        .expect_err("second version heading");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_ordered_lists_during_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\n 1. Added a feature.\n",
+        )
+        .expect_err("ordered list");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_unreleased_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(&repo, "Unreleased\n----------\n\nTo be released.\n")
+            .expect_err("empty import");
+
+        assert!(matches!(error, Error::UnreleasedImportEmpty));
     }
 
     #[test]

@@ -31,6 +31,25 @@ Start with the smallest valid form:
 Then run `sacho fmt` and `sacho check`.
 
 
+`import-unreleased` refuses the changelog
+-----------------------------------------
+
+Import is available only for a materialized changelog before any Markdown
+fragments exist. If fragments already exist, decide whether they or the current
+unreleased region are the source of truth instead of merging both implicitly.
+
+The region may contain its version heading, the configured unreleased date
+line, configured level-three section headings, and top-level unordered lists.
+Move other top-level prose into list items before importing. Configure a section
+for each level-three heading you need to preserve, or remove the headings when
+the repository intentionally uses one unsectioned fragment stream.
+
+When *changes.d/next* already has a value, it must match `X` in the imported
+`Version X` heading. Resolve the disagreement explicitly, then rerun the
+command. `--force` confirms normalization only and does not bypass these
+checks.
+
+
 `missing changelog fragment`
 ----------------------------
 

@@ -147,20 +147,36 @@ state that never shipped.
 Basic workflow
 --------------
 
-With `sacho` on your `PATH`, initialize it at the repository root and choose
-the version you are preparing:
+With `sacho` on your `PATH`, initialize it at the repository root:
 
 ~~~~ sh
 sacho init
-sacho next 1.2.0
 ~~~~
 
 Initialization creates *sacho.toml*, *changes.d/*, and *CHANGES.md*. It also
 sets up the merge integration supported by the detected version-control
 system. The interactive setup can infer an issue-link template from the
-repository URL and offer to install a Git pre-commit hook. Repository
+repository URL, offer headings found across an existing changelog as section
+configuration, and offer to install a Git pre-commit hook. Repository
 integrations use the executable that ran `init`; pass
 `--integration-executable PATH` to use another executable.
+
+If an existing *CHANGES.md* already has entries under `Unreleased` or
+`Version X`, import them before creating new fragments:
+
+~~~~ sh
+sacho import-unreleased
+~~~~
+
+Sacho shows any normalization diff before writing. The import creates one root
+fragment, or one fragment per populated configured section, records `X` as the
+next version when present, and leaves every released section unchanged.
+
+If the import did not infer a version, choose the version you are preparing:
+
+~~~~ sh
+sacho next 1.2.0
+~~~~
 
 Create one fragment for each user-visible change, then edit the path printed by
 the command:

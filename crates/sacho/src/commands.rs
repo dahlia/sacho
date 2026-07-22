@@ -18,7 +18,9 @@ use crate::changelog::{
     set_trailing_newline_count,
 };
 use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
-use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
+use crate::config::{
+    Config, ReferenceSigil, RegionDetection, SectionConfig, UrlTemplate, VcsPreset,
+};
 use crate::error::{Error, MutationCommand, Result};
 use crate::fragment::{
     DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
@@ -27,7 +29,8 @@ use crate::fragment::{
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
-    carry_release, has_released_sections, insertion_title_span, render_released_section,
+    carry_release, has_released_sections, import_unreleased_region, insertion_title_span,
+    render_released_section,
 };
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
@@ -74,6 +77,9 @@ pub struct InitOptions {
 
     /// Repository URL used for `links."#"` in newly generated configuration.
     pub repository_url: Option<String>,
+
+    /// Sections selected while creating new configuration.
+    pub sections: Vec<SectionConfig>,
 }
 
 /// Result of bootstrapping Sacho in a repository.
@@ -482,6 +488,52 @@ pub struct CarryResult {
     pub cleanup_warnings: Vec<MutationCleanupWarning>,
 }
 
+/// Options for importing the materialized unreleased changelog into fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportUnreleasedOptions {
+    /// Bypass confirmation when normalization changes the materialized region.
+    pub force: bool,
+}
+
+/// Planned import of the materialized unreleased changelog.
+///
+/// Planning is read-only. If [`Self::requires_confirmation`] returns true, a
+/// caller should show [`Self::diff`] and obtain confirmation before applying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportUnreleasedPlan {
+    /// Version inferred from the materialized heading.
+    pub inferred_version: Option<String>,
+
+    /// Fragment paths that will be created.
+    pub written_fragments: Vec<PathBuf>,
+
+    /// Normalization diff that requires confirmation, unless forced.
+    pub diff: Option<String>,
+
+    force: bool,
+    mutation: RepositoryMutationPlan,
+}
+
+impl ImportUnreleasedPlan {
+    /// Reports whether applying the plan needs caller confirmation.
+    pub fn requires_confirmation(&self) -> bool {
+        self.diff.is_some() && !self.force
+    }
+}
+
+/// Result of importing a materialized unreleased changelog.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportUnreleasedResult {
+    /// Fragment paths written by the import.
+    pub written_fragments: Vec<PathBuf>,
+
+    /// Version inferred from the materialized heading.
+    pub inferred_version: Option<String>,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
+}
+
 /// Options for running repository checks.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CheckOptions {
@@ -713,6 +765,127 @@ pub fn infer_repository_url(start: impl AsRef<Path>) -> Option<String> {
     let preset =
         repository_preset(&root).or_else(|| is_git_repository(&root).then_some(VcsPreset::Git))?;
     crate::repository_url::infer(&root, preset).map(|url| url.web_url)
+}
+
+/// Resolves the repository root used by [`init_repository`].
+pub fn initialization_root(start: impl AsRef<Path>) -> PathBuf {
+    init_root(start.as_ref())
+}
+
+/// Suggests a safe, unused fragment subdirectory for a section identifier.
+pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
+    let stem = id.rsplit('/').next().unwrap_or(id);
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("section");
+    }
+
+    for suffix in 1..=used.len() + 1 {
+        let candidate = if suffix == 1 {
+            PathBuf::from(&slug)
+        } else {
+            PathBuf::from(format!("{slug}-{suffix}"))
+        };
+        if !used.iter().any(|path| path == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("one more candidate than used paths must produce an unused path")
+}
+
+/// Finds repository directories whose basename resembles a section.
+///
+/// Returned values are repository-relative recursive glob patterns. VCS
+/// metadata, dependency caches, build output, virtual environments, symlinked
+/// directories, and the configured fragment tree are not traversed.
+pub fn infer_section_paths(
+    root: impl AsRef<Path>,
+    id: &str,
+    section_directory: &Path,
+    fragment_directory: &Path,
+) -> Result<Vec<String>> {
+    const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".jj", ".venv", "node_modules", "target"];
+
+    fn visit(
+        root: &Path,
+        relative: &Path,
+        fragment_directory: &Path,
+        wanted: &[String],
+        matches: &mut Vec<String>,
+    ) -> Result<()> {
+        let absolute = root.join(relative);
+        let entries = match fs::read_dir(&absolute) {
+            Ok(entries) => entries,
+            Err(_) if !relative.as_os_str().is_empty() => return Ok(()),
+            Err(source) => {
+                return Err(Error::ReadFile {
+                    path: absolute,
+                    source,
+                });
+            }
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = relative.join(entry.file_name());
+            if path == fragment_directory {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if SKIPPED_DIRECTORIES
+                .iter()
+                .any(|skipped| name.eq_ignore_ascii_case(skipped))
+            {
+                continue;
+            }
+            if wanted.iter().any(|wanted| wanted == &name)
+                && let Some(path) = path.to_str()
+            {
+                matches.push(format!("{}/**", path.replace('\\', "/")));
+            }
+            visit(root, &path, fragment_directory, wanted, matches)?;
+        }
+        Ok(())
+    }
+
+    let id_stem = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    let directory_stem = section_directory
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let wanted = vec![id_stem, directory_stem];
+    let mut matches = Vec::new();
+    visit(
+        root.as_ref(),
+        Path::new(""),
+        fragment_directory,
+        &wanted,
+        &mut matches,
+    )?;
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
 }
 
 fn load_init_config(
@@ -1600,6 +1773,149 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     Ok(CarryResult {
         written_fragments,
         sync,
+        cleanup_warnings: outcome.cleanup_warnings,
+    })
+}
+
+/// Plans importing the materialized unreleased region into fragments.
+///
+/// The plan refuses repositories that already contain Markdown fragments and
+/// validates every generated fragment before returning. No file is changed
+/// until [`apply_import_unreleased`] is called.
+pub fn plan_import_unreleased(
+    repo: &Repository,
+    options: ImportUnreleasedOptions,
+) -> Result<ImportUnreleasedPlan> {
+    if !repo.config().changelog.materialize {
+        return Err(Error::UnreleasedImportRequiresMaterialization);
+    }
+    let before_sources = snapshot_release_fragment_sources(repo)?;
+    if !before_sources.is_empty() {
+        return Err(Error::UnreleasedImportExistingFragments);
+    }
+
+    let changelog_path = repo.config().changelog.path.clone();
+    let changelog_before = read_release_file_state(repo, &changelog_path)?;
+    let changelog =
+        release_file_state_utf8(repo, &changelog_path, &changelog_before)?.ok_or_else(|| {
+            Error::ReadFile {
+                path: repo.resolve(&changelog_path),
+                source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+            }
+        })?;
+    let region = find_unreleased_region(
+        changelog,
+        repo.config().changelog.region_detection,
+        &repo.config().changelog.unreleased_heading,
+    )
+    .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+    let mut imported = import_unreleased_region(repo, &changelog[region.start..region.end])?;
+    for fragment in &mut imported.fragments {
+        fragment.markdown = format_fragment_source(&fragment.markdown)
+            .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
+        parse_fragment(
+            fragment.path.clone(),
+            &fragment.markdown,
+            fragment.section.clone(),
+            &repo.config().links,
+        )
+        .map_err(|source| Error::Fragment {
+            path: fragment.path.clone(),
+            source,
+        })?;
+    }
+
+    let next_path = next_version_path(repo);
+    let next_before = read_release_file_state(repo, &next_path)?;
+    let existing_version = release_next_version(repo, &next_path, &next_before)?;
+    if let Some(actual) = &existing_version
+        && imported.version.as_ref() != Some(actual)
+    {
+        return Err(Error::UnreleasedImportNextMismatch {
+            expected: imported
+                .version
+                .clone()
+                .unwrap_or_else(|| String::from("Unreleased")),
+            actual: actual.clone(),
+        });
+    }
+    let next_after = match (&imported.version, existing_version) {
+        (Some(version), None) => ReleaseFileState::Present(format!("{version}\n")),
+        _ => next_before.clone(),
+    };
+
+    let after_sources = imported
+        .fragments
+        .iter()
+        .map(|fragment| ReleaseFragmentSource {
+            path: fragment.path.clone(),
+            contents: fragment.markdown.as_bytes().to_vec(),
+            section: fragment.section.clone(),
+        })
+        .collect::<Vec<_>>();
+    let parsed_after = parse_release_fragment_sources(repo, &after_sources)?;
+    let next_contents = release_file_state_utf8(repo, &next_path, &next_after)?;
+    let version_label = version_label_from_contents(&repo.resolve(&next_path), next_contents)?;
+    let compiled =
+        compile_parsed_fragments(repo, CompileOptions::default(), version_label, parsed_after)?;
+    let (normalized_changelog, _) =
+        synchronize_materialized_changelog(repo, changelog, &compiled, &changelog_path)?;
+    let changelog_after = ReleaseFileState::Present(normalized_changelog.clone());
+    let diff =
+        (changelog != normalized_changelog).then(|| unified_diff(changelog, &normalized_changelog));
+
+    let written_fragments = imported
+        .fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    let mut participants = after_sources
+        .iter()
+        .map(|source| ReleaseFileChange {
+            path: source.path.clone(),
+            before: ReleaseFileState::Missing,
+            after: release_file_state_from_bytes(source.contents.clone()),
+        })
+        .collect::<Vec<_>>();
+    participants.push(ReleaseFileChange {
+        path: next_path,
+        before: next_before,
+        after: next_after,
+    });
+    participants.push(ReleaseFileChange {
+        path: changelog_path,
+        before: changelog_before,
+        after: changelog_after,
+    });
+
+    Ok(ImportUnreleasedPlan {
+        inferred_version: imported.version,
+        written_fragments: written_fragments.clone(),
+        diff,
+        force: options.force,
+        mutation: RepositoryMutationPlan {
+            command: MutationCommand::ImportUnreleased,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: written_fragments,
+        },
+    })
+}
+
+/// Applies a previously planned unreleased import transaction.
+///
+/// Every generated fragment, the next-version file, and the materialized
+/// changelog are committed together. Stale inputs and concurrent fragment
+/// additions are rejected before the first write.
+pub fn apply_import_unreleased(
+    repo: &Repository,
+    plan: ImportUnreleasedPlan,
+) -> Result<ImportUnreleasedResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    let outcome = apply_repository_mutation(repo, &plan.mutation)?;
+    Ok(ImportUnreleasedResult {
+        written_fragments: plan.written_fragments,
+        inferred_version: plan.inferred_version,
         cleanup_warnings: outcome.cleanup_warnings,
     })
 }
@@ -4794,6 +5110,10 @@ fn default_init_config(root: &Path, options: &InitOptions) -> Result<Config> {
     if let Some(materialize) = options.materialize {
         config.changelog.materialize = materialize;
     }
+    config.sections.clone_from(&options.sections);
+    for section in &config.sections {
+        compile_glob_set(&section.paths)?;
+    }
     config.vcs.preset = repository_preset(root)
         .or_else(|| is_git_repository(root).then_some(VcsPreset::Git))
         .unwrap_or(VcsPreset::None);
@@ -4814,43 +5134,91 @@ fn render_init_config(config: &Config) -> String {
     let mut output = String::new();
     output.push_str("[changelog]\n");
     output.push_str(&format!(
-        "path = {:?}\n",
-        config.changelog.path.display().to_string()
+        "path = {}\n",
+        toml_basic_string(&config.changelog.path.display().to_string())
     ));
-    output.push_str(&format!("title = {:?}\n", config.changelog.title));
     output.push_str(&format!(
-        "unreleased-heading = {:?}\n",
-        config.changelog.unreleased_heading
+        "title = {}\n",
+        toml_basic_string(&config.changelog.title)
+    ));
+    output.push_str(&format!(
+        "unreleased-heading = {}\n",
+        toml_basic_string(&config.changelog.unreleased_heading)
     ));
     output.push_str(&format!("materialize = {}\n", config.changelog.materialize));
     output.push_str(&format!(
-        "region-detection = {:?}\n\n",
-        toml_vcs_region(config.changelog.region_detection)
+        "region-detection = {}\n\n",
+        toml_basic_string(toml_vcs_region(config.changelog.region_detection))
     ));
     output.push_str("[fragments]\n");
     output.push_str(&format!(
-        "directory = {:?}\n",
-        config.fragments.directory.display().to_string()
+        "directory = {}\n",
+        toml_basic_string(&config.fragments.directory.display().to_string())
     ));
     output.push_str(&format!(
-        "next-file = {:?}\n\n",
-        config.fragments.next_file.display().to_string()
+        "next-file = {}\n\n",
+        toml_basic_string(&config.fragments.next_file.display().to_string())
     ));
     if !config.links.is_empty() {
         output.push_str("[links]\n");
         for (sigil, template) in &config.links {
-            output.push_str(&format!("{:?} = {:?}\n", sigil.as_str(), template.as_str()));
+            output.push_str(&format!(
+                "{} = {}\n",
+                toml_basic_string(sigil.as_str()),
+                toml_basic_string(template.as_str())
+            ));
         }
         output.push('\n');
     }
     output.push_str("[vcs]\n");
     output.push_str(&format!(
-        "preset = {:?}\n\n",
-        toml_vcs_preset(config.vcs.preset)
+        "preset = {}\n\n",
+        toml_basic_string(toml_vcs_preset(config.vcs.preset))
     ));
     output.push_str("[check]\n");
     output.push_str("paths = []\n");
+    for section in &config.sections {
+        output.push_str("\n[[sections]]\n");
+        output.push_str(&format!("id = {}\n", toml_basic_string(&section.id)));
+        output.push_str(&format!(
+            "directory = {}\n",
+            toml_basic_string(&section.directory.display().to_string())
+        ));
+        output.push_str(&format!("paths = {}\n", toml_string_array(&section.paths)));
+    }
     output
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\t' => output.push_str("\\t"),
+            '\n' => output.push_str("\\n"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\r' => output.push_str("\\r"),
+            control if control <= '\u{001f}' || control == '\u{007f}' => {
+                output.push_str(&format!("\\u{:04X}", control as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('\"');
+    output
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| toml_basic_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn validate_init_changelog_path(
@@ -5785,12 +6153,136 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: Some(String::from("   ")),
+                sections: Vec::new(),
             },
         )
         .expect("blank repository URL");
 
         assert!(config.links.is_empty());
         assert!(!render_init_config(&config).contains("[links]"));
+    }
+
+    #[test]
+    fn init_config_renders_selected_sections() {
+        let options = InitOptions {
+            sections: vec![SectionConfig {
+                id: String::from("👨‍👩‍👧 core"),
+                directory: PathBuf::from("core"),
+                paths: vec![String::from("packages/core/**")],
+            }],
+            ..InitOptions::default()
+        };
+        let config = default_init_config(Path::new("project"), &options).expect("init config");
+        let rendered = render_init_config(&config);
+        let reparsed = Config::parse(&rendered).expect("rendered config");
+
+        assert_eq!(reparsed.sections, options.sections);
+        assert!(rendered.contains("[[sections]]"));
+        assert!(rendered.contains("id = \"👨‍👩‍👧 core\""));
+        assert!(!rendered.contains("\\u{"));
+        assert!(rendered.contains("directory = \"core\""));
+        assert!(rendered.contains("paths = [\"packages/core/**\"]"));
+    }
+
+    #[test]
+    fn init_config_escapes_remaining_ascii_control_characters() {
+        assert_eq!(toml_basic_string("\u{001f}\u{007f}"), "\"\\u001F\\u007F\"");
+    }
+
+    #[test]
+    fn suggests_safe_unique_section_directories() {
+        let mut used = Vec::new();
+
+        let first = suggest_section_directory("@example/Core tools", &used);
+        used.push(first.clone());
+        let second = suggest_section_directory("core-tools", &used);
+
+        assert_eq!(first, PathBuf::from("core-tools"));
+        assert_eq!(second, PathBuf::from("core-tools-2"));
+    }
+
+    #[test]
+    fn infers_section_paths_by_directory_name_and_skips_generated_trees() {
+        let temp = TempDir::new().expect("tempdir");
+        for path in [
+            "packages/core",
+            "examples/core",
+            "target/core",
+            "node_modules/core",
+            ".git/core",
+            "changes.d/core",
+        ] {
+            fs::create_dir_all(temp.path().join(path)).expect("directory");
+        }
+
+        let paths = infer_section_paths(
+            temp.path(),
+            "@example/core",
+            Path::new("core"),
+            Path::new("changes.d"),
+        )
+        .expect("path suggestions");
+
+        assert_eq!(
+            paths,
+            vec![
+                String::from("examples/core/**"),
+                String::from("packages/core/**")
+            ]
+        );
+    }
+
+    #[test]
+    fn section_path_inference_matches_distinct_id_and_directory_stems() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("id directory");
+        fs::create_dir_all(temp.path().join("crates/cli")).expect("section directory");
+
+        let paths = infer_section_paths(
+            temp.path(),
+            "@example/core",
+            Path::new("cli"),
+            Path::new("changes.d"),
+        )
+        .expect("path suggestions");
+
+        assert_eq!(paths, vec!["crates/cli/**", "packages/core/**"]);
+    }
+
+    #[test]
+    fn section_path_inference_reports_an_unreadable_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("not-a-directory");
+        fs::write(&root, "file").expect("root file");
+
+        let error = infer_section_paths(&root, "core", Path::new("core"), Path::new("changes.d"))
+            .expect_err("root read error");
+
+        assert!(matches!(error, Error::ReadFile { path, .. } if path == root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn section_path_inference_skips_unreadable_subdirectories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("package directory");
+        let unreadable = temp.path().join("private");
+        fs::create_dir(&unreadable).expect("private directory");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("remove permissions");
+
+        let result = infer_section_paths(
+            temp.path(),
+            "core",
+            Path::new("core"),
+            Path::new("changes.d"),
+        );
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert_eq!(result.expect("best-effort scan"), vec!["packages/core/**"]);
     }
 
     #[test]
@@ -6247,6 +6739,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6278,6 +6771,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("concurrent init lock");
@@ -6302,6 +6796,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("mutation lock changelog");
@@ -6332,6 +6827,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("Git mutation lock changelog");
@@ -6361,6 +6857,7 @@ mod tests {
                     install_hook: false,
                     append_existing_hook: false,
                     repository_url: None,
+                    sections: Vec::new(),
                 },
             )
             .expect_err("future VCS lock parent");
@@ -6392,6 +6889,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("inactive Git lock parent");
@@ -6436,6 +6934,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6465,6 +6964,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -6497,6 +6997,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -6566,6 +7067,7 @@ mod tests {
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6593,6 +7095,7 @@ mod tests {
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6615,6 +7118,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6643,6 +7147,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6676,6 +7181,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("fragment path conflict");
@@ -6699,6 +7205,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("changelog path conflict");
@@ -7289,6 +7796,167 @@ mod tests {
         .expect_err("missing version");
 
         assert!(matches!(carry_error, Error::ReleasedVersionNotFound { .. }));
+    }
+
+    #[test]
+    fn import_unreleased_plans_before_writing_and_preserves_released_bytes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        let released = "Version 2.3.0\n-------------\n\nReleased on July 1, 2026.\n\n -  Shipped the previous release.\n";
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!(
+                "Version 2.4.0\n-------------\n\nTo be released.\n\n- Added import support.\n\n{released}"
+            ),
+        )
+        .expect("changelog");
+
+        let plan =
+            plan_import_unreleased(&repo, ImportUnreleasedOptions { force: false }).expect("plan");
+
+        assert!(plan.requires_confirmation());
+        assert_eq!(plan.inferred_version.as_deref(), Some("2.4.0"));
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/imported-unreleased.md")
+                .exists()
+        );
+        assert!(!temp.path().join("changes.d/next").exists());
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("forced plan");
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![PathBuf::from("changes.d/imported-unreleased.md")]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.4.0\n"
+        );
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.ends_with(released));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn import_unreleased_rejects_existing_fragments_without_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/existing.md"), " -  Existing.\n")
+            .expect("existing fragment");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\n -  Added import support.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("existing fragment");
+
+        assert!(matches!(error, Error::UnreleasedImportExistingFragments));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/imported-unreleased.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn import_unreleased_requires_materialized_changelog() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("materialized changelog required");
+
+        assert!(matches!(
+            error,
+            Error::UnreleasedImportRequiresMaterialization
+        ));
+    }
+
+    #[test]
+    fn import_unreleased_rejects_mismatched_next_version_without_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/next"), "2.5.0\n").expect("next");
+        let changelog =
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Added import support.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("mismatched next version");
+
+        assert!(matches!(
+            error,
+            Error::UnreleasedImportNextMismatch {
+                expected,
+                actual
+            } if expected == "2.4.0" && actual == "2.5.0"
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.5.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn import_unreleased_accepts_matching_next_version() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/next"), "2.4.0\n").expect("next");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Added import support.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("matching next version");
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+
+        assert_eq!(result.inferred_version.as_deref(), Some("2.4.0"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.4.0\n"
+        );
+    }
+
+    #[test]
+    fn import_unreleased_without_version_keeps_next_file_absent() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n\n- Added import support.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("version-less plan");
+
+        assert!(plan.diff.is_some());
+        assert!(!plan.requires_confirmation());
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+        assert_eq!(result.inferred_version, None);
+        assert!(!temp.path().join("changes.d/next").exists());
     }
 
     #[test]
@@ -10122,6 +10790,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         ));
         assert_mutation_locked(add_fragment(

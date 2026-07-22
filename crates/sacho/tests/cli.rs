@@ -31,6 +31,7 @@ fn repository_commands_reject_an_external_configured_path_without_touching_it() 
         &["sync", "--force"],
         &["release", "1.2.0", "--date", "2026-07-15"],
         &["carry", "1.1.0"],
+        &["import-unreleased", "--force"],
     ];
 
     for args in invocations {
@@ -379,6 +380,38 @@ fn init_interactive_infers_a_git_worktree_remote() {
         std::fs::read_to_string(worktree.join("sacho.toml")).expect("worktree configuration");
     assert!(
         config.contains("https://github.com/team/project/issues/{n}"),
+        "{config}"
+    );
+}
+
+#[test]
+fn init_interactive_configures_selected_changelog_sections() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::create_dir_all(temp.path().join("packages/core")).expect("package directory");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Project changes\n===============\n\nVersion 2.0.0\n-------------\n\nTo be released.\n\n### core\n\n -  Added core.\n\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n### core\n\n -  Shipped core.\n",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["init"], "\n\n\n9\n1\n\n\n\n\n");
+
+    assert!(success, "{output}");
+    assert!(
+        output.contains("section number 9 is outside 1..=1"),
+        "{output}"
+    );
+    assert!(
+        output.contains("1. core (2 occurrences, unreleased)"),
+        "{output}"
+    );
+    let config = std::fs::read_to_string(temp.path().join("sacho.toml")).expect("configuration");
+    assert!(config.contains("[[sections]]"), "{config}");
+    assert!(config.contains("id = \"core\""), "{config}");
+    assert!(config.contains("directory = \"core\""), "{config}");
+    assert!(
+        config.contains("paths = [\"packages/core/**\"]"),
         "{config}"
     );
 }
@@ -1384,6 +1417,93 @@ fn sync_without_force_exits_two_and_leaves_changelog_unchanged() {
 }
 
 #[test]
+fn import_unreleased_requires_force_non_interactively_then_imports() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir(temp.path().join("changes.d")).expect("fragment directory");
+    let changelog = "Version 2.4.0\n-------------\n\nTo be released.\n\n- Added import support.\n\nVersion 2.3.0\n-------------\n\nReleased on July 1, 2026.\n\n -  Previous release.\n";
+    std::fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(temp.path())
+        .arg("import-unreleased")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "rerun with `sacho import-unreleased --force`",
+        ));
+
+    assert!(
+        !temp
+            .path()
+            .join("changes.d/imported-unreleased.md")
+            .exists()
+    );
+    assert!(!temp.path().join("changes.d/next").exists());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("unchanged changelog"),
+        changelog
+    );
+
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+    command
+        .current_dir(temp.path())
+        .args(["import-unreleased", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changes.d/imported-unreleased.md"));
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+        "2.4.0\n"
+    );
+    let mut check = Command::cargo_bin("sacho").expect("binary");
+    check
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_unreleased_in_terminal_applies_after_yes_confirmation() {
+    let temp = import_unreleased_confirmation_repository();
+
+    let (success, output) = run_in_terminal(temp.path(), &["import-unreleased"], "yes\n");
+
+    assert!(success, "{output}");
+    assert!(output.contains("normalize the materialized"), "{output}");
+    assert!(output.contains("[y/N]"), "{output}");
+    assert!(
+        temp.path()
+            .join("changes.d/imported-unreleased.md")
+            .exists()
+    );
+}
+
+#[test]
+fn import_unreleased_in_terminal_keeps_repository_after_default_no() {
+    let temp = import_unreleased_confirmation_repository();
+    let original = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["import-unreleased"], "\n");
+
+    assert!(!success, "{output}");
+    assert!(output.contains("cancelled"), "{output}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+        original
+    );
+    assert!(
+        !temp
+            .path()
+            .join("changes.d/imported-unreleased.md")
+            .exists()
+    );
+}
+
+#[test]
 fn sync_in_terminal_applies_after_yes_confirmation() {
     let temp = sync_confirmation_repository();
 
@@ -1659,6 +1779,18 @@ fn sync_confirmation_repository() -> tempfile::TempDir {
     std::fs::write(
         temp.path().join("CHANGES.md"),
         "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+    temp
+}
+
+fn import_unreleased_confirmation_repository() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\n- Added import support.\n",
     )
     .expect("changelog");
     temp

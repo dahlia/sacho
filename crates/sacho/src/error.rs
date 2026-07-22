@@ -14,6 +14,9 @@ pub enum MutationCommand {
 
     /// The `carry` command.
     Carry,
+
+    /// The `import-unreleased` command.
+    ImportUnreleased,
 }
 
 impl std::fmt::Display for MutationCommand {
@@ -22,6 +25,7 @@ impl std::fmt::Display for MutationCommand {
             Self::Next => "next",
             Self::Format => "fmt",
             Self::Carry => "carry",
+            Self::ImportUnreleased => "import-unreleased",
         })
     }
 }
@@ -48,6 +52,37 @@ pub enum Error {
 
         /// Reason the executable cannot be used.
         reason: &'static str,
+    },
+
+    /// Existing unreleased Markdown cannot be represented as Sacho fragments.
+    #[snafu(display("cannot import unreleased changelog: {message}"))]
+    UnreleasedImportIncompatible {
+        /// Explanation of the incompatible Markdown structure.
+        message: String,
+    },
+
+    /// The unreleased region contains no list items to import.
+    #[snafu(display("cannot import unreleased changelog because it contains no entries"))]
+    UnreleasedImportEmpty,
+
+    /// Importing requires a materialized changelog region.
+    #[snafu(display("`sacho import-unreleased` requires changelog.materialize = true"))]
+    UnreleasedImportRequiresMaterialization,
+
+    /// Existing fragments make the import target ambiguous.
+    #[snafu(display("cannot import unreleased changelog while Markdown fragments already exist"))]
+    UnreleasedImportExistingFragments,
+
+    /// The current next-version file disagrees with the changelog heading.
+    #[snafu(display(
+        "cannot import unreleased changelog because its heading implies {expected}, but the next-version file contains {actual}"
+    ))]
+    UnreleasedImportNextMismatch {
+        /// Version implied by the materialized heading.
+        expected: String,
+
+        /// Version found in the next-version file.
+        actual: String,
     },
 
     /// A file could not be read.

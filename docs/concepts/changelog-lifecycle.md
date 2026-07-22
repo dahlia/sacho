@@ -43,6 +43,7 @@ Fragments remain the source of truth. Do not edit this region by hand.
 Several commands keep it current:
 
  -  `sacho add` creates a fragment and refreshes the region.
+ -  `sacho import-unreleased` adopts existing entries and normalizes the region.
  -  `sacho next` changes the version and refreshes the heading.
  -  `sacho fmt` formats every fragment and refreshes the region.
  -  `sacho sync` refreshes only the generated region.
@@ -59,6 +60,26 @@ with an empty body while closed.
 
 Set `materialize = false` when the repository should keep only released history
 in *CHANGES.md*. `sacho preview` still compiles the unreleased region on demand.
+
+
+Importing an existing region
+----------------------------
+
+An existing project may already have user-written entries in its current
+unreleased region when Sacho is initialized. Run `sacho import-unreleased`
+before adding fragments. It parses only that region, writes deterministic
+*imported-unreleased.md* fragments, and compiles them back into the same region.
+Released sections remain untouched.
+
+Configured level-three headings select section directories. Without configured
+sections, level-three headings are rejected because flattening them would lose
+structure. Top-level prose, ordered lists, and other unsupported blocks are
+also rejected. These checks still apply with `--force`.
+
+The import shows a normalization diff and asks for confirmation when running in
+a terminal. Noninteractive callers must review the diff and rerun with
+`--force`. A version in a `Version X` heading becomes the next-version value;
+an `Unreleased` heading does not set a next-version value.
 
 
 Fragments-only repositories

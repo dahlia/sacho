@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
@@ -9,14 +9,17 @@ use jiff::{Timestamp, civil};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
-    InitOptions, InitResult, MutationCleanupWarning, NextOptions, ReleaseDate, ReleaseOptions,
-    ShowOptions, SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver,
-    apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
-    infer_repository_url, init_repository, mercurial_update_hook, plan_format, plan_release,
-    plan_sync, reference_transaction_hook, set_next_version, show,
+    ImportUnreleasedOptions, ImportUnreleasedPlan, InitOptions, InitResult, MutationCleanupWarning,
+    NextOptions, ReleaseDate, ReleaseOptions, ShowOptions, SyncOptions, SyncPlan, add_fragment,
+    apply_format, apply_import_unreleased, apply_merge_driver, apply_release, apply_sync, carry,
+    check, commit_message_hook, compile_unreleased, infer_repository_url, infer_section_paths,
+    init_repository, initialization_root, mercurial_update_hook, plan_format,
+    plan_import_unreleased, plan_release, plan_sync, reference_transaction_hook, set_next_version,
+    show, suggest_section_directory,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
-use sacho::{Error, Repository};
+use sacho::released::discover_section_candidates;
+use sacho::{Error, Repository, SectionConfig};
 
 const HELP_LICENSE_NOTICE: &str = "Copyright (C) 2026 Hong Minhee\n\
 Sacho is free software under GNU GPLv3 only and comes with ABSOLUTELY NO WARRANTY.\n\
@@ -179,6 +182,13 @@ enum Command {
         /// Released version whose entries should be carried.
         #[arg(help = "Released version whose entries should be carried")]
         version: String,
+    },
+
+    /// Import the materialized unreleased region into fragments.
+    ImportUnreleased {
+        /// Apply even when normalized fragment output changes the region.
+        #[arg(long, help = "Apply even when normalization changes the changelog")]
+        force: bool,
     },
 
     /// Resolve changelog merge conflicts by recompiling fragments.
@@ -353,6 +363,22 @@ impl Cli {
                 print_mutation_cleanup_warnings("sacho carry", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
+            Command::ImportUnreleased { force } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force })?;
+                if !confirm_import_unreleased_plan(&plan)? {
+                    return Ok(ExitCode::from(2));
+                }
+                let result = apply_import_unreleased(&repo, plan)?;
+                print_mutation_cleanup_warnings(
+                    "sacho import-unreleased",
+                    &result.cleanup_warnings,
+                );
+                for path in result.written_fragments {
+                    println!("{}", path.display());
+                }
+                Ok(ExitCode::SUCCESS)
+            }
             Command::MergeDriver {
                 original,
                 current,
@@ -497,6 +523,29 @@ fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Resul
     }
 }
 
+fn confirm_import_unreleased_plan(plan: &ImportUnreleasedPlan) -> Result<bool, CliReport> {
+    if !plan.requires_confirmation() {
+        return Ok(true);
+    }
+    let Some(diff) = &plan.diff else {
+        return Ok(true);
+    };
+    let interactive = sync_should_prompt(io::stdin().is_terminal(), io::stdout().is_terminal());
+    if interactive {
+        print!("{diff}");
+        println!("the imported fragments normalize the materialized unreleased region");
+        if prompt_bool("Apply this import", false)? {
+            return Ok(true);
+        }
+        eprintln!("import cancelled; the repository was not changed");
+    } else {
+        eprint!("{diff}");
+        eprintln!("the imported fragments normalize the materialized unreleased region");
+        eprintln!("rerun with `sacho import-unreleased --force` to apply it non-interactively");
+    }
+    Ok(false)
+}
+
 fn sync_should_prompt(stdin_terminal: bool, stdout_terminal: bool) -> bool {
     stdin_terminal && stdout_terminal
 }
@@ -549,6 +598,12 @@ fn resolve_init_options(
         let changelog_path = prompt("Changelog path", "CHANGES.md")?;
         let fragment_directory = prompt("Fragment directory", "changes.d")?;
         let materialize = prompt_bool("Materialize unreleased changelog", true)?;
+        let root = initialization_root(".");
+        let sections = resolve_interactive_sections(
+            &root,
+            Path::new(&changelog_path),
+            Path::new(&fragment_directory),
+        )?;
         let repository_url = resolve_interactive_repository_url(repository_url)?;
         let install_hook = if install_hook {
             true
@@ -568,6 +623,7 @@ fn resolve_init_options(
             install_hook,
             append_existing_hook,
             repository_url,
+            sections,
         })
     } else {
         Ok(InitOptions {
@@ -578,8 +634,124 @@ fn resolve_init_options(
             install_hook,
             append_existing_hook: false,
             repository_url,
+            sections: Vec::new(),
         })
     }
+}
+
+fn resolve_interactive_sections(
+    root: &Path,
+    changelog_path: &Path,
+    fragment_directory: &Path,
+) -> Result<Vec<SectionConfig>, CliReport> {
+    if root.join(Repository::CONFIG_FILE).exists() {
+        return Ok(Vec::new());
+    }
+    let path = root.join(changelog_path);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let changelog = std::fs::read_to_string(&path).map_err(|source| Error::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    let document_title = root.file_name().and_then(|name| name.to_str()).map_or_else(
+        || String::from("Changelog"),
+        |name| format!("{name} changelog"),
+    );
+    let candidates = discover_section_candidates(&changelog, &document_title, "To be released.");
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    println!("Possible changelog sections:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        let occurrence_word = if candidate.occurrences == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        };
+        let unreleased = if candidate.appears_in_unreleased {
+            ", unreleased"
+        } else {
+            ""
+        };
+        println!(
+            "  {}. {} ({} {}{})",
+            index + 1,
+            candidate.id,
+            candidate.occurrences,
+            occurrence_word,
+            unreleased
+        );
+    }
+    let selected = loop {
+        let answer = prompt("Select sections by number, comma-separated", "")?;
+        match parse_section_selection(&answer, candidates.len()) {
+            Ok(selected) => break selected,
+            Err(error) => eprintln!("{error}"),
+        }
+    };
+    let mut sections = Vec::new();
+    let mut used_directories = Vec::new();
+    for index in selected {
+        let candidate = &candidates[index];
+        let suggested = suggest_section_directory(&candidate.id, &used_directories);
+        let directory = PathBuf::from(prompt(
+            &format!("Fragment directory for {}", candidate.id),
+            &suggested.display().to_string(),
+        )?);
+        used_directories.push(directory.clone());
+        let suggested_paths =
+            infer_section_paths(root, &candidate.id, &directory, fragment_directory)?;
+        let paths_answer = prompt(
+            &format!("Paths for {} (comma-separated; '-' for none)", candidate.id),
+            &suggested_paths.join(", "),
+        )?;
+        let paths = if paths_answer == "-" {
+            Vec::new()
+        } else {
+            paths_answer
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        sections.push(SectionConfig {
+            id: candidate.id.clone(),
+            directory,
+            paths,
+        });
+    }
+    Ok(sections)
+}
+
+fn parse_section_selection(answer: &str, candidate_count: usize) -> Result<Vec<usize>, CliReport> {
+    if answer.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut selected = Vec::new();
+    for part in answer.split(',') {
+        let number = part.trim().parse::<usize>().map_err(|_| Error::Usage {
+            message: format!("invalid section number {:?}", part.trim()),
+        })?;
+        if number == 0 || number > candidate_count {
+            return Err(Error::Usage {
+                message: format!("section number {number} is outside 1..={candidate_count}"),
+            }
+            .into());
+        }
+        let index = number - 1;
+        if selected.contains(&index) {
+            return Err(Error::Usage {
+                message: format!("section number {number} was selected more than once"),
+            }
+            .into());
+        }
+        selected.push(index);
+    }
+    Ok(selected)
 }
 
 fn resolve_interactive_repository_url(
@@ -863,6 +1035,18 @@ mod tests {
             optional_prompt_value(String::from("https://example.com/repo")),
             Some(String::from("https://example.com/repo"))
         );
+    }
+
+    #[test]
+    fn section_selection_parser_preserves_order_and_rejects_bad_numbers() {
+        assert_eq!(parse_section_selection("", 3).expect("empty"), Vec::new());
+        assert_eq!(
+            parse_section_selection("3, 1", 3).expect("selection"),
+            vec![2, 0]
+        );
+        assert!(parse_section_selection("1,1", 3).is_err());
+        assert!(parse_section_selection("4", 3).is_err());
+        assert!(parse_section_selection("core", 3).is_err());
     }
 
     #[test]
