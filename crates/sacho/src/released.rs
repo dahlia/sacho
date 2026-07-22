@@ -1213,6 +1213,35 @@ Released on July 1, 2026.
     }
 
     #[test]
+    fn ignores_an_exact_version_shaped_document_title() {
+        let candidates = discover_section_candidates(
+            "# Version 9.9.9\n\n### Notation\n\nDocument notation.\n",
+            "Version 9.9.9",
+            "To be released.",
+        );
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn keeps_a_version_shaped_h1_that_is_not_the_document_title() {
+        let candidates = discover_section_candidates(
+            "# Version 9.9.9\n\n### core\n\n -  Added core.\n",
+            "Project changes",
+            "To be released.",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![ChangelogSectionCandidate {
+                id: String::from("core"),
+                occurrences: 1,
+                appears_in_unreleased: false,
+            }]
+        );
+    }
+
+    #[test]
     fn finds_setext_version_target() {
         let (_temp, repo) = repo_with_config(
             r##"
