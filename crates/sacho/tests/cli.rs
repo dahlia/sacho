@@ -384,6 +384,38 @@ fn init_interactive_infers_a_git_worktree_remote() {
 }
 
 #[test]
+fn init_interactive_configures_selected_changelog_sections() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::create_dir_all(temp.path().join("packages/core")).expect("package directory");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Project changes\n===============\n\nVersion 2.0.0\n-------------\n\nTo be released.\n\n### core\n\n -  Added core.\n\nVersion 1.0.0\n-------------\n\nReleased on July 1, 2026.\n\n### core\n\n -  Shipped core.\n",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["init"], "\n\n\n9\n1\n\n\n\n\n");
+
+    assert!(success, "{output}");
+    assert!(
+        output.contains("section number 9 is outside 1..=1"),
+        "{output}"
+    );
+    assert!(
+        output.contains("1. core (2 occurrences, unreleased)"),
+        "{output}"
+    );
+    let config = std::fs::read_to_string(temp.path().join("sacho.toml")).expect("configuration");
+    assert!(config.contains("[[sections]]"), "{config}");
+    assert!(config.contains("id = \"core\""), "{config}");
+    assert!(config.contains("directory = \"core\""), "{config}");
+    assert!(
+        config.contains("paths = [\"packages/core/**\"]"),
+        "{config}"
+    );
+}
+
+#[test]
 fn init_discovers_a_markerless_git_worktree_from_the_environment() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let metadata_worktree = temp.path().join("metadata-worktree");

@@ -18,7 +18,9 @@ use crate::changelog::{
     set_trailing_newline_count,
 };
 use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
-use crate::config::{Config, ReferenceSigil, RegionDetection, UrlTemplate, VcsPreset};
+use crate::config::{
+    Config, ReferenceSigil, RegionDetection, SectionConfig, UrlTemplate, VcsPreset,
+};
 use crate::error::{Error, MutationCommand, Result};
 use crate::fragment::{
     DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
@@ -74,6 +76,9 @@ pub struct InitOptions {
 
     /// Repository URL used for `links."#"` in newly generated configuration.
     pub repository_url: Option<String>,
+
+    /// Sections selected while creating new configuration.
+    pub sections: Vec<SectionConfig>,
 }
 
 /// Result of bootstrapping Sacho in a repository.
@@ -713,6 +718,130 @@ pub fn infer_repository_url(start: impl AsRef<Path>) -> Option<String> {
     let preset =
         repository_preset(&root).or_else(|| is_git_repository(&root).then_some(VcsPreset::Git))?;
     crate::repository_url::infer(&root, preset).map(|url| url.web_url)
+}
+
+/// Resolves the repository root used by [`init_repository`].
+pub fn initialization_root(start: impl AsRef<Path>) -> PathBuf {
+    init_root(start.as_ref())
+}
+
+/// Suggests a safe, unused fragment subdirectory for a section identifier.
+pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
+    let stem = id.rsplit('/').next().unwrap_or(id);
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("section");
+    }
+
+    for suffix in 1.. {
+        let candidate = if suffix == 1 {
+            PathBuf::from(&slug)
+        } else {
+            PathBuf::from(format!("{slug}-{suffix}"))
+        };
+        if !used.iter().any(|path| path == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("an unbounded numeric suffix must produce an unused path")
+}
+
+/// Finds repository directories whose basename resembles a section.
+///
+/// Returned values are repository-relative recursive glob patterns. VCS
+/// metadata, dependency caches, build output, virtual environments, symlinked
+/// directories, and the configured fragment tree are not traversed.
+pub fn infer_section_paths(
+    root: impl AsRef<Path>,
+    id: &str,
+    section_directory: &Path,
+    fragment_directory: &Path,
+) -> Result<Vec<String>> {
+    const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".jj", ".venv", "node_modules", "target"];
+
+    fn visit(
+        root: &Path,
+        relative: &Path,
+        fragment_directory: &Path,
+        wanted: &[String],
+        matches: &mut Vec<String>,
+    ) -> Result<()> {
+        let absolute = root.join(relative);
+        let entries = match fs::read_dir(&absolute) {
+            Ok(entries) => entries,
+            Err(_) if !relative.as_os_str().is_empty() => return Ok(()),
+            Err(source) => {
+                return Err(Error::ReadFile {
+                    path: absolute,
+                    source,
+                });
+            }
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let path = relative.join(entry.file_name());
+            if path == fragment_directory || path.starts_with(fragment_directory) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if SKIPPED_DIRECTORIES
+                .iter()
+                .any(|skipped| name.eq_ignore_ascii_case(skipped))
+            {
+                continue;
+            }
+            if wanted.iter().any(|wanted| wanted == &name)
+                && let Some(path) = path.to_str()
+            {
+                matches.push(format!("{}/**", path.replace('\\', "/")));
+            }
+            visit(root, &path, fragment_directory, wanted, matches)?;
+        }
+        Ok(())
+    }
+
+    let id_stem = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+    let directory_stem = section_directory
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut wanted = vec![id_stem];
+    if !directory_stem.is_empty() && !wanted.contains(&directory_stem) {
+        wanted.push(directory_stem);
+    }
+    let mut matches = Vec::new();
+    visit(
+        root.as_ref(),
+        Path::new(""),
+        fragment_directory,
+        &wanted,
+        &mut matches,
+    )?;
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
 }
 
 fn load_init_config(
@@ -4794,6 +4923,10 @@ fn default_init_config(root: &Path, options: &InitOptions) -> Result<Config> {
     if let Some(materialize) = options.materialize {
         config.changelog.materialize = materialize;
     }
+    config.sections.clone_from(&options.sections);
+    for section in &config.sections {
+        compile_glob_set(&section.paths)?;
+    }
     config.vcs.preset = repository_preset(root)
         .or_else(|| is_git_repository(root).then_some(VcsPreset::Git))
         .unwrap_or(VcsPreset::None);
@@ -4814,43 +4947,91 @@ fn render_init_config(config: &Config) -> String {
     let mut output = String::new();
     output.push_str("[changelog]\n");
     output.push_str(&format!(
-        "path = {:?}\n",
-        config.changelog.path.display().to_string()
+        "path = {}\n",
+        toml_basic_string(&config.changelog.path.display().to_string())
     ));
-    output.push_str(&format!("title = {:?}\n", config.changelog.title));
     output.push_str(&format!(
-        "unreleased-heading = {:?}\n",
-        config.changelog.unreleased_heading
+        "title = {}\n",
+        toml_basic_string(&config.changelog.title)
+    ));
+    output.push_str(&format!(
+        "unreleased-heading = {}\n",
+        toml_basic_string(&config.changelog.unreleased_heading)
     ));
     output.push_str(&format!("materialize = {}\n", config.changelog.materialize));
     output.push_str(&format!(
-        "region-detection = {:?}\n\n",
-        toml_vcs_region(config.changelog.region_detection)
+        "region-detection = {}\n\n",
+        toml_basic_string(toml_vcs_region(config.changelog.region_detection))
     ));
     output.push_str("[fragments]\n");
     output.push_str(&format!(
-        "directory = {:?}\n",
-        config.fragments.directory.display().to_string()
+        "directory = {}\n",
+        toml_basic_string(&config.fragments.directory.display().to_string())
     ));
     output.push_str(&format!(
-        "next-file = {:?}\n\n",
-        config.fragments.next_file.display().to_string()
+        "next-file = {}\n\n",
+        toml_basic_string(&config.fragments.next_file.display().to_string())
     ));
     if !config.links.is_empty() {
         output.push_str("[links]\n");
         for (sigil, template) in &config.links {
-            output.push_str(&format!("{:?} = {:?}\n", sigil.as_str(), template.as_str()));
+            output.push_str(&format!(
+                "{} = {}\n",
+                toml_basic_string(sigil.as_str()),
+                toml_basic_string(template.as_str())
+            ));
         }
         output.push('\n');
     }
     output.push_str("[vcs]\n");
     output.push_str(&format!(
-        "preset = {:?}\n\n",
-        toml_vcs_preset(config.vcs.preset)
+        "preset = {}\n\n",
+        toml_basic_string(toml_vcs_preset(config.vcs.preset))
     ));
     output.push_str("[check]\n");
     output.push_str("paths = []\n");
+    for section in &config.sections {
+        output.push_str("\n[[sections]]\n");
+        output.push_str(&format!("id = {}\n", toml_basic_string(&section.id)));
+        output.push_str(&format!(
+            "directory = {}\n",
+            toml_basic_string(&section.directory.display().to_string())
+        ));
+        output.push_str(&format!("paths = {}\n", toml_string_array(&section.paths)));
+    }
     output
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\t' => output.push_str("\\t"),
+            '\n' => output.push_str("\\n"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\r' => output.push_str("\\r"),
+            control if control <= '\u{001f}' || control == '\u{007f}' => {
+                output.push_str(&format!("\\u{:04X}", control as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('\"');
+    output
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| toml_basic_string(value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn validate_init_changelog_path(
@@ -5785,12 +5966,102 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: Some(String::from("   ")),
+                sections: Vec::new(),
             },
         )
         .expect("blank repository URL");
 
         assert!(config.links.is_empty());
         assert!(!render_init_config(&config).contains("[links]"));
+    }
+
+    #[test]
+    fn init_config_renders_selected_sections() {
+        let options = InitOptions {
+            sections: vec![SectionConfig {
+                id: String::from("👨‍👩‍👧 core"),
+                directory: PathBuf::from("core"),
+                paths: vec![String::from("packages/core/**")],
+            }],
+            ..InitOptions::default()
+        };
+        let config = default_init_config(Path::new("project"), &options).expect("init config");
+        let rendered = render_init_config(&config);
+        let reparsed = Config::parse(&rendered).expect("rendered config");
+
+        assert_eq!(reparsed.sections, options.sections);
+        assert!(rendered.contains("[[sections]]"));
+        assert!(rendered.contains("id = \"👨‍👩‍👧 core\""));
+        assert!(!rendered.contains("\\u{"));
+        assert!(rendered.contains("directory = \"core\""));
+        assert!(rendered.contains("paths = [\"packages/core/**\"]"));
+    }
+
+    #[test]
+    fn suggests_safe_unique_section_directories() {
+        let mut used = Vec::new();
+
+        let first = suggest_section_directory("@example/Core tools", &used);
+        used.push(first.clone());
+        let second = suggest_section_directory("core-tools", &used);
+
+        assert_eq!(first, PathBuf::from("core-tools"));
+        assert_eq!(second, PathBuf::from("core-tools-2"));
+    }
+
+    #[test]
+    fn infers_section_paths_by_directory_name_and_skips_generated_trees() {
+        let temp = TempDir::new().expect("tempdir");
+        for path in [
+            "packages/core",
+            "examples/core",
+            "target/core",
+            "node_modules/core",
+            ".git/core",
+            "changes.d/core",
+        ] {
+            fs::create_dir_all(temp.path().join(path)).expect("directory");
+        }
+
+        let paths = infer_section_paths(
+            temp.path(),
+            "@example/core",
+            Path::new("core"),
+            Path::new("changes.d"),
+        )
+        .expect("path suggestions");
+
+        assert_eq!(
+            paths,
+            vec![
+                String::from("examples/core/**"),
+                String::from("packages/core/**")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn section_path_inference_skips_unreadable_subdirectories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("package directory");
+        let unreadable = temp.path().join("private");
+        fs::create_dir(&unreadable).expect("private directory");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("remove permissions");
+
+        let result = infer_section_paths(
+            temp.path(),
+            "core",
+            Path::new("core"),
+            Path::new("changes.d"),
+        );
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert_eq!(result.expect("best-effort scan"), vec!["packages/core/**"]);
     }
 
     #[test]
@@ -6247,6 +6518,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6278,6 +6550,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("concurrent init lock");
@@ -6302,6 +6575,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("mutation lock changelog");
@@ -6332,6 +6606,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("Git mutation lock changelog");
@@ -6361,6 +6636,7 @@ mod tests {
                     install_hook: false,
                     append_existing_hook: false,
                     repository_url: None,
+                    sections: Vec::new(),
                 },
             )
             .expect_err("future VCS lock parent");
@@ -6392,6 +6668,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("inactive Git lock parent");
@@ -6436,6 +6713,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6465,6 +6743,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -6497,6 +6776,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -6566,6 +6846,7 @@ mod tests {
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6593,6 +6874,7 @@ mod tests {
                 install_hook: true,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6615,6 +6897,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6643,6 +6926,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect("init");
@@ -6676,6 +6960,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("fragment path conflict");
@@ -6699,6 +6984,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         )
         .expect_err("changelog path conflict");
@@ -10122,6 +10408,7 @@ mod tests {
                 install_hook: false,
                 append_existing_hook: false,
                 repository_url: None,
+                sections: Vec::new(),
             },
         ));
         assert_mutation_locked(add_fragment(
