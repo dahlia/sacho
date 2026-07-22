@@ -1439,6 +1439,39 @@ To be released.
     }
 
     #[test]
+    fn rejects_a_level_three_unreleased_region_heading() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(&repo, "### Unreleased\n\n -  Added a feature.\n")
+            .expect_err("level-three region heading");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_a_second_version_heading_during_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\n -  Added one feature.\n\n## Unreleased\n\n -  Added another feature.\n",
+        )
+        .expect_err("second version heading");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
+    fn rejects_ordered_lists_during_import() {
+        let (_temp, repo) = repo_with_config("");
+        let error = import_unreleased_region(
+            &repo,
+            "Unreleased\n----------\n\nTo be released.\n\n 1. Added a feature.\n",
+        )
+        .expect_err("ordered list");
+
+        assert!(matches!(error, Error::UnreleasedImportIncompatible { .. }));
+    }
+
+    #[test]
     fn rejects_empty_unreleased_import() {
         let (_temp, repo) = repo_with_config("");
         let error = import_unreleased_region(&repo, "Unreleased\n----------\n\nTo be released.\n")
