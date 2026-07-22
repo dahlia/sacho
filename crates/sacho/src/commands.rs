@@ -6185,6 +6185,11 @@ mod tests {
     }
 
     #[test]
+    fn init_config_escapes_remaining_ascii_control_characters() {
+        assert_eq!(toml_basic_string("\u{001f}\u{007f}"), "\"\\u001F\\u007F\"");
+    }
+
+    #[test]
     fn suggests_safe_unique_section_directories() {
         let mut used = Vec::new();
 
