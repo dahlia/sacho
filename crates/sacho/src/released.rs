@@ -36,6 +36,19 @@ pub struct CarriedFragment {
     pub markdown: String,
 }
 
+/// A possible Sacho section found in an existing changelog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangelogSectionCandidate {
+    /// Text of the direct level-three heading.
+    pub id: String,
+
+    /// Number of matching level-three heading occurrences.
+    pub occurrences: usize,
+
+    /// Whether the heading occurs in the current unreleased region.
+    pub appears_in_unreleased: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TargetSection<'a> {
     body: &'a str,
@@ -53,6 +66,96 @@ struct ParsedEntry {
 struct ReferenceDefinition {
     label: String,
     url: String,
+}
+
+#[derive(Debug, Clone)]
+struct SectionCandidateRegion {
+    unreleased: bool,
+    sections: Vec<String>,
+}
+
+/// Finds direct level-three headings inside changelog version regions.
+///
+/// The first level-one or Setext heading is ignored when it matches
+/// `document_title` so a title such as `Version history` does not open a
+/// version region.
+///
+/// Candidates from a region containing `unreleased_heading` are ordered before
+/// candidates found only in released history. Within each group, candidates
+/// retain their first-appearance order. Callers must still ask a person which
+/// headings represent stable repository sections because change categories
+/// such as `Added` have the same Markdown shape.
+pub fn discover_section_candidates(
+    changelog: &str,
+    document_title: &str,
+    unreleased_heading: &str,
+) -> Vec<ChangelogSectionCandidate> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, changelog, &comrak_options());
+    let mut regions = Vec::<SectionCandidateRegion>::new();
+    let mut current = None;
+    let mut first_heading = true;
+
+    for child in root.children() {
+        match &child.data().value {
+            NodeValue::Heading(heading) => {
+                let text = plain_text(child).trim().to_owned();
+                if first_heading && (heading.level == 1 || heading.setext) && text == document_title
+                {
+                    first_heading = false;
+                    continue;
+                }
+                first_heading = false;
+                if heading.level <= 2 && (text == "Unreleased" || is_version_heading_text(&text)) {
+                    regions.push(SectionCandidateRegion {
+                        unreleased: text == "Unreleased",
+                        sections: Vec::new(),
+                    });
+                    current = Some(regions.len() - 1);
+                } else if heading.level == 3
+                    && let Some(index) = current
+                    && !text.is_empty()
+                {
+                    regions[index].sections.push(text);
+                }
+            }
+            NodeValue::Paragraph
+                if current.is_some() && plain_text(child).trim() == unreleased_heading =>
+            {
+                regions[current.expect("checked above")].unreleased = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates = Vec::<ChangelogSectionCandidate>::new();
+    for unreleased in [true, false] {
+        for region in regions
+            .iter()
+            .filter(|region| region.unreleased == unreleased)
+        {
+            for id in &region.sections {
+                if candidates.iter().any(|candidate| candidate.id == *id) {
+                    continue;
+                }
+                let occurrences = regions
+                    .iter()
+                    .flat_map(|region| &region.sections)
+                    .filter(|section| *section == id)
+                    .count();
+                candidates.push(ChangelogSectionCandidate {
+                    id: id.clone(),
+                    occurrences,
+                    appears_in_unreleased: regions
+                        .iter()
+                        .filter(|region| region.unreleased)
+                        .flat_map(|region| &region.sections)
+                        .any(|section| section == id),
+                });
+            }
+        }
+    }
+    candidates
 }
 
 /// Parses a released version section and returns deterministic carry fragments.
@@ -821,6 +924,136 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    #[test]
+    fn discovers_section_candidates_with_unreleased_entries_first() {
+        let changelog = "\
+Project changes
+===============
+
+Version 2.0.0
+-------------
+
+To be released.
+
+### core
+
+ -  Added a core feature.
+
+### Added
+
+ -  Added something else.
+
+### Version 9.9.9
+
+ -  This is a section heading, not a version region.
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+### cli
+
+ -  Added a command.
+
+### core
+
+ -  Fixed the core.
+
+ -  A nested heading:
+
+    ### ignored
+
+```markdown
+### also ignored
+```
+";
+
+        let candidates =
+            discover_section_candidates(changelog, "Project changes", "To be released.");
+
+        assert_eq!(
+            candidates,
+            vec![
+                ChangelogSectionCandidate {
+                    id: String::from("core"),
+                    occurrences: 2,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("Added"),
+                    occurrences: 1,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("Version 9.9.9"),
+                    occurrences: 1,
+                    appears_in_unreleased: true,
+                },
+                ChangelogSectionCandidate {
+                    id: String::from("cli"),
+                    occurrences: 1,
+                    appears_in_unreleased: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_candidates_below_a_literal_unreleased_heading() {
+        let candidates = discover_section_candidates(
+            "## Unreleased\n\n### server\n\n -  Added a server.\n",
+            "Project changes",
+            "To be released.",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![ChangelogSectionCandidate {
+                id: String::from("server"),
+                occurrences: 1,
+                appears_in_unreleased: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_a_version_shaped_document_title_and_its_preamble() {
+        for underline in ["===============", "---------------"] {
+            let changelog = format!(
+                "\
+Version history
+{underline}
+
+### Notation
+
+This heading describes the document.
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+### core
+
+ -  Added core.
+"
+            );
+
+            let candidates =
+                discover_section_candidates(&changelog, "Version history", "To be released.");
+
+            assert_eq!(
+                candidates,
+                vec![ChangelogSectionCandidate {
+                    id: String::from("core"),
+                    occurrences: 1,
+                    appears_in_unreleased: false,
+                }]
+            );
+        }
     }
 
     #[test]
