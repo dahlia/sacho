@@ -9,12 +9,13 @@ use jiff::{Timestamp, civil};
 use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
-    InitOptions, InitResult, MutationCleanupWarning, NextOptions, ReleaseDate, ReleaseOptions,
-    ShowOptions, SyncOptions, SyncPlan, add_fragment, apply_format, apply_merge_driver,
-    apply_release, apply_sync, carry, check, commit_message_hook, compile_unreleased,
-    infer_repository_url, infer_section_paths, init_repository, initialization_root,
-    mercurial_update_hook, plan_format, plan_release, plan_sync, reference_transaction_hook,
-    set_next_version, show, suggest_section_directory,
+    ImportUnreleasedOptions, ImportUnreleasedPlan, InitOptions, InitResult, MutationCleanupWarning,
+    NextOptions, ReleaseDate, ReleaseOptions, ShowOptions, SyncOptions, SyncPlan, add_fragment,
+    apply_format, apply_import_unreleased, apply_merge_driver, apply_release, apply_sync, carry,
+    check, commit_message_hook, compile_unreleased, infer_repository_url, infer_section_paths,
+    init_repository, initialization_root, mercurial_update_hook, plan_format,
+    plan_import_unreleased, plan_release, plan_sync, reference_transaction_hook, set_next_version,
+    show, suggest_section_directory,
 };
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::released::discover_section_candidates;
@@ -181,6 +182,13 @@ enum Command {
         /// Released version whose entries should be carried.
         #[arg(help = "Released version whose entries should be carried")]
         version: String,
+    },
+
+    /// Import the materialized unreleased region into fragments.
+    ImportUnreleased {
+        /// Apply even when normalized fragment output changes the region.
+        #[arg(long, help = "Apply even when normalization changes the changelog")]
+        force: bool,
     },
 
     /// Resolve changelog merge conflicts by recompiling fragments.
@@ -355,6 +363,22 @@ impl Cli {
                 print_mutation_cleanup_warnings("sacho carry", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
+            Command::ImportUnreleased { force } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force })?;
+                if !confirm_import_unreleased_plan(&plan)? {
+                    return Ok(ExitCode::from(2));
+                }
+                let result = apply_import_unreleased(&repo, plan)?;
+                print_mutation_cleanup_warnings(
+                    "sacho import-unreleased",
+                    &result.cleanup_warnings,
+                );
+                for path in result.written_fragments {
+                    println!("{}", path.display());
+                }
+                Ok(ExitCode::SUCCESS)
+            }
             Command::MergeDriver {
                 original,
                 current,
@@ -497,6 +521,29 @@ fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Resul
         eprintln!("synchronization cancelled; the repository was not changed");
         Ok(false)
     }
+}
+
+fn confirm_import_unreleased_plan(plan: &ImportUnreleasedPlan) -> Result<bool, CliReport> {
+    if !plan.requires_confirmation() {
+        return Ok(true);
+    }
+    let Some(diff) = &plan.diff else {
+        return Ok(true);
+    };
+    let interactive = sync_should_prompt(io::stdin().is_terminal(), io::stdout().is_terminal());
+    if interactive {
+        print!("{diff}");
+        println!("the imported fragments normalize the materialized unreleased region");
+        if prompt_bool("Apply this import", false)? {
+            return Ok(true);
+        }
+        eprintln!("import cancelled; the repository was not changed");
+    } else {
+        eprint!("{diff}");
+        eprintln!("the imported fragments normalize the materialized unreleased region");
+        eprintln!("rerun with `sacho import-unreleased --force` to apply it non-interactively");
+    }
+    Ok(false)
 }
 
 fn sync_should_prompt(stdin_terminal: bool, stdout_terminal: bool) -> bool {

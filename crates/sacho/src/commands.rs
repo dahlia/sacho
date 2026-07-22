@@ -29,7 +29,8 @@ use crate::fragment::{
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
-    carry_release, has_released_sections, insertion_title_span, render_released_section,
+    carry_release, has_released_sections, import_unreleased_region, insertion_title_span,
+    render_released_section,
 };
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
@@ -482,6 +483,52 @@ pub struct CarryResult {
 
     /// Synchronization result when materialization is enabled.
     pub sync: Option<SyncResult>,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
+}
+
+/// Options for importing the materialized unreleased changelog into fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportUnreleasedOptions {
+    /// Bypass confirmation when normalization changes the materialized region.
+    pub force: bool,
+}
+
+/// Planned import of the materialized unreleased changelog.
+///
+/// Planning is read-only. If [`Self::requires_confirmation`] returns true, a
+/// caller should show [`Self::diff`] and obtain confirmation before applying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportUnreleasedPlan {
+    /// Version inferred from the materialized heading.
+    pub inferred_version: Option<String>,
+
+    /// Fragment paths that will be created.
+    pub written_fragments: Vec<PathBuf>,
+
+    /// Normalization diff that requires confirmation, unless forced.
+    pub diff: Option<String>,
+
+    force: bool,
+    mutation: RepositoryMutationPlan,
+}
+
+impl ImportUnreleasedPlan {
+    /// Reports whether applying the plan needs caller confirmation.
+    pub fn requires_confirmation(&self) -> bool {
+        self.diff.is_some() && !self.force
+    }
+}
+
+/// Result of importing a materialized unreleased changelog.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportUnreleasedResult {
+    /// Fragment paths written by the import.
+    pub written_fragments: Vec<PathBuf>,
+
+    /// Version inferred from the materialized heading.
+    pub inferred_version: Option<String>,
 
     /// Non-fatal failures while removing committed transaction claims.
     pub cleanup_warnings: Vec<MutationCleanupWarning>,
@@ -1729,6 +1776,149 @@ pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     Ok(CarryResult {
         written_fragments,
         sync,
+        cleanup_warnings: outcome.cleanup_warnings,
+    })
+}
+
+/// Plans importing the materialized unreleased region into fragments.
+///
+/// The plan refuses repositories that already contain Markdown fragments and
+/// validates every generated fragment before returning. No file is changed
+/// until [`apply_import_unreleased`] is called.
+pub fn plan_import_unreleased(
+    repo: &Repository,
+    options: ImportUnreleasedOptions,
+) -> Result<ImportUnreleasedPlan> {
+    if !repo.config().changelog.materialize {
+        return Err(Error::UnreleasedImportRequiresMaterialization);
+    }
+    let before_sources = snapshot_release_fragment_sources(repo)?;
+    if !before_sources.is_empty() {
+        return Err(Error::UnreleasedImportExistingFragments);
+    }
+
+    let changelog_path = repo.config().changelog.path.clone();
+    let changelog_before = read_release_file_state(repo, &changelog_path)?;
+    let changelog =
+        release_file_state_utf8(repo, &changelog_path, &changelog_before)?.ok_or_else(|| {
+            Error::ReadFile {
+                path: repo.resolve(&changelog_path),
+                source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+            }
+        })?;
+    let region = find_unreleased_region(
+        changelog,
+        repo.config().changelog.region_detection,
+        &repo.config().changelog.unreleased_heading,
+    )
+    .map_err(|source| changelog_error(changelog_path.clone(), source))?;
+    let mut imported = import_unreleased_region(repo, &changelog[region.start..region.end])?;
+    for fragment in &mut imported.fragments {
+        fragment.markdown = format_fragment_source(&fragment.markdown)
+            .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
+        parse_fragment(
+            fragment.path.clone(),
+            &fragment.markdown,
+            fragment.section.clone(),
+            &repo.config().links,
+        )
+        .map_err(|source| Error::Fragment {
+            path: fragment.path.clone(),
+            source,
+        })?;
+    }
+
+    let next_path = next_version_path(repo);
+    let next_before = read_release_file_state(repo, &next_path)?;
+    let existing_version = release_next_version(repo, &next_path, &next_before)?;
+    if let Some(actual) = &existing_version
+        && imported.version.as_ref() != Some(actual)
+    {
+        return Err(Error::UnreleasedImportNextMismatch {
+            expected: imported
+                .version
+                .clone()
+                .unwrap_or_else(|| String::from("Unreleased")),
+            actual: actual.clone(),
+        });
+    }
+    let next_after = match (&imported.version, existing_version) {
+        (Some(version), None) => ReleaseFileState::Present(format!("{version}\n")),
+        _ => next_before.clone(),
+    };
+
+    let after_sources = imported
+        .fragments
+        .iter()
+        .map(|fragment| ReleaseFragmentSource {
+            path: fragment.path.clone(),
+            contents: fragment.markdown.as_bytes().to_vec(),
+            section: fragment.section.clone(),
+        })
+        .collect::<Vec<_>>();
+    let parsed_after = parse_release_fragment_sources(repo, &after_sources)?;
+    let next_contents = release_file_state_utf8(repo, &next_path, &next_after)?;
+    let version_label = version_label_from_contents(&repo.resolve(&next_path), next_contents)?;
+    let compiled =
+        compile_parsed_fragments(repo, CompileOptions::default(), version_label, parsed_after)?;
+    let (normalized_changelog, _) =
+        synchronize_materialized_changelog(repo, changelog, &compiled, &changelog_path)?;
+    let changelog_after = ReleaseFileState::Present(normalized_changelog.clone());
+    let diff =
+        (changelog != normalized_changelog).then(|| unified_diff(changelog, &normalized_changelog));
+
+    let written_fragments = imported
+        .fragments
+        .iter()
+        .map(|fragment| fragment.path.clone())
+        .collect::<Vec<_>>();
+    let mut participants = after_sources
+        .iter()
+        .map(|source| ReleaseFileChange {
+            path: source.path.clone(),
+            before: ReleaseFileState::Missing,
+            after: release_file_state_from_bytes(source.contents.clone()),
+        })
+        .collect::<Vec<_>>();
+    participants.push(ReleaseFileChange {
+        path: next_path,
+        before: next_before,
+        after: next_after,
+    });
+    participants.push(ReleaseFileChange {
+        path: changelog_path,
+        before: changelog_before,
+        after: changelog_after,
+    });
+
+    Ok(ImportUnreleasedPlan {
+        inferred_version: imported.version,
+        written_fragments: written_fragments.clone(),
+        diff,
+        force: options.force,
+        mutation: RepositoryMutationPlan {
+            command: MutationCommand::ImportUnreleased,
+            participants,
+            fragment_paths_before: Vec::new(),
+            fragment_paths_after: written_fragments,
+        },
+    })
+}
+
+/// Applies a previously planned unreleased import transaction.
+///
+/// Every generated fragment, the next-version file, and the materialized
+/// changelog are committed together. Stale inputs and concurrent fragment
+/// additions are rejected before the first write.
+pub fn apply_import_unreleased(
+    repo: &Repository,
+    plan: ImportUnreleasedPlan,
+) -> Result<ImportUnreleasedResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    let outcome = apply_repository_mutation(repo, &plan.mutation)?;
+    Ok(ImportUnreleasedResult {
+        written_fragments: plan.written_fragments,
+        inferred_version: plan.inferred_version,
         cleanup_warnings: outcome.cleanup_warnings,
     })
 }
@@ -7575,6 +7765,167 @@ mod tests {
         .expect_err("missing version");
 
         assert!(matches!(carry_error, Error::ReleasedVersionNotFound { .. }));
+    }
+
+    #[test]
+    fn import_unreleased_plans_before_writing_and_preserves_released_bytes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        let released = "Version 2.3.0\n-------------\n\nReleased on July 1, 2026.\n\n -  Shipped the previous release.\n";
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!(
+                "Version 2.4.0\n-------------\n\nTo be released.\n\n- Added import support.\n\n{released}"
+            ),
+        )
+        .expect("changelog");
+
+        let plan =
+            plan_import_unreleased(&repo, ImportUnreleasedOptions { force: false }).expect("plan");
+
+        assert!(plan.requires_confirmation());
+        assert_eq!(plan.inferred_version.as_deref(), Some("2.4.0"));
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/imported-unreleased.md")
+                .exists()
+        );
+        assert!(!temp.path().join("changes.d/next").exists());
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("forced plan");
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![PathBuf::from("changes.d/imported-unreleased.md")]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.4.0\n"
+        );
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.ends_with(released));
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    #[test]
+    fn import_unreleased_rejects_existing_fragments_without_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/existing.md"), " -  Existing.\n")
+            .expect("existing fragment");
+        let changelog = "Unreleased\n----------\n\nTo be released.\n\n -  Added import support.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("existing fragment");
+
+        assert!(matches!(error, Error::UnreleasedImportExistingFragments));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/imported-unreleased.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn import_unreleased_requires_materialized_changelog() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("materialized changelog required");
+
+        assert!(matches!(
+            error,
+            Error::UnreleasedImportRequiresMaterialization
+        ));
+    }
+
+    #[test]
+    fn import_unreleased_rejects_mismatched_next_version_without_writes() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/next"), "2.5.0\n").expect("next");
+        let changelog =
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Added import support.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+        let error = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect_err("mismatched next version");
+
+        assert!(matches!(
+            error,
+            Error::UnreleasedImportNextMismatch {
+                expected,
+                actual
+            } if expected == "2.4.0" && actual == "2.5.0"
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.5.0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+    }
+
+    #[test]
+    fn import_unreleased_accepts_matching_next_version() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(temp.path().join("changes.d/next"), "2.4.0\n").expect("next");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Added import support.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("matching next version");
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+
+        assert_eq!(result.inferred_version.as_deref(), Some("2.4.0"));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/next")).expect("next"),
+            "2.4.0\n"
+        );
+    }
+
+    #[test]
+    fn import_unreleased_without_version_keeps_next_file_absent() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Unreleased\n----------\n\nTo be released.\n\n- Added import support.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("version-less plan");
+
+        assert!(plan.diff.is_some());
+        assert!(!plan.requires_confirmation());
+        let result = apply_import_unreleased(&repo, plan).expect("apply");
+        assert_eq!(result.inferred_version, None);
+        assert!(!temp.path().join("changes.d/next").exists());
     }
 
     #[test]
