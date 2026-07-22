@@ -792,7 +792,7 @@ pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
         slug.push_str("section");
     }
 
-    for suffix in 1.. {
+    for suffix in 1..=used.len() + 1 {
         let candidate = if suffix == 1 {
             PathBuf::from(&slug)
         } else {
@@ -802,7 +802,7 @@ pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
             return candidate;
         }
     }
-    unreachable!("an unbounded numeric suffix must produce an unused path")
+    unreachable!("one more candidate than used paths must produce an unused path")
 }
 
 /// Finds repository directories whose basename resembles a section.
@@ -848,7 +848,7 @@ pub fn infer_section_paths(
                 continue;
             }
             let path = relative.join(entry.file_name());
-            if path == fragment_directory || path.starts_with(fragment_directory) {
+            if path == fragment_directory {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -874,10 +874,7 @@ pub fn infer_section_paths(
         .and_then(OsStr::to_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let mut wanted = vec![id_stem];
-    if !directory_stem.is_empty() && !wanted.contains(&directory_stem) {
-        wanted.push(directory_stem);
-    }
+    let wanted = vec![id_stem, directory_stem];
     let mut matches = Vec::new();
     visit(
         root.as_ref(),
@@ -6228,6 +6225,35 @@ mod tests {
                 String::from("packages/core/**")
             ]
         );
+    }
+
+    #[test]
+    fn section_path_inference_matches_distinct_id_and_directory_stems() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("id directory");
+        fs::create_dir_all(temp.path().join("crates/cli")).expect("section directory");
+
+        let paths = infer_section_paths(
+            temp.path(),
+            "@example/core",
+            Path::new("cli"),
+            Path::new("changes.d"),
+        )
+        .expect("path suggestions");
+
+        assert_eq!(paths, vec!["crates/cli/**", "packages/core/**"]);
+    }
+
+    #[test]
+    fn section_path_inference_reports_an_unreadable_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("not-a-directory");
+        fs::write(&root, "file").expect("root file");
+
+        let error = infer_section_paths(&root, "core", Path::new("core"), Path::new("changes.d"))
+            .expect_err("root read error");
+
+        assert!(matches!(error, Error::ReadFile { path, .. } if path == root));
     }
 
     #[cfg(unix)]
