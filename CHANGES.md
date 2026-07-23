@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.2.0
 -------------
 
-To be released.
+Released on July 23, 2026.
 
  -  Added optional HTTP redirect resolution for fragment references, including
     persistent per-fragment URL pins and command-line overrides for previews,
