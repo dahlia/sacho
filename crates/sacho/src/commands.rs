@@ -3214,6 +3214,9 @@ fn missing_fragment_requirements(
             repository_paths.push(path.clone());
         } else {
             for section in matched_sections {
+                if section.pattern_index.is_some() && !section_paths.contains_key(&section.id) {
+                    repo.validate_pattern_section_directory(&section.directory)?;
+                }
                 section_paths
                     .entry(section.id)
                     .or_default()
@@ -15525,6 +15528,32 @@ priority: 0
         let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
 
         assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn layer_three_rejects_a_patterned_section_overlapping_the_next_file() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        );
+
+        let error =
+            missing_fragment_requirements(&repo, &[PathBuf::from("packages/next/src/lib.rs")])
+                .expect_err("next-file overlap");
+
+        let message = error.to_string();
+        assert!(message.contains("fragments.next-file"), "{message}");
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
     }
 
     #[test]
