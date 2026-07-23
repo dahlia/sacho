@@ -10,9 +10,10 @@ To be released.
     release notes without Sacho's canonical 80-column wrapping.  [[#3]]
  -  Added section patterns for deriving changelog sections from repository
     layouts, so package-oriented repositories no longer need to list every
-    package separately.
+    package separately.  [[#4]]
 
 [#3]: https://github.com/dahlia/sacho/pull/3
+[#4]: https://github.com/dahlia/sacho/pull/4
 
 
 Version 0.2.0
