@@ -43,6 +43,17 @@ pub(crate) fn is_http_reference_url(value: &str) -> bool {
     )
 }
 
+pub(crate) fn validate_http_url(value: &str) -> std::result::Result<Url, String> {
+    let url = Url::parse(value).map_err(|source| source.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(String::from("scheme must be http or https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(String::from("userinfo is not allowed"));
+    }
+    Ok(url)
+}
+
 /// Resolves one expanded reference URL and returns its final effective URL.
 pub fn resolve_reference_url(label: &str, source_url: &str) -> Result<String> {
     ReferenceUrlResolver::new().resolve(label, source_url)
@@ -136,7 +147,8 @@ fn request_following_redirects(
         let next = current.join(location).map_err(|source| {
             link_resolution_failure(label, location, format!("invalid redirect URL: {source}"))
         })?;
-        validate_request_url(label, next.as_str())?;
+        let next = validate_request_url(label, next.as_str())?;
+        validate_redirect_transition(label, &current, &next)?;
         current = next;
     }
     unreachable!("the redirect loop always returns")
@@ -159,23 +171,18 @@ fn resolved_response_url(
 }
 
 fn validate_request_url(label: &str, value: &str) -> Result<Url> {
-    let url = Url::parse(value)
-        .map_err(|source| link_resolution_failure(label, value, source.to_string()))?;
-    if !matches!(url.scheme(), "http" | "https") {
+    validate_http_url(value).map_err(|reason| link_resolution_failure(label, value, reason))
+}
+
+fn validate_redirect_transition(label: &str, current: &Url, next: &Url) -> Result<()> {
+    if current.scheme() == "https" && next.scheme() == "http" {
         return Err(link_resolution_failure(
             label,
-            value,
-            "scheme must be http or https",
+            next.as_str(),
+            "HTTPS redirects must not downgrade to HTTP",
         ));
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(link_resolution_failure(
-            label,
-            value,
-            "userinfo is not allowed",
-        ));
-    }
-    Ok(url)
+    Ok(())
 }
 
 fn resolution_error(label: &str, url: &str, source: ureq::Error) -> Error {
@@ -513,5 +520,26 @@ mod tests {
         ));
         assert_eq!(source.finish(), vec!["HEAD /issues/11 HTTP/1.1"]);
         assert_eq!(target.finish(), vec!["HEAD /test-server-shutdown HTTP/1.1"]);
+    }
+
+    #[test]
+    fn rejects_https_redirect_downgrades() {
+        let current = Url::parse("https://example.com/issues/12").expect("current URL");
+        let next = Url::parse("http://example.com/pull/12").expect("next URL");
+
+        let error = validate_redirect_transition("#12", &current, &next)
+            .expect_err("HTTPS downgrade must fail");
+
+        assert!(matches!(
+            error,
+            Error::LinkResolutionFailed { ref label, ref reason, .. }
+                if label == "#12" && reason.contains("downgrade")
+        ));
+    }
+
+    #[test]
+    fn allows_private_hosts_for_configured_self_hosted_trackers() {
+        assert!(validate_http_url("http://127.0.0.1/issues/13").is_ok());
+        assert!(validate_http_url("https://10.0.0.1/issues/13").is_ok());
     }
 }

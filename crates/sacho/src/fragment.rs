@@ -9,13 +9,13 @@ use comrak::{Arena, Options as ComrakOptions, parse_document};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use snafu::ResultExt;
-use url::Url;
 
 use crate::config::{ReferenceSigil, UrlTemplate};
 use crate::error::{
     FragmentError, FrontmatterSnafu, ReadFileSnafu, Result, UnclosedFrontmatterSnafu,
     UnknownReferenceSnafu, redact_url_credentials,
 };
+use crate::link_resolution::validate_http_url;
 use crate::repo::Repository;
 
 /// Parsed changelog fragment.
@@ -472,26 +472,13 @@ pub(crate) fn validate_resolved_link(
     label: &str,
     value: &str,
 ) -> std::result::Result<(), FragmentError> {
-    let url = Url::parse(value).map_err(|source| FragmentError::InvalidResolvedLink {
-        label: label.to_owned(),
-        url: redact_url_credentials(value),
-        reason: source.to_string(),
-    })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(FragmentError::InvalidResolvedLink {
+    validate_http_url(value)
+        .map(drop)
+        .map_err(|reason| FragmentError::InvalidResolvedLink {
             label: label.to_owned(),
             url: redact_url_credentials(value),
-            reason: String::from("scheme must be http or https"),
-        });
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(FragmentError::InvalidResolvedLink {
-            label: label.to_owned(),
-            url: redact_url_credentials(value),
-            reason: String::from("userinfo is not allowed"),
-        });
-    }
-    Ok(())
+            reason,
+        })
 }
 
 fn comrak_options() -> ComrakOptions<'static> {
