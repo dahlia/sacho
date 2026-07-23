@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -59,6 +60,7 @@ pub(crate) struct SectionResolver<'a> {
     explicit: &'a [SectionConfig],
     patterns: &'a [SectionPatternConfig],
     explicit_paths: Vec<globset::GlobSet>,
+    pattern_path_matchers: RefCell<BTreeMap<String, globset::GlobMatcher>>,
 }
 
 impl<'a> SectionResolver<'a> {
@@ -87,6 +89,7 @@ impl<'a> SectionResolver<'a> {
             explicit,
             patterns,
             explicit_paths,
+            pattern_path_matchers: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -105,9 +108,11 @@ impl<'a> SectionResolver<'a> {
                 continue;
             };
             let candidate = instantiate(pattern, index, &captures)?;
-            if let Some(section) = self.explicit.iter().find(|section| {
-                section.id == candidate.id || section.directory == candidate.directory
-            }) {
+            if let Some(section) = self
+                .explicit
+                .iter()
+                .find(|section| section.directory == candidate.directory)
+            {
                 shadowed.get_or_insert_with(|| SectionResolutionError::Shadowed {
                     requested_id: id.to_owned(),
                     explicit_id: section.id.clone(),
@@ -147,9 +152,11 @@ impl<'a> SectionResolver<'a> {
                 continue;
             };
             let candidate = instantiate(pattern, index, &captures)?;
-            if !self.explicit.iter().any(|section| {
-                section.id == candidate.id || section.directory == candidate.directory
-            }) {
+            if !self
+                .explicit
+                .iter()
+                .any(|section| section.id == candidate.id)
+            {
                 candidates.push(candidate);
             }
         }
@@ -184,13 +191,7 @@ impl<'a> SectionResolver<'a> {
                     for path_pattern in paths {
                         let rendered = path_pattern
                             .render_glob_with_literal_prefix(&pattern.source, &captures)?;
-                        let matcher = globset::Glob::new(&rendered)
-                            .map_err(|source| SectionResolutionError::InvalidGlob {
-                                pattern: rendered,
-                                source,
-                            })?
-                            .compile_matcher();
-                        matched |= matcher.is_match(path);
+                        matched |= self.pattern_path_is_match(&rendered, path)?;
                     }
                     matched
                 }
@@ -209,6 +210,35 @@ impl<'a> SectionResolver<'a> {
             resolved.push(candidate);
         }
         Ok(resolved)
+    }
+
+    fn pattern_path_is_match(
+        &self,
+        rendered: &str,
+        path: &Path,
+    ) -> Result<bool, SectionResolutionError> {
+        if let Some(matched) = {
+            let matchers = self.pattern_path_matchers.borrow();
+            matchers.get(rendered).map(|matcher| matcher.is_match(path))
+        } {
+            return Ok(matched);
+        }
+        let matcher = globset::Glob::new(rendered)
+            .map_err(|source| SectionResolutionError::InvalidGlob {
+                pattern: rendered.to_owned(),
+                source,
+            })?
+            .compile_matcher();
+        let matched = matcher.is_match(path);
+        self.pattern_path_matchers
+            .borrow_mut()
+            .insert(rendered.to_owned(), matcher);
+        Ok(matched)
+    }
+
+    #[cfg(test)]
+    fn cached_pattern_glob_count(&self) -> usize {
+        self.pattern_path_matchers.borrow().len()
     }
 
     pub(crate) fn ordered_present(
@@ -490,6 +520,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_path_matchers_are_cached_by_rendered_glob() {
+        let patterns = [pattern(
+            "packages/{name}",
+            "{name}",
+            "{name}",
+            Some(&["packages/{name}/src/**"]),
+        )];
+        let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
+
+        resolver
+            .resolve_source_path(Path::new("packages/core/src/lib.rs"))
+            .expect("first source");
+        resolver
+            .resolve_source_path(Path::new("packages/core/src/parser.rs"))
+            .expect("same capture");
+        assert_eq!(resolver.cached_pattern_glob_count(), 1);
+
+        resolver
+            .resolve_source_path(Path::new("packages/cli/src/main.rs"))
+            .expect("different capture");
+        assert_eq!(resolver.cached_pattern_glob_count(), 2);
+    }
+
+    #[test]
     fn explicit_sections_suppress_colliding_pattern_instances() {
         let explicit = [explicit("@acme/core", "special", &["special-source/**"])];
         let patterns = [pattern("packages/{name}", "@acme/{name}", "{name}", None)];
@@ -538,6 +592,12 @@ mod tests {
                 .expect("explicit")
                 .id,
             "special"
+        );
+        assert!(
+            resolver
+                .resolve_source_path(Path::new("packages/core/src/lib.rs"))
+                .expect("source")
+                .is_empty()
         );
     }
 
