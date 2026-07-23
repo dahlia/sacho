@@ -82,7 +82,9 @@ it also registers merge drivers in *.gitattributes* and the local Git config.
 Interactive setup can infer issue links from the repository remote and offer to
 install commit hooks. When *CHANGES.md* already exists, it can also offer
 level-three headings found across the changelog as section ids, then suggest
-fragment directories and source path globs for the selected sections.
+fragment directories and source path globs for the selected sections. If two
+or more selected ids map to one unambiguous sibling package directory, Sacho
+offers to store them as one section pattern instead.
 
 Use `sacho init --interactive` to ask the setup questions even when automatic
 detection would otherwise be enough. For scripts, `--no-interactive` prevents

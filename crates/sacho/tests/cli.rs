@@ -498,6 +498,87 @@ fn init_interactive_configures_selected_changelog_sections() {
 }
 
 #[test]
+fn init_interactive_collapses_sibling_packages_into_a_section_pattern() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+    std::fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Project changes
+===============
+
+Version 2.0.0
+-------------
+
+To be released.
+
+### @example/core
+
+ -  Added core.
+
+### @example/cli
+
+ -  Added CLI.
+",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["init"], "\n\n\n1,2\n\n\n\n");
+
+    assert!(success, "{output}");
+    assert!(
+        output.contains("Use inferred section pattern packages/{name} -> @example/{name}"),
+        "{output}"
+    );
+    let config = std::fs::read_to_string(temp.path().join("sacho.toml")).expect("configuration");
+    assert!(config.contains("[[section-patterns]]"), "{config}");
+    assert!(config.contains("source = \"packages/{name}\""), "{config}");
+    assert!(config.contains("id = \"@example/{name}\""), "{config}");
+    assert!(config.contains("directory = \"{name}\""), "{config}");
+    assert!(!config.contains("[[sections]]"), "{config}");
+}
+
+#[test]
+fn init_interactive_can_decline_an_inferred_section_pattern() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+    std::fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Project changes
+===============
+
+Version 2.0.0
+-------------
+
+To be released.
+
+### @example/core
+
+ -  Added core.
+
+### @example/cli
+
+ -  Added CLI.
+",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["init"], "\n\n\n1,2\nn\n\n\n\n\n\n");
+
+    assert!(success, "{output}");
+    let config = std::fs::read_to_string(temp.path().join("sacho.toml")).expect("configuration");
+    assert_eq!(config.matches("[[sections]]").count(), 2, "{config}");
+    assert!(config.contains("id = \"@example/core\""), "{config}");
+    assert!(config.contains("id = \"@example/cli\""), "{config}");
+    assert!(!config.contains("[[section-patterns]]"), "{config}");
+}
+
+#[test]
 fn init_discovers_a_markerless_git_worktree_from_the_environment() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let metadata_worktree = temp.path().join("metadata-worktree");

@@ -34,6 +34,12 @@ paths = [
 ]
 ~~~~
 
+A first-time interactive `sacho init` can suggest this shape when an existing
+changelog has headings such as `@acme/core` and `@acme/parser`, and both names
+map to sibling directories below *packages/*. The suggestion is made only when
+there is one unambiguous common parent. You can decline it and configure the
+selected headings as explicit sections instead.
+
 A change to *packages/parser/src/lib.rs* now requires a fragment in the
 `@acme/parser` section. Create it with:
 

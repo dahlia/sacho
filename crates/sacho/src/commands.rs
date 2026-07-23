@@ -46,6 +46,7 @@ use crate::repo::{
     validate_repository_config_paths_with_cache,
 };
 use crate::section::{SectionResolver, has_sections};
+use crate::section_pattern::{SectionPattern, SectionPatternConfig};
 use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, HgVcs, JjVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
@@ -85,6 +86,9 @@ pub struct InitOptions {
 
     /// Sections selected while creating new configuration.
     pub sections: Vec<SectionConfig>,
+
+    /// Section patterns selected while creating new configuration.
+    pub section_patterns: Vec<SectionPatternConfig>,
 }
 
 /// Result of bootstrapping Sacho in a repository.
@@ -935,6 +939,84 @@ pub fn infer_section_paths(
     matches.sort();
     matches.dedup();
     Ok(matches)
+}
+
+/// Infers one reversible section pattern from selected changelog section ids.
+///
+/// Inference succeeds only when at least two ids share the same prefix and
+/// their final components name sibling directories under exactly one common
+/// repository path.
+pub fn infer_section_pattern(
+    root: impl AsRef<Path>,
+    ids: &[String],
+    fragment_directory: &Path,
+) -> Result<Option<SectionPatternConfig>> {
+    if ids.len() < 2 {
+        return Ok(None);
+    }
+
+    let capture_pattern =
+        SectionPattern::from_str("{name}").expect("the built-in single-capture pattern is valid");
+    let mut id_prefix = None::<&str>;
+    let mut common_parents = None::<BTreeSet<String>>;
+    let mut capture_values = BTreeSet::new();
+    for id in ids {
+        let stem = id.rsplit('/').next().unwrap_or(id);
+        if capture_pattern.captures(stem).is_none() || !capture_values.insert(stem) {
+            return Ok(None);
+        }
+        let prefix = &id[..id.len() - stem.len()];
+        match id_prefix {
+            Some(expected) if expected != prefix => return Ok(None),
+            None => id_prefix = Some(prefix),
+            _ => {}
+        }
+
+        let parents = infer_section_paths(root.as_ref(), id, Path::new(stem), fragment_directory)?
+            .into_iter()
+            .filter_map(|path| path.strip_suffix("/**").map(str::to_owned))
+            .filter_map(|path| {
+                let (parent, name) = path.rsplit_once('/')?;
+                (name == stem).then(|| parent.to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        common_parents = Some(match common_parents {
+            Some(common) => common.intersection(&parents).cloned().collect(),
+            None => parents,
+        });
+    }
+
+    let mut parents = common_parents.unwrap_or_default().into_iter();
+    let Some(parent) = parents.next() else {
+        return Ok(None);
+    };
+    if parents.next().is_some() {
+        return Ok(None);
+    }
+    let parent = escape_section_pattern_literal(&parent);
+    let prefix = escape_section_pattern_literal(id_prefix.unwrap_or_default());
+    let source = format!("{parent}/{capture_pattern}");
+    let id = format!("{prefix}{capture_pattern}");
+    let Ok(source) = SectionPattern::from_str(&source) else {
+        return Ok(None);
+    };
+    let Ok(id) = SectionPattern::from_str(&id) else {
+        return Ok(None);
+    };
+    let pattern = SectionPatternConfig {
+        source,
+        id,
+        directory: capture_pattern,
+        paths: None,
+    };
+    if pattern.validate().is_err() {
+        return Ok(None);
+    }
+    Ok(Some(pattern))
+}
+
+fn escape_section_pattern_literal(value: &str) -> String {
+    value.replace('{', "{{").replace('}', "}}")
 }
 
 fn load_init_config(
@@ -5582,6 +5664,9 @@ fn default_init_config(root: &Path, options: &InitOptions) -> Result<Config> {
         config.changelog.materialize = materialize;
     }
     config.sections.clone_from(&options.sections);
+    config
+        .section_patterns
+        .clone_from(&options.section_patterns);
     for section in &config.sections {
         compile_glob_set(&section.paths)?;
     }
@@ -5656,6 +5741,27 @@ fn render_init_config(config: &Config) -> String {
             toml_basic_string(&section.directory.display().to_string())
         ));
         output.push_str(&format!("paths = {}\n", toml_string_array(&section.paths)));
+    }
+    for pattern in &config.section_patterns {
+        output.push_str("\n[[section-patterns]]\n");
+        output.push_str(&format!(
+            "source = {}\n",
+            toml_basic_string(&pattern.source.to_string())
+        ));
+        output.push_str(&format!(
+            "id = {}\n",
+            toml_basic_string(&pattern.id.to_string())
+        ));
+        output.push_str(&format!(
+            "directory = {}\n",
+            toml_basic_string(&pattern.directory.to_string())
+        ));
+        if let Some(paths) = &pattern.paths {
+            output.push_str(&format!(
+                "paths = {}\n",
+                toml_string_array(&paths.iter().map(ToString::to_string).collect::<Vec<_>>())
+            ));
+        }
     }
     output
 }
@@ -6702,6 +6808,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: Some(String::from("   ")),
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("blank repository URL");
@@ -6730,6 +6837,29 @@ mod tests {
         assert!(!rendered.contains("\\u{"));
         assert!(rendered.contains("directory = \"core\""));
         assert!(rendered.contains("paths = [\"packages/core/**\"]"));
+    }
+
+    #[test]
+    fn init_config_renders_selected_section_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("pattern inference");
+        let options = InitOptions {
+            section_patterns: pattern.into_iter().collect(),
+            ..InitOptions::default()
+        };
+        let config = default_init_config(temp.path(), &options).expect("init config");
+        let rendered = render_init_config(&config);
+        let reparsed = Config::parse(&rendered).expect("rendered config");
+
+        assert_eq!(reparsed.section_patterns, options.section_patterns);
+        assert!(rendered.contains("[[section-patterns]]"));
     }
 
     #[test]
@@ -6795,6 +6925,89 @@ mod tests {
         .expect("path suggestions");
 
         assert_eq!(paths, vec!["crates/cli/**", "packages/core/**"]);
+    }
+
+    #[test]
+    fn infers_a_section_pattern_from_selected_sibling_packages() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("pattern inference")
+        .expect("one pattern");
+
+        assert_eq!(pattern.source.to_string(), "packages/{name}");
+        assert_eq!(pattern.id.to_string(), "@example/{name}");
+        assert_eq!(pattern.directory.to_string(), "{name}");
+        assert_eq!(pattern.paths, None);
+    }
+
+    #[test]
+    fn does_not_infer_a_section_pattern_from_ambiguous_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        for path in [
+            "packages/core",
+            "packages/cli",
+            "examples/core",
+            "examples/cli",
+        ] {
+            fs::create_dir_all(temp.path().join(path)).expect("package");
+        }
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("pattern inference");
+
+        assert_eq!(pattern, None);
+    }
+
+    #[test]
+    fn section_pattern_inference_rejects_duplicates_and_escapes_literal_braces() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("groups/{legacy}/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("groups/{legacy}/cli")).expect("cli package");
+
+        let duplicate = infer_section_pattern(
+            temp.path(),
+            &["team{old}/core".to_owned(), "team{old}/core".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("duplicate inference");
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["team{old}/core".to_owned(), "team{old}/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("pattern inference")
+        .expect("one pattern");
+
+        assert_eq!(duplicate, None);
+        assert_eq!(pattern.source.to_string(), "groups/{{legacy}}/{name}");
+        assert_eq!(pattern.id.to_string(), "team{{old}}/{name}");
+    }
+
+    #[test]
+    fn section_pattern_inference_falls_back_for_an_invalid_id_template() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["/packages/core".to_owned(), "/packages/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("best-effort inference");
+
+        assert_eq!(pattern, None);
     }
 
     #[test]
@@ -7288,6 +7501,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7320,6 +7534,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("concurrent init lock");
@@ -7345,6 +7560,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("mutation lock changelog");
@@ -7376,6 +7592,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("Git mutation lock changelog");
@@ -7406,6 +7623,7 @@ mod tests {
                     append_existing_hook: false,
                     repository_url: None,
                     sections: Vec::new(),
+                    section_patterns: Vec::new(),
                 },
             )
             .expect_err("future VCS lock parent");
@@ -7438,6 +7656,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("inactive Git lock parent");
@@ -7483,6 +7702,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7513,6 +7733,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -7546,6 +7767,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("configuration changelog alias");
@@ -7616,6 +7838,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7644,6 +7867,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7667,6 +7891,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7696,6 +7921,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect("init");
@@ -7730,6 +7956,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("fragment path conflict");
@@ -7754,6 +7981,7 @@ mod tests {
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         )
         .expect_err("changelog path conflict");
@@ -11511,6 +11739,7 @@ links:
                 append_existing_hook: false,
                 repository_url: None,
                 sections: Vec::new(),
+                section_patterns: Vec::new(),
             },
         ));
         assert_mutation_locked(add_fragment(
