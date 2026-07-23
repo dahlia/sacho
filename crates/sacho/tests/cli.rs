@@ -903,6 +903,58 @@ fn preview_prints_empty_unreleased_region() {
 }
 
 #[test]
+fn preview_no_word_wrap_joins_soft_breaks_and_preserves_hard_breaks() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/no-word-wrap.md"),
+        concat!(
+            " -  Added a deliberately long release note that must stay on one physical line ",
+            "when it is published through GitHub Releases.  ",
+            "\n",
+            "    This intentional hard break remains visible.\n",
+        ),
+    )
+    .expect("fragment");
+    let mut wrapped_command = Command::cargo_bin("sacho").expect("binary");
+    let wrapped_output = wrapped_command
+        .current_dir(temp.path())
+        .arg("preview")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let wrapped_output = String::from_utf8(wrapped_output).expect("UTF-8 preview");
+    assert!(
+        wrapped_output.lines().all(|line| line.len() <= 80),
+        "{wrapped_output}"
+    );
+    assert!(!wrapped_output.contains(
+        " -  Added a deliberately long release note that must stay on one physical line when it is published through GitHub Releases."
+    ));
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args(["preview", "--no-word-wrap"])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "Unreleased\n",
+            "----------\n",
+            "\n",
+            "To be released.\n",
+            "\n",
+            " -  Added a deliberately long release note that must stay on one physical line ",
+            "when it is published through GitHub Releases.  ",
+            "\n",
+            "    This intentional hard break remains visible.\n",
+        ));
+}
+
+#[test]
 fn preview_uses_configured_link_resolution_without_writing_fragments() {
     let (base, request) = one_request_http_server();
     let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1127,7 +1179,9 @@ fn preview_help_describes_section_option() {
         ))
         .stdout(predicate::str::contains("Section id to preview by itself"))
         .stdout(predicate::str::contains("--resolve-links"))
-        .stdout(predicate::str::contains("--no-resolve-links"));
+        .stdout(predicate::str::contains("--no-resolve-links"))
+        .stdout(predicate::str::contains("--no-word-wrap"))
+        .stdout(predicate::str::contains("Do not word-wrap the output"));
 }
 
 #[test]
@@ -1244,6 +1298,75 @@ Released on July 19, 2026.
 ",
             );
     }
+}
+
+#[test]
+fn show_no_word_wrap_writes_unwrapped_release_notes_to_a_file() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        concat!(
+            "Version 1.2.0\n",
+            "-------------\n",
+            "\n",
+            "Released on July 19, 2026.\n",
+            "\n",
+            " -  Added a deliberately long release note that must stay on one physical line ",
+            "when it is published through GitHub Releases.  ",
+            "\n",
+            "    This intentional hard break remains visible.\n",
+        ),
+    )
+    .expect("changelog");
+    let mut wrapped_command = Command::cargo_bin("sacho").expect("binary");
+    let wrapped_output = wrapped_command
+        .current_dir(temp.path())
+        .args(["show", "1.2.0"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let wrapped_output = String::from_utf8(wrapped_output).expect("UTF-8 released section");
+    assert!(
+        wrapped_output.lines().all(|line| line.len() <= 80),
+        "{wrapped_output}"
+    );
+    assert!(!wrapped_output.contains(
+        " -  Added a deliberately long release note that must stay on one physical line when it is published through GitHub Releases."
+    ));
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .args([
+            "show",
+            "1.2.0",
+            "--skip-heading",
+            "--no-word-wrap",
+            "--output-file",
+            "release-notes.md",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("release-notes.md")).expect("output"),
+        concat!(
+            "Released on July 19, 2026.\n",
+            "\n",
+            " -  Added a deliberately long release note that must stay on one physical line ",
+            "when it is published through GitHub Releases.  ",
+            "\n",
+            "    This intentional hard break remains visible.\n",
+        )
+    );
 }
 
 #[test]
@@ -1540,7 +1663,9 @@ fn show_help_describes_version_argument() {
         .stdout(predicate::str::contains("-o, --output-file <PATH>"))
         .stdout(predicate::str::contains(
             "Write the released section to a file",
-        ));
+        ))
+        .stdout(predicate::str::contains("--no-word-wrap"))
+        .stdout(predicate::str::contains("Do not word-wrap the output"));
 }
 
 #[test]

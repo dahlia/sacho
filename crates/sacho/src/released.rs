@@ -12,7 +12,7 @@ use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
 use crate::config::SectionConfig;
 use crate::error::{Error, Result};
 use crate::fragment::{is_complete_reference_label, validate_resolved_link};
-use crate::markdown::format_markdown;
+use crate::markdown::format_markdown_with_word_wrap;
 use crate::repo::Repository;
 
 /// Entries decompiled from a released changelog section.
@@ -423,11 +423,12 @@ pub(crate) fn render_released_section(
     version: &str,
     unreleased_region: Option<UnreleasedRegionSpan>,
     skip_heading: bool,
+    word_wrap: bool,
 ) -> Result<Option<ReleasedSection>> {
     let Some(target) = find_target_section(source, version, unreleased_region) else {
         return Ok(None);
     };
-    let markdown = render_target_section(source, &target, skip_heading)?;
+    let markdown = render_target_section(source, &target, skip_heading, word_wrap)?;
     Ok(Some(ReleasedSection {
         version: version.to_owned(),
         markdown,
@@ -438,6 +439,7 @@ fn render_target_section(
     source: &str,
     target: &TargetSection<'_>,
     skip_heading: bool,
+    word_wrap: bool,
 ) -> Result<String> {
     let arena = Arena::new();
     let options = comrak_options();
@@ -469,7 +471,7 @@ fn render_target_section(
     let mut rendered = String::new();
     format_commonmark(section, &options, &mut rendered)
         .expect("writing CommonMark to a String cannot fail");
-    format_markdown(&rendered)
+    format_markdown_with_word_wrap(&rendered, word_wrap)
 }
 
 fn referenced_footnote_definitions<'a>(

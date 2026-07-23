@@ -89,10 +89,11 @@ sacho show 1.2.0
 ~~~~
 
 Use `--skip-heading` when the release platform already displays the version,
-and `--output-file` to write the result directly:
+`--no-word-wrap` when it displays soft line breaks, and `--output-file` to write
+the result directly:
 
 ~~~~ sh
-sacho show 1.2.0 --skip-heading --output-file release-notes.md
+sacho show 1.2.0 --skip-heading --no-word-wrap --output-file release-notes.md
 ~~~~
 
 A GitHub Actions job triggered by a `v1.2.0` tag can publish that file with the
@@ -100,12 +101,13 @@ GitHub CLI:
 
 ~~~~ sh
 version="${GITHUB_REF_NAME#v}"
-sacho show "$version" --skip-heading --output-file release-notes.md
+sacho show "$version" --skip-heading --no-word-wrap --output-file release-notes.md
 gh release create "$GITHUB_REF_NAME" --notes-file release-notes.md
 ~~~~
 
 `show` reads only released sections. It does not compile current fragments or
-return an unreleased preview.
+return an unreleased preview. The no-wrap rendering changes only the exported
+Markdown and preserves intentional hard breaks.
 
 
 Forward-port release notes
