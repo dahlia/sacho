@@ -518,6 +518,9 @@ pub struct ShowOptions {
 
     /// Whether to omit the released version heading from the returned Markdown.
     pub skip_heading: bool,
+
+    /// Whether to wrap returned Markdown at Sacho's canonical line width.
+    pub word_wrap: bool,
 }
 
 /// Result of carrying released entries.
@@ -1718,6 +1721,7 @@ pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> 
         &options.version,
         unreleased_region,
         options.skip_heading,
+        options.word_wrap,
     )?
     .ok_or(Error::ReleasedVersionNotFound {
         version: options.version,

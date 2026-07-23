@@ -3,16 +3,13 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use hongdown::{
-    DashSetting, IndentWidth, LeadingSpaces, LineWidth, Options as HongdownOptions, TrailingSpaces,
-    UnorderedMarker, format,
-};
 use indexmap::IndexMap;
 use snafu::ResultExt;
 
 use crate::config::{ReferenceSigil, UrlTemplate};
 use crate::error::{ReadFileSnafu, Result};
 use crate::fragment::{Fragment, ReferenceUse, discover_fragments};
+use crate::markdown::format_markdown_with_word_wrap;
 use crate::repo::Repository;
 
 /// Rendered section identifier.
@@ -27,6 +24,9 @@ pub struct CompileOptions {
     /// Whether to include the version heading and date line when no entries
     /// are available.
     pub include_empty_region: bool,
+
+    /// Whether to wrap rendered Markdown at Sacho's canonical line width.
+    pub word_wrap: bool,
 }
 
 impl Default for CompileOptions {
@@ -34,6 +34,7 @@ impl Default for CompileOptions {
         Self {
             section: None,
             include_empty_region: true,
+            word_wrap: true,
         }
     }
 }
@@ -183,6 +184,7 @@ pub(crate) fn compile_parsed_fragments(
             &version_label,
             &config.changelog.unreleased_heading,
             &sections,
+            options.word_wrap,
         )?
     };
 
@@ -443,6 +445,7 @@ fn format_region(
     version_label: &VersionLabel,
     unreleased_heading: &str,
     sections: &[CompiledSection],
+    word_wrap: bool,
 ) -> Result<String> {
     let mut header = String::new();
     header.push_str("## ");
@@ -451,17 +454,11 @@ fn format_region(
     header.push_str(unreleased_heading);
     header.push('\n');
 
-    let options = hongdown_options();
-    let mut markdown = format(&header, &options).map_err(|source| crate::Error::Format {
-        source: Box::new(source),
-    })?;
+    let mut markdown = format_markdown_with_word_wrap(&header, word_wrap)?;
     for section in sections {
         markdown.push('\n');
-        let section_markdown = format(section.markdown.trim_end(), &options).map_err(|source| {
-            crate::Error::Format {
-                source: Box::new(source),
-            }
-        })?;
+        let section_markdown =
+            format_markdown_with_word_wrap(section.markdown.trim_end(), word_wrap)?;
         markdown.push_str(section_markdown.trim_end());
         markdown.push('\n');
         if !section.references.is_empty() {
@@ -480,21 +477,6 @@ fn append_reference_definitions(markdown: &mut String, references: &[CompiledRef
         markdown.push_str("]: ");
         markdown.push_str(&reference.url);
         markdown.push('\n');
-    }
-}
-
-fn hongdown_options() -> HongdownOptions {
-    HongdownOptions {
-        line_width: Some(LineWidth::new(80).expect("80 is a valid line width")),
-        unordered_marker: UnorderedMarker::Hyphen,
-        leading_spaces: LeadingSpaces::new(1).expect("1 is valid leading spaces"),
-        trailing_spaces: TrailingSpaces::new(2).expect("2 is valid trailing spaces"),
-        indent_width: IndentWidth::new(4).expect("4 is a valid indent width"),
-        curly_double_quotes: false,
-        curly_single_quotes: false,
-        ellipsis: false,
-        em_dash: DashSetting::Disabled,
-        ..HongdownOptions::default()
     }
 }
 

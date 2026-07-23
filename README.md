@@ -246,7 +246,7 @@ can run:
 
 ~~~~ sh
 version="${GITHUB_REF_NAME#v}"
-sacho show "$version" --skip-heading --output-file release-notes.md
+sacho show "$version" --skip-heading --no-word-wrap --output-file release-notes.md
 gh release create "$GITHUB_REF_NAME" --notes-file release-notes.md
 ~~~~
 

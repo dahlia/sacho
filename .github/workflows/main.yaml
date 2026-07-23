@@ -415,7 +415,8 @@ jobs:
           mkdir release-notes-bin
           tar --extract --xz --file "$archive" --directory release-notes-bin
           release-notes-bin/sacho \
-            show "$VERSION" --skip-heading --output-file release-notes.md
+            show "$VERSION" --skip-heading --no-word-wrap \
+            --output-file release-notes.md
       - name: Publish the GitHub Release
         shell: bash
         env:

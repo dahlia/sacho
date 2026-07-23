@@ -229,14 +229,14 @@ After the release commit, `sacho show` prints one frozen section:
 
 ~~~~ sh
 sacho show 1.2.0
-sacho show 1.2.0 --skip-heading --output-file release-notes.md
+sacho show 1.2.0 --skip-heading --no-word-wrap --output-file release-notes.md
 ~~~~
 
 A tag-triggered GitHub Actions job can hand that file to the GitHub CLI:
 
 ~~~~ sh
 version="${GITHUB_REF_NAME#v}"
-sacho show "$version" --skip-heading --output-file release-notes.md
+sacho show "$version" --skip-heading --no-word-wrap --output-file release-notes.md
 gh release create "$GITHUB_REF_NAME" --notes-file release-notes.md
 ~~~~
 

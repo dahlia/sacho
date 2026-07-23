@@ -71,6 +71,11 @@ Previewing catches editorial problems that fragment-by-fragment review can
 miss: repeated entries, a security fix buried in the sort order, or two notes
 that describe different stages of the same feature.
 
+Use `sacho preview --no-word-wrap` when handing the rendered Markdown to a
+publishing system that displays soft line breaks. The option affects only the
+preview; fragments and the materialized changelog retain Sacho's canonical
+80-column wrapping.
+
 
 Check before committing
 -----------------------

@@ -147,6 +147,10 @@ enum Command {
             help = "Do not resolve unpinned reference links"
         )]
         no_resolve_links: bool,
+
+        /// Do not word-wrap the rendered Markdown.
+        #[arg(long, help = "Do not word-wrap the output")]
+        no_word_wrap: bool,
     },
 
     /// Print a released changelog section.
@@ -167,6 +171,10 @@ enum Command {
             help = "Write the released section to a file"
         )]
         output_file: Option<PathBuf>,
+
+        /// Do not word-wrap the rendered Markdown.
+        #[arg(long, help = "Do not word-wrap the output")]
+        no_word_wrap: bool,
     },
 
     /// Regenerate the materialized unreleased changelog region.
@@ -374,6 +382,7 @@ impl Cli {
                 section,
                 resolve_links,
                 no_resolve_links,
+                no_word_wrap,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let compiled = compile_unreleased_with_link_resolution(
@@ -381,6 +390,7 @@ impl Cli {
                     CompileOptions {
                         section,
                         include_empty_region: true,
+                        word_wrap: !no_word_wrap,
                     },
                     link_resolution_policy(resolve_links, no_resolve_links),
                 )?;
@@ -391,6 +401,7 @@ impl Cli {
                 version,
                 skip_heading,
                 output_file,
+                no_word_wrap,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let released = show(
@@ -398,6 +409,7 @@ impl Cli {
                     ShowOptions {
                         version,
                         skip_heading,
+                        word_wrap: !no_word_wrap,
                     },
                 )?;
                 if let Some(path) = output_file {

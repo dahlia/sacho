@@ -117,18 +117,21 @@ unchanged.
 
 ~~~~ text
 sacho preview [--section <SECTION>] [--resolve-links | --no-resolve-links]
+              [--no-word-wrap]
 ~~~~
 
 Prints the compiled unreleased region to standard output without changing
 files. `--section` prints only one configured section. Link resolution affects
-the output in memory and never writes pins from `preview`.
+the output in memory and never writes pins from `preview`. `--no-word-wrap`
+removes automatic 80-column wrapping from the output while preserving explicit
+Markdown hard breaks.
 
 
 `sacho show`
 ------------
 
 ~~~~ text
-sacho show [--skip-heading] [--output-file <PATH>] <VERSION>
+sacho show [--skip-heading] [--output-file <PATH>] [--no-word-wrap] <VERSION>
 ~~~~
 
 Reads a frozen released section from the changelog.
@@ -137,9 +140,12 @@ Reads a frozen released section from the changelog.
 | ---------------------------- | -------------------------------------------------------------------------- |
 | `-H`, `--skip-heading`       | Omit the version heading while preserving the section body and references. |
 | `-o`, `--output-file <PATH>` | Write to a file instead of standard output.                                |
+| `--no-word-wrap`             | Remove automatic 80-column wrapping from the output.                       |
 
 The command reports an error when the requested released version is absent. It
-does not read the current fragments.
+does not read the current fragments. `--no-word-wrap` applies equally to
+standard output and `--output-file`, and preserves explicit Markdown hard
+breaks.
 
 
 `sacho sync`
