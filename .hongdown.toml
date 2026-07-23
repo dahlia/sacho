@@ -5,4 +5,5 @@ exclude = [
   "**/node_modules/**",
   "**/.vitepress/**",
   ".git/**",
+  "changes.d/**",
 ]
