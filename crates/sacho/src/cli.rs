@@ -10,8 +10,8 @@ use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     ImportUnreleasedOptions, ImportUnreleasedPlan, InitOptions, InitResult, MutationCleanupWarning,
-    NextOptions, ReleaseDate, ReleaseOptions, ResolveLinksOptions, ShowOptions, SyncOptions,
-    SyncPlan, add_fragment, apply_format, apply_import_unreleased, apply_merge_driver,
+    NextOptions, ReleaseDate, ReleaseOptions, ResolveLinksOptions, ResolveLinksResult, ShowOptions,
+    SyncOptions, SyncPlan, add_fragment, apply_format, apply_import_unreleased, apply_merge_driver,
     apply_release, apply_resolve_links, apply_sync, carry, check, commit_message_hook,
     compile_unreleased_with_link_resolution, infer_repository_url, infer_section_paths,
     init_repository, initialization_root, mercurial_update_hook, plan_format,
@@ -367,7 +367,7 @@ impl Cli {
                     return Ok(ExitCode::from(2));
                 }
                 let result = apply_resolve_links(&repo, plan)?;
-                print_mutation_cleanup_warnings("sacho resolve-links", &result.cleanup_warnings);
+                print_resolve_links_result(&repo, "sacho resolve-links", result);
                 Ok(ExitCode::SUCCESS)
             }
             Command::Preview {
@@ -421,7 +421,7 @@ impl Cli {
                         return Ok(ExitCode::from(2));
                     }
                     let result = apply_resolve_links(&repo, plan)?;
-                    print_mutation_cleanup_warnings("sacho sync", &result.cleanup_warnings);
+                    print_resolve_links_result(&repo, "sacho sync", result);
                 } else {
                     let plan = plan_sync(&repo, SyncOptions { force })?;
                     if !confirm_sync_plan(&plan, None, policy)? {
@@ -537,6 +537,16 @@ fn print_mutation_cleanup_warnings(command: &str, warnings: &[MutationCleanupWar
             warning.path.display(),
             warning.message,
         );
+    }
+}
+
+fn print_resolve_links_result(repo: &Repository, command: &str, result: ResolveLinksResult) {
+    print_mutation_cleanup_warnings(command, &result.cleanup_warnings);
+    for path in result.changed_fragments {
+        println!("{}", path.display());
+    }
+    if result.changelog_changed {
+        println!("{}", repo.config().changelog.path.display());
     }
 }
 

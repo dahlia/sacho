@@ -974,7 +974,8 @@ fn sync_resolve_links_pins_fragments_without_materialization() {
         .current_dir(temp.path())
         .args(["sync", "--resolve-links"])
         .assert()
-        .success();
+        .success()
+        .stdout("changes.d/change.md\n");
 
     let fragment = std::fs::read_to_string(path).expect("fragment");
     assert!(fragment.contains("links:"));
@@ -1038,12 +1039,50 @@ fn resolve_links_command_pins_fragments_without_materialization() {
         .current_dir(temp.path())
         .arg("resolve-links")
         .assert()
-        .success();
+        .success()
+        .stdout("changes.d/change.md\n");
 
     let fragment = std::fs::read_to_string(path).expect("fragment");
     assert!(fragment.contains("links:"));
     assert!(fragment.contains(&format!("{base}/issues/4")));
     assert_eq!(request.join().expect("server"), "HEAD /issues/4 HTTP/1.1");
+}
+
+#[test]
+fn resolve_links_command_reports_the_materialized_changelog() {
+    let (base, requests) = redirecting_http_server();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        format!("[links]\n\"#\" = \"{base}/issues/{{n}}\"\n"),
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/change.md"),
+        " -  Fixed reported links.  [[#5]]\n",
+    )
+    .expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        format!(
+            "Unreleased\n----------\n\nTo be released.\n\n -  Fixed reported links.  [[#5]]\n\n[#5]: {base}/issues/5\n"
+        ),
+    )
+    .expect("changelog");
+    let mut command = Command::cargo_bin("sacho").expect("binary");
+
+    command
+        .current_dir(temp.path())
+        .arg("resolve-links")
+        .assert()
+        .success()
+        .stdout("changes.d/change.md\nCHANGES.md\n");
+
+    assert_eq!(
+        requests.join().expect("server"),
+        vec!["HEAD /issues/5 HTTP/1.1", "HEAD /pull/3 HTTP/1.1"]
+    );
 }
 
 #[test]
