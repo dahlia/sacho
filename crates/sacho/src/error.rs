@@ -3,6 +3,58 @@ use std::path::PathBuf;
 use crate::changelog::ChangelogError;
 use snafu::Snafu;
 
+/// Removes HTTP userinfo before a URL is stored in an error.
+pub(crate) fn redact_url_credentials(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return String::from("<invalid URL>");
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return value.to_owned();
+    }
+    if url.set_password(None).is_err() || url.set_username("").is_err() {
+        return String::from("<redacted URL>");
+    }
+    url.into()
+}
+
+#[cfg(test)]
+mod credential_redaction_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn redacts_generated_http_userinfo(
+            username in "[A-Za-z0-9]{1,16}",
+            password in "[A-Za-z0-9]{1,16}",
+            number in any::<u64>(),
+        ) {
+            let source =
+                format!("https://{username}:{password}@example.com/issues/{number}");
+            let redacted = redact_url_credentials(&source);
+            let parsed = url::Url::parse(&redacted).expect("redacted URL");
+            let credentials = format!("{username}:{password}@");
+            let path = format!("/issues/{number}");
+
+            prop_assert!(parsed.username().is_empty());
+            prop_assert!(parsed.password().is_none());
+            prop_assert!(!redacted.contains(&credentials));
+            prop_assert!(redacted.ends_with(&path));
+        }
+    }
+
+    #[test]
+    fn replaces_unparseable_urls_instead_of_echoing_them() {
+        let source = "https://user:secret@";
+
+        let redacted = redact_url_credentials(source);
+
+        assert_eq!(redacted, "<invalid URL>");
+        assert!(!redacted.contains("secret"));
+    }
+}
+
 /// Built-in command whose multi-file repository mutation is transactional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationCommand {
@@ -17,6 +69,9 @@ pub enum MutationCommand {
 
     /// The `import-unreleased` command.
     ImportUnreleased,
+
+    /// The `resolve-links` command or a resolving synchronization.
+    ResolveLinks,
 }
 
 impl std::fmt::Display for MutationCommand {
@@ -26,6 +81,7 @@ impl std::fmt::Display for MutationCommand {
             Self::Format => "fmt",
             Self::Carry => "carry",
             Self::ImportUnreleased => "import-unreleased",
+            Self::ResolveLinks => "resolve-links",
         })
     }
 }
@@ -37,6 +93,30 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// An unpinned reference URL could not be resolved through HTTP redirects.
+    #[snafu(display("failed to resolve reference {label:?} from {url:?}: {reason}"))]
+    LinkResolutionFailed {
+        /// Complete reference label being resolved.
+        label: String,
+        /// Expanded URL template sent to the server.
+        url: String,
+        /// HTTP or transport failure.
+        reason: String,
+    },
+
+    /// Two fragments pin the same reference label to different URLs.
+    #[snafu(display(
+        "reference label {label:?} has conflicting resolved URLs {first:?} and {second:?}"
+    ))]
+    ConflictingResolvedLinks {
+        /// Complete reference label with conflicting overrides.
+        label: String,
+        /// First resolved URL encountered.
+        first: String,
+        /// Conflicting resolved URL.
+        second: String,
+    },
+
     /// The current Sacho executable could not be located for repository integration.
     #[snafu(display("failed to determine the current Sacho executable: {source}"))]
     CurrentExecutable {
@@ -828,6 +908,26 @@ pub enum FragmentError {
     Frontmatter {
         /// Underlying YAML parser error.
         source: serde_yaml_ng::Error,
+    },
+
+    /// A resolved reference URL in fragment frontmatter is not safe to request.
+    #[snafu(display("invalid resolved link {label:?} = {url:?}: {reason}"))]
+    InvalidResolvedLink {
+        /// Complete reference label whose URL is invalid.
+        label: String,
+        /// Invalid URL value.
+        url: String,
+        /// Validation failure.
+        reason: String,
+    },
+
+    /// A resolved-link frontmatter key is malformed, unconfigured, or unused.
+    #[snafu(display("invalid resolved link label {label:?}: {reason}"))]
+    InvalidResolvedLinkLabel {
+        /// Frontmatter key that cannot act as a pin for this fragment.
+        label: String,
+        /// Validation failure.
+        reason: String,
     },
 
     /// The fragment Markdown did not match Sacho's structural constraints.

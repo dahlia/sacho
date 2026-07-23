@@ -72,6 +72,25 @@ A fragment using `[[#842]]` can then compile a reference definition for issue
 842. Links without a matching sigil fail `sacho check`.
 
 
+`[link-resolution]`
+-------------------
+
+~~~~ toml
+[link-resolution]
+enabled = false
+~~~~
+
+When enabled, `preview`, `sync`, and `release` resolve unpinned reference URLs
+through HTTP redirects by default. The command-line `--resolve-links` and
+`--no-resolve-links` options override this setting. `check`, hooks, and `fmt`
+never make network requests, and unpinned references remain valid.
+
+Resolved URLs are stored in fragment frontmatter. Existing pins are
+authoritative, and every pin key must name a configured reference used by that
+fragment. Remove a pin before resolving again when its destination needs to be
+refreshed.
+
+
 `[vcs]`                                                                   {#vcs}
 --------------------------------------------------------------------------------
 

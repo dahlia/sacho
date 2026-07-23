@@ -98,15 +98,30 @@ discard hand edits, Sacho asks for confirmation in a terminal and refuses the
 change in a noninteractive process.
 
 
+`sacho resolve-links`
+---------------------
+
+~~~~ text
+sacho resolve-links
+~~~~
+
+Follows redirects for every unpinned fragment reference and records each final
+URL in that fragment's frontmatter. Existing pins are not requested again.
+When materialization is enabled, the changelog is synchronized in the same
+failure-safe operation. A network or validation failure leaves every file
+unchanged.
+
+
 `sacho preview`
 ---------------
 
 ~~~~ text
-sacho preview [--section <SECTION>]
+sacho preview [--section <SECTION>] [--resolve-links | --no-resolve-links]
 ~~~~
 
 Prints the compiled unreleased region to standard output without changing
-files. `--section` prints only one configured section.
+files. `--section` prints only one configured section. Link resolution affects
+the output in memory and never writes pins from `preview`.
 
 
 `sacho show`
@@ -131,20 +146,23 @@ does not read the current fragments.
 ------------
 
 ~~~~ text
-sacho sync [--force]
+sacho sync [--force] [--resolve-links | --no-resolve-links]
 ~~~~
 
 Recompiles the materialized unreleased region from the fragments. It does
-nothing when materialization is disabled or the changelog is already current.
+nothing when materialization is disabled or the changelog is already current,
+unless link resolution is enabled and unpinned fragment references remain.
 
 `--force` allows the replacement to discard edits inside the generated region.
+Resolved fragment pins and changelog output are committed atomically.
 
 
 `sacho release`
 ---------------
 
 ~~~~ text
-sacho release [--date <DATE>] [--next <NEXT>] [--allow-empty] [VERSION]
+sacho release [--date <DATE>] [--next <NEXT>] [--allow-empty]
+              [--resolve-links | --no-resolve-links] [VERSION]
 ~~~~
 
 Compiles and inserts a dated released section and removes the consumed
@@ -152,12 +170,14 @@ fragments. Without `--next`, it also removes the next-version file and closes
 the materialized unreleased region. With `--next`, it opens the following cycle
 in the same operation.
 
-| Argument or option | Meaning                                                                |
-| ------------------ | ---------------------------------------------------------------------- |
-| `VERSION`          | Version to release. Defaults to the next-version file.                 |
-| `--date <DATE>`    | Release date in `YYYY-MM-DD` form. Defaults to the current local date. |
-| `--next <NEXT>`    | Open this next version immediately after the release.                  |
-| `--allow-empty`    | Allow a release without substantive changelog items.                   |
+| Argument or option   | Meaning                                                                |
+| -------------------- | ---------------------------------------------------------------------- |
+| `VERSION`            | Version to release. Defaults to the next-version file.                 |
+| `--date <DATE>`      | Release date in `YYYY-MM-DD` form. Defaults to the current local date. |
+| `--next <NEXT>`      | Open this next version immediately after the release.                  |
+| `--allow-empty`      | Allow a release without substantive changelog items.                   |
+| `--resolve-links`    | Resolve unpinned links before compiling the release.                   |
+| `--no-resolve-links` | Disable configured link resolution for this release.                   |
 
 When both `VERSION` and the next-version file contain values, they must agree.
 The first release may have no fragments when the changelog has no released

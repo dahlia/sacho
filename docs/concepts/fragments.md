@@ -98,3 +98,20 @@ The corresponding URL template belongs in *sacho.toml*:
 
 Sacho emits the link definitions in the compiled changelog. `sacho check`
 reports a reference whose sigil has no configured template.
+
+For trackers that redirect a shared reference route to a more specific target,
+run `sacho resolve-links`. Sacho follows the redirect chain once and pins the
+final URL without moving the reference out of the entry text:
+
+~~~~ markdown
+---
+links:
+  "#842": https://github.com/acme/widget/pull/842
+---
+
+ -  Added `clear()` to remove every entry at once.  [[#842]]
+~~~~
+
+Pins travel with their fragments and take precedence over the repository URL
+template. Each pin key must be a configured reference label used by that
+fragment. Delete a pin to request that reference again.

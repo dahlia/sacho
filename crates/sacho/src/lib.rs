@@ -20,6 +20,8 @@ pub mod diagnostic;
 pub mod error;
 /// Fragment discovery, parsing, and validation types.
 pub mod fragment;
+/// Reference-link redirect resolution types.
+pub mod link_resolution;
 /// Markdown formatting adapter types.
 pub mod markdown;
 /// Changelog merge driver types.
@@ -33,8 +35,9 @@ mod repository_url;
 pub mod vcs;
 
 pub use crate::config::{
-    ChangelogConfig, CheckConfig, Config, FragmentsConfig, ReferenceSigil, RegionDetection,
-    SectionConfig, UrlTemplate, VcsCommand, VcsCommandOverrides, VcsConfig, VcsPreset, VcsQuery,
+    ChangelogConfig, CheckConfig, Config, FragmentsConfig, LinkResolutionConfig, ReferenceSigil,
+    RegionDetection, SectionConfig, UrlTemplate, VcsCommand, VcsCommandOverrides, VcsConfig,
+    VcsPreset, VcsQuery,
 };
 pub use crate::error::{ConfigError, Error, FragmentError, MutationCommand, Result};
 pub use crate::repo::Repository;

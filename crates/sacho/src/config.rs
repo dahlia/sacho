@@ -24,6 +24,10 @@ pub struct Config {
     #[serde(default)]
     pub links: IndexMap<ReferenceSigil, UrlTemplate>,
 
+    /// HTTP redirect resolution settings for reference links.
+    #[serde(default)]
+    pub link_resolution: LinkResolutionConfig,
+
     /// Version-control integration settings.
     #[serde(default)]
     pub vcs: VcsConfig,
@@ -261,6 +265,14 @@ impl UrlTemplate {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// HTTP redirect resolution settings for reference links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct LinkResolutionConfig {
+    /// Whether supported commands resolve unpinned links by default.
+    pub enabled: bool,
 }
 
 /// Version-control integration configuration.
@@ -518,6 +530,7 @@ mod tests {
                         ..FragmentsConfig::default()
                     },
                     links: link_map,
+                    link_resolution: LinkResolutionConfig::default(),
                     vcs: VcsConfig::default(),
                     check: CheckConfig::default(),
                     sections: unique_sections,
@@ -531,8 +544,29 @@ mod tests {
 
         assert_eq!(config.changelog.path, PathBuf::from("CHANGES.md"));
         assert_eq!(config.fragments.directory, PathBuf::from("changes.d"));
+        assert!(!config.link_resolution.enabled);
         assert_eq!(config.vcs.preset, VcsPreset::Git);
         assert!(config.vcs.commands.is_empty());
+    }
+
+    #[test]
+    fn parses_link_resolution_policy_without_changing_link_templates() {
+        let config = Config::parse(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+
+            [link-resolution]
+            enabled = true
+            "##,
+        )
+        .expect("link resolution config");
+
+        assert!(config.link_resolution.enabled);
+        assert_eq!(
+            config.links[&ReferenceSigil::new("#")].as_str(),
+            "https://example.com/issues/{n}"
+        );
     }
 
     #[test]

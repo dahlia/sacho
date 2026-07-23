@@ -2,14 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
 use comrak::{Arena, Options as ComrakOptions, format_commonmark, parse_document};
+use serde::Serialize;
 
 use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
 use crate::config::SectionConfig;
 use crate::error::{Error, Result};
+use crate::fragment::{is_complete_reference_label, validate_resolved_link};
 use crate::markdown::format_markdown;
 use crate::repo::Repository;
 
@@ -70,6 +72,18 @@ struct TargetSection<'a> {
 struct ParsedEntry {
     section: Option<String>,
     item_markdown: String,
+    links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FragmentContents {
+    items: Vec<String>,
+    links: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct FragmentFrontmatter<'a> {
+    links: &'a BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,34 +190,33 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
         }
     })?;
     let entries = parse_entries(repo, target.body)?;
-    let mut grouped = BTreeMap::<Option<String>, Vec<String>>::new();
+    let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
-        grouped
-            .entry(entry.section)
-            .or_default()
-            .push(entry.item_markdown);
+        merge_fragment_entry(&mut grouped, entry)?;
     }
 
     let mut fragments = Vec::new();
     if repo.config().sections.is_empty() {
-        let items = grouped.remove(&None).unwrap_or_default();
-        if !items.is_empty() {
+        let contents = grouped.remove(&None).unwrap_or_default();
+        if !contents.items.is_empty() {
+            let path = carried_fragment_path(repo, None, version)?;
             fragments.push(CarriedFragment {
                 section: None,
-                path: carried_fragment_path(repo, None, version)?,
-                markdown: fragment_markdown(items),
+                markdown: fragment_markdown(&path, contents)?,
+                path,
             });
         }
     } else {
         for section in &repo.config().sections {
             let section_id = Some(section.id.clone());
-            let Some(items) = grouped.remove(&section_id) else {
+            let Some(contents) = grouped.remove(&section_id) else {
                 continue;
             };
+            let path = carried_fragment_path(repo, Some(section), version)?;
             fragments.push(CarriedFragment {
                 section: section_id,
-                path: carried_fragment_path(repo, Some(section), version)?,
-                markdown: fragment_markdown(items),
+                markdown: fragment_markdown(&path, contents)?,
+                path,
             });
         }
     }
@@ -224,7 +237,7 @@ pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<Impor
     let arena = Arena::new();
     let root = parse_document(&arena, region, &comrak_options());
     let line_starts = line_starts(region);
-    let references = reference_definitions(region);
+    let references = configured_reference_definitions(repo, region);
     let mut version = None;
     let mut saw_heading = false;
     let mut current_section = None;
@@ -280,14 +293,12 @@ pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<Impor
                 for item in child.children() {
                     let source = slice_item_sourcepos(region, &line_starts, item.data().sourcepos)
                         .unwrap_or_default();
+                    let (item_markdown, links) =
+                        fold_item_references(source, item, &line_starts, &references)?;
                     entries.push(ParsedEntry {
                         section: current_section.clone(),
-                        item_markdown: fold_item_references(
-                            source,
-                            item,
-                            &line_starts,
-                            &references,
-                        ),
+                        item_markdown,
+                        links,
                     });
                 }
             }
@@ -322,38 +333,37 @@ fn fragments_from_entries(
     entries: Vec<ParsedEntry>,
     filename: &str,
 ) -> Result<Vec<CarriedFragment>> {
-    let mut grouped = BTreeMap::<Option<String>, Vec<String>>::new();
+    let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
-        grouped
-            .entry(entry.section)
-            .or_default()
-            .push(entry.item_markdown);
+        merge_fragment_entry(&mut grouped, entry)?;
     }
     let mut fragments = Vec::new();
     if repo.config().sections.is_empty() {
-        let items = grouped.remove(&None).unwrap_or_default();
-        if !items.is_empty() {
+        let contents = grouped.remove(&None).unwrap_or_default();
+        if !contents.items.is_empty() {
+            let path = repo.config().fragments.directory.join(filename);
             fragments.push(CarriedFragment {
                 section: None,
-                path: repo.config().fragments.directory.join(filename),
-                markdown: fragment_markdown(items),
+                markdown: fragment_markdown(&path, contents)?,
+                path,
             });
         }
     } else {
         for section in &repo.config().sections {
             let section_id = Some(section.id.clone());
-            let Some(items) = grouped.remove(&section_id) else {
+            let Some(contents) = grouped.remove(&section_id) else {
                 continue;
             };
+            let path = repo
+                .config()
+                .fragments
+                .directory
+                .join(&section.directory)
+                .join(filename);
             fragments.push(CarriedFragment {
                 section: section_id,
-                path: repo
-                    .config()
-                    .fragments
-                    .directory
-                    .join(&section.directory)
-                    .join(filename),
-                markdown: fragment_markdown(items),
+                markdown: fragment_markdown(&path, contents)?,
+                path,
             });
         }
     }
@@ -540,13 +550,46 @@ fn validate_carried_filename(filename: &str) -> Result<()> {
     Ok(())
 }
 
-fn fragment_markdown(items: Vec<String>) -> String {
+fn merge_fragment_entry(
+    grouped: &mut BTreeMap<Option<String>, FragmentContents>,
+    entry: ParsedEntry,
+) -> Result<()> {
+    let contents = grouped.entry(entry.section).or_default();
+    for (label, url) in &entry.links {
+        if let Some(existing) = contents.links.get(label)
+            && existing != url
+        {
+            return Err(Error::ConflictingResolvedLinks {
+                label: label.clone(),
+                first: existing.clone(),
+                second: url.clone(),
+            });
+        }
+    }
+    contents.items.push(entry.item_markdown);
+    contents.links.extend(entry.links);
+    Ok(())
+}
+
+fn fragment_markdown(path: &Path, contents: FragmentContents) -> Result<String> {
     let mut markdown = String::new();
-    for item in items {
+    if !contents.links.is_empty() {
+        let serialized = serde_yaml_ng::to_string(&FragmentFrontmatter {
+            links: &contents.links,
+        })
+        .map_err(|source| Error::Fragment {
+            path: path.to_path_buf(),
+            source: crate::FragmentError::Frontmatter { source },
+        })?;
+        markdown.push_str("---\n");
+        markdown.push_str(serialized.trim_start_matches("---\n").trim_end());
+        markdown.push_str("\n---\n");
+    }
+    for item in contents.items {
         markdown.push_str(item.trim_end());
         markdown.push('\n');
     }
-    markdown
+    Ok(markdown)
 }
 
 fn find_target_section<'a>(
@@ -585,7 +628,7 @@ fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
     let line_starts = line_starts(body);
     let mut entries = Vec::new();
     let mut current_section = None;
-    let references = reference_definitions(body);
+    let references = configured_reference_definitions(repo, body);
 
     for child in root.children() {
         let value = child.data().value.clone();
@@ -604,10 +647,12 @@ fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
                 for item in child.children() {
                     let source = slice_item_sourcepos(body, &line_starts, item.data().sourcepos)
                         .unwrap_or_default();
-                    let markdown = fold_item_references(source, item, &line_starts, &references);
+                    let (item_markdown, links) =
+                        fold_item_references(source, item, &line_starts, &references)?;
                     entries.push(ParsedEntry {
                         section: current_section.clone(),
-                        item_markdown: markdown,
+                        item_markdown,
+                        links,
                     });
                 }
             }
@@ -638,21 +683,23 @@ fn fold_item_references<'a>(
     item: &'a AstNode<'a>,
     line_starts: &[usize],
     references: &[ReferenceDefinition],
-) -> String {
+) -> Result<(String, BTreeMap<String, String>)> {
     let item_start_offset = item_source_start_offset(line_starts, item.data().sourcepos)
         .unwrap_or_else(|| {
             sourcepos_start_offset(line_starts, item.data().sourcepos.start).unwrap_or(0)
         });
     let mut replacements = Vec::<(usize, usize, String)>::new();
-    let mut labels_for_item = BTreeSet::<String>::new();
+    let mut labels = BTreeSet::<String>::new();
+    let mut links = BTreeMap::<String, String>::new();
     collect_link_replacements(
         item,
         references,
         line_starts,
         item_start_offset,
         &mut replacements,
-        &mut labels_for_item,
-    );
+        &mut labels,
+        &mut links,
+    )?;
 
     replacements.sort_by_key(|(start, _, _)| *start);
     let mut output = source.to_owned();
@@ -660,12 +707,12 @@ fn fold_item_references<'a>(
         output.replace_range(start..end, &replacement);
     }
 
-    for label in labels_for_item {
+    for label in labels {
         if !output.contains(&format!("[{label}]")) {
             append_reference_label(&mut output, &label);
         }
     }
-    output.trim_end().to_owned()
+    Ok((output.trim_end().to_owned(), links))
 }
 
 fn collect_link_replacements<'a>(
@@ -674,15 +721,28 @@ fn collect_link_replacements<'a>(
     line_starts: &[usize],
     item_start_offset: usize,
     replacements: &mut Vec<(usize, usize, String)>,
-    labels_for_item: &mut BTreeSet<String>,
-) {
+    labels: &mut BTreeSet<String>,
+    links: &mut BTreeMap<String, String>,
+) -> Result<()> {
     if let NodeValue::Link(link) = &node.data().value
         && let Some(reference) = references
             .iter()
             .find(|reference| reference.url == link.url)
     {
         let label_text = plain_text(node).trim().to_owned();
-        labels_for_item.insert(reference.label.clone());
+        labels.insert(reference.label.clone());
+        if validate_resolved_link(&reference.label, &reference.url).is_ok() {
+            if let Some(existing) = links.get(&reference.label)
+                && existing != &reference.url
+            {
+                return Err(Error::ConflictingResolvedLinks {
+                    label: reference.label.clone(),
+                    first: existing.clone(),
+                    second: reference.url.clone(),
+                });
+            }
+            links.insert(reference.label.clone(), reference.url.clone());
+        }
         if label_text == reference.label
             && let Some((start, end)) = sourcepos_offsets(line_starts, node.data().sourcepos)
         {
@@ -700,9 +760,11 @@ fn collect_link_replacements<'a>(
             line_starts,
             item_start_offset,
             replacements,
-            labels_for_item,
-        );
+            labels,
+            links,
+        )?;
     }
+    Ok(())
 }
 
 fn append_reference_label(markdown: &mut String, label: &str) {
@@ -734,6 +796,13 @@ fn reference_definitions(source: &str) -> Vec<ReferenceDefinition> {
     }
     definitions.sort_by(|left, right| left.label.cmp(&right.label));
     definitions
+}
+
+fn configured_reference_definitions(repo: &Repository, source: &str) -> Vec<ReferenceDefinition> {
+    reference_definitions(source)
+        .into_iter()
+        .filter(|reference| is_complete_reference_label(&reference.label, &repo.config().links))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1592,6 +1661,279 @@ Released on July 7, 2026.
     }
 
     #[test]
+    fn preserves_folded_reference_definitions_as_carried_fragment_pins() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Fixed carry.  [[#8](https://example.com/pull/8)]
+
+[#8]: https://example.com/pull/8
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let fragment = crate::fragment::parse_fragment(
+            carried.fragments[0].path.clone(),
+            &carried.fragments[0].markdown,
+            None,
+            &repo.config().links,
+        )
+        .expect("carried fragment");
+
+        assert_eq!(
+            fragment.links,
+            BTreeMap::from([(
+                String::from("#8"),
+                String::from("https://example.com/pull/8"),
+            )])
+        );
+        assert_eq!(fragment.items[0].references[0].label, "#8");
+    }
+
+    #[test]
+    fn preserves_folded_reference_definitions_as_imported_fragment_pins() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Fixed import.  [[#9](https://example.com/discussions/9)]
+
+[#9]: https://example.com/discussions/9
+";
+
+        let imported = import_unreleased_region(&repo, region).expect("import");
+        let fragment = crate::fragment::parse_fragment(
+            imported.fragments[0].path.clone(),
+            &imported.fragments[0].markdown,
+            None,
+            &repo.config().links,
+        )
+        .expect("imported fragment");
+
+        assert_eq!(
+            fragment.links,
+            BTreeMap::from([(
+                String::from("#9"),
+                String::from("https://example.com/discussions/9"),
+            )])
+        );
+        assert_eq!(fragment.items[0].references[0].label, "#9");
+    }
+
+    #[test]
+    fn rejects_conflicting_reference_definitions_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Fixed the first path.  [[#8](https://example.com/pull/8)]
+ -  Fixed the second path.  [[#8](https://example.net/pull/8)]
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Fixed the first path.  [[#8](https://example.com/pull/8)]
+ -  Fixed the second path.  [[#8](https://example.net/pull/8)]
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let error = result.expect_err("conflicting definitions");
+            assert!(matches!(
+                error,
+                Error::ConflictingResolvedLinks { ref label, ref first, ref second }
+                    if label == "#8"
+                        && first == "https://example.com/pull/8"
+                        && second == "https://example.net/pull/8"
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_reference_definitions_within_one_entry() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Fixed both [[#8](https://example.com/pull/8)] and [[#8](https://example.net/pull/8)].
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Fixed both [[#8](https://example.com/pull/8)] and [[#8](https://example.net/pull/8)].
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let error = result.expect_err("conflicting definitions");
+            assert!(matches!(
+                error,
+                Error::ConflictingResolvedLinks { ref label, ref first, ref second }
+                    if label == "#8"
+                        && first == "https://example.com/pull/8"
+                        && second == "https://example.net/pull/8"
+            ));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn decompiled_reference_pins_preserve_generated_destinations(
+            number in 1_u64..=u32::MAX.into(),
+            destination in prop_oneof![Just("pull"), Just("discussions")],
+        ) {
+            let (_temp, repo) = repo_with_config(
+                r##"
+                [changelog]
+                materialize = false
+
+                [links]
+                "#" = "https://example.com/issues/{n}"
+                "##,
+            );
+            let label = format!("#{number}");
+            let url = format!("https://example.com/{destination}/{number}");
+            let changelog = format!(
+                "Version 1.1.5\n-------------\n\nReleased today.\n\n -  Fixed carry.  [[{label}]({url})]\n\n[{label}]: {url}\n"
+            );
+            let region = format!(
+                "Unreleased\n----------\n\nTo be released.\n\n -  Fixed import.  [[{label}]({url})]\n\n[{label}]: {url}\n"
+            );
+
+            let carried = carry_release(&repo, &changelog, "1.1.5").expect("carry");
+            let imported = import_unreleased_region(&repo, &region).expect("import");
+
+            for output in [&carried.fragments[0], &imported.fragments[0]] {
+                let fragment = crate::fragment::parse_fragment(
+                    output.path.clone(),
+                    &output.markdown,
+                    None,
+                    &repo.config().links,
+                )
+                .expect("decompiled fragment");
+                prop_assert_eq!(fragment.links.get(&label), Some(&url));
+            }
+        }
+
+        #[test]
+        fn decompiled_non_http_references_remain_unpinned(
+            number in 1_u64..=u32::MAX.into(),
+            relative in any::<bool>(),
+        ) {
+            let template = if relative {
+                "/issues/{n}"
+            } else {
+                "mailto:issue-{n}@example.com"
+            };
+            let config = format!(
+                "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{template}\"\n"
+            );
+            let (_temp, repo) = repo_with_config(&config);
+            let label = format!("#{number}");
+            let url = template.replace("{n}", &number.to_string());
+            let changelog = format!(
+                "Version 1.1.5\n-------------\n\nReleased today.\n\n -  Fixed carry.  [[{label}]({url})]\n\n[{label}]: {url}\n"
+            );
+            let region = format!(
+                "Unreleased\n----------\n\nTo be released.\n\n -  Fixed import.  [[{label}]({url})]\n\n[{label}]: {url}\n"
+            );
+
+            let carried = carry_release(&repo, &changelog, "1.1.5").expect("carry");
+            let imported = import_unreleased_region(&repo, &region).expect("import");
+
+            for output in [&carried.fragments[0], &imported.fragments[0]] {
+                let fragment = crate::fragment::parse_fragment(
+                    output.path.clone(),
+                    &output.markdown,
+                    None,
+                    &repo.config().links,
+                )
+                .expect("decompiled fragment");
+                prop_assert!(fragment.links.is_empty());
+                prop_assert_eq!(&fragment.items[0].references[0].label, &label);
+                let compiled = crate::compile::compile_parsed_fragments(
+                    &repo,
+                    crate::compile::CompileOptions::default(),
+                    crate::compile::VersionLabel::Unreleased,
+                    vec![fragment],
+                )
+                .expect("compiled fragment");
+                let definition = format!("[{label}]: {url}");
+                prop_assert!(compiled.markdown.contains(&definition));
+            }
+        }
+    }
+
+    #[test]
     fn appends_reference_label_when_link_text_does_not_identify_reference() {
         let (_temp, repo) = repo_with_config(
             r##"
@@ -1619,6 +1961,97 @@ Released on July 7, 2026.
             carried.fragments[0]
                 .markdown
                 .contains(" -  Fixed carry.  [issue](https://example.com/issues/8)  [[#8]]\n")
+        );
+    }
+
+    #[test]
+    fn leaves_ordinary_markdown_reference_definitions_out_of_fragment_pins() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [documentation](https://example.com/docs).
+
+[docs]: https://example.com/docs
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [documentation](https://example.com/docs).
+
+[docs]: https://example.com/docs
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for output in [&carried.fragments[0], &imported.fragments[0]] {
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("ordinary references must remain valid Markdown");
+            assert!(fragment.links.is_empty());
+            assert_eq!(
+                fragment.items[0].markdown,
+                "-  Read the [documentation](https://example.com/docs)."
+            );
+        }
+    }
+
+    #[test]
+    fn appends_unpinned_relative_reference_when_link_text_does_not_identify_it() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Fixed carry.  [issue](/issues/8)
+
+[#8]: /issues/8
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let fragment = crate::fragment::parse_fragment(
+            carried.fragments[0].path.clone(),
+            &carried.fragments[0].markdown,
+            None,
+            &repo.config().links,
+        )
+        .expect("carried fragment");
+
+        assert!(fragment.links.is_empty());
+        assert_eq!(fragment.items[0].references[0].label, "#8");
+        assert!(
+            carried.fragments[0]
+                .markdown
+                .contains(" -  Fixed carry.  [issue](/issues/8)  [[#8]]\n")
         );
     }
 
