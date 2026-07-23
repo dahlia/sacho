@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -17,7 +17,10 @@ use crate::changelog::{
     marker_region_contents, replace_unreleased_region, set_hongdown_separator_before,
     set_trailing_newline_count,
 };
-use crate::compile::{VersionLabel, compile_parsed_fragments, version_label_from_contents};
+use crate::compile::{
+    VersionLabel, compile_parsed_fragments, validate_resolved_link_consistency,
+    version_label_from_contents,
+};
 use crate::config::{
     Config, ReferenceSigil, RegionDetection, SectionConfig, UrlTemplate, VcsPreset,
 };
@@ -26,6 +29,7 @@ use crate::fragment::{
     DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
     discover_fragment_candidates, parse_fragment,
 };
+use crate::link_resolution::{LinkResolutionPolicy, ReferenceUrlResolver, is_http_reference_url};
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
@@ -203,6 +207,15 @@ struct FormatFragmentSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedFragmentSnapshot {
+    path: PathBuf,
+    before: String,
+    after: String,
+    parsed_before: Fragment,
+    parsed_after: Fragment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FormatFileSnapshot {
     path: PathBuf,
     contents: Option<String>,
@@ -285,6 +298,38 @@ pub enum SyncPlan {
 pub struct SyncResult {
     /// Whether applying the plan changed the changelog file.
     pub changed: bool,
+}
+
+/// Planned resolution of unpinned reference links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveLinksPlan {
+    /// Fragment paths whose frontmatter will change.
+    pub changed_fragments: Vec<PathBuf>,
+
+    /// Materialized changelog synchronization produced by the resolved links.
+    pub sync: SyncPlan,
+
+    mutation: RepositoryMutationPlan,
+}
+
+/// Options for resolving and pinning reference links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolveLinksOptions {
+    /// Apply materialized synchronization even when it may discard hand edits.
+    pub force: bool,
+}
+
+/// Result of resolving and pinning reference links.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolveLinksResult {
+    /// Fragment paths whose frontmatter changed.
+    pub changed_fragments: Vec<PathBuf>,
+
+    /// Whether the materialized changelog changed.
+    pub changelog_changed: bool,
+
+    /// Non-fatal failures while removing committed transaction claims.
+    pub cleanup_warnings: Vec<MutationCleanupWarning>,
 }
 
 /// Options for planning a release.
@@ -1345,6 +1390,307 @@ pub fn compile_unreleased(repo: &Repository, options: CompileOptions) -> Result<
     crate::compile::compile_unreleased(repo, options)
 }
 
+/// Compiles the current fragments, optionally resolving unpinned links in memory.
+///
+/// This function never writes fragment or changelog files.
+pub fn compile_unreleased_with_link_resolution(
+    repo: &Repository,
+    options: CompileOptions,
+    policy: LinkResolutionPolicy,
+) -> Result<CompiledRegion> {
+    if !policy.is_enabled(repo.config()) {
+        return compile_unreleased(repo, options);
+    }
+    let snapshots = prepare_resolved_fragments(repo, options.section.as_deref())?;
+    let version_label = current_version_label(repo)?;
+    compile_parsed_fragments(
+        repo,
+        options,
+        version_label,
+        snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.parsed_after)
+            .collect(),
+    )
+}
+
+/// Plans link resolution and any materialized changelog synchronization.
+///
+/// Planning completes every network request but does not write repository files.
+pub fn plan_resolve_links(
+    repo: &Repository,
+    options: ResolveLinksOptions,
+) -> Result<ResolveLinksPlan> {
+    plan_resolve_links_with_snapshot_hook(repo, options, || {})
+}
+
+fn plan_resolve_links_with_snapshot_hook(
+    repo: &Repository,
+    options: ResolveLinksOptions,
+    after_next_snapshot: impl FnOnce(),
+) -> Result<ResolveLinksPlan> {
+    let snapshots = prepare_resolved_fragments(repo, None)?;
+    let changed_fragments = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.before != snapshot.after)
+        .map(|snapshot| snapshot.path.clone())
+        .collect::<Vec<_>>();
+    let fragment_paths = snapshots
+        .iter()
+        .map(|snapshot| snapshot.path.clone())
+        .collect::<Vec<_>>();
+    let mut participants = snapshots
+        .iter()
+        .map(|snapshot| ReleaseFileChange {
+            path: snapshot.path.clone(),
+            before: ReleaseFileState::Present(snapshot.before.clone()),
+            after: ReleaseFileState::Present(snapshot.after.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let sync = if repo.config().changelog.materialize {
+        let next_path = next_version_path(repo);
+        let next_file = read_format_file_snapshot(repo, &next_path)?;
+        let version_label =
+            version_label_from_contents(&repo.resolve(&next_path), next_file.contents.as_deref())?;
+        after_next_snapshot();
+        let compiled_before = compile_parsed_fragments(
+            repo,
+            CompileOptions::default(),
+            version_label.clone(),
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parsed_before.clone())
+                .collect(),
+        )?;
+        let compiled_after = compile_parsed_fragments(
+            repo,
+            CompileOptions::default(),
+            version_label,
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.parsed_after.clone())
+                .collect(),
+        )?;
+        let next_state = release_state_from_optional_contents(next_file.contents);
+        participants.push(ReleaseFileChange {
+            path: next_path,
+            before: next_state.clone(),
+            after: next_state,
+        });
+
+        let changelog_path = repo.config().changelog.path.clone();
+        let changelog = read_format_file_snapshot(repo, &changelog_path)?;
+        let old_contents = changelog.contents.ok_or_else(|| Error::ReadFile {
+            path: repo.resolve(&changelog_path),
+            source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
+        })?;
+        let (expected_before, _) = synchronize_materialized_changelog(
+            repo,
+            &old_contents,
+            &compiled_before,
+            &changelog_path,
+        )?;
+        let generated_change_only = expected_before == old_contents;
+        let sync = plan_sync_from_contents(
+            repo,
+            &compiled_after,
+            old_contents.clone(),
+            SyncOptions {
+                force: options.force || generated_change_only,
+            },
+        )?;
+        let after = format_sync_pending(&sync).map_or_else(
+            || ReleaseFileState::Present(old_contents.clone()),
+            |pending| ReleaseFileState::Present(pending.new_contents.clone()),
+        );
+        participants.push(ReleaseFileChange {
+            path: changelog_path,
+            before: ReleaseFileState::Present(old_contents),
+            after,
+        });
+        sync
+    } else {
+        SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled)
+    };
+
+    Ok(ResolveLinksPlan {
+        changed_fragments,
+        sync,
+        mutation: RepositoryMutationPlan {
+            command: MutationCommand::ResolveLinks,
+            participants,
+            fragment_paths_before: fragment_paths.clone(),
+            fragment_paths_after: fragment_paths,
+        },
+    })
+}
+
+/// Applies a previously planned reference-link resolution.
+pub fn apply_resolve_links(
+    repo: &Repository,
+    plan: ResolveLinksPlan,
+) -> Result<ResolveLinksResult> {
+    let _lock = acquire_mutation_lock(repo)?;
+    let changelog_changed = format_sync_pending(&plan.sync)
+        .is_some_and(|pending| pending.old_contents != pending.new_contents);
+    let changed_fragments = plan.changed_fragments;
+    let outcome = apply_repository_mutation(repo, &plan.mutation)?;
+    Ok(ResolveLinksResult {
+        changed_fragments,
+        changelog_changed,
+        cleanup_warnings: outcome.cleanup_warnings,
+    })
+}
+
+fn current_version_label(repo: &Repository) -> Result<VersionLabel> {
+    let path = next_version_path(repo);
+    let snapshot = read_format_file_snapshot(repo, &path)?;
+    version_label_from_contents(&repo.resolve(&path), snapshot.contents.as_deref())
+}
+
+fn prepare_resolved_fragments(
+    repo: &Repository,
+    resolve_section: Option<&str>,
+) -> Result<Vec<ResolvedFragmentSnapshot>> {
+    let discovered = discover_fragment_candidates(repo)?;
+    let mut parsed = Vec::with_capacity(discovered.candidates.len());
+    let mut targets = BTreeMap::<String, (String, u64)>::new();
+    let mut resolved = BTreeMap::<String, String>::new();
+
+    for candidate in discovered.candidates {
+        let should_resolve =
+            resolve_section.is_none_or(|section| candidate.section.as_deref() == Some(section));
+        let source = fs::read_to_string(&candidate.path).map_err(|source| Error::ReadFile {
+            path: candidate.path.clone(),
+            source,
+        })?;
+        let fragment = parse_fragment(
+            candidate.relative_path.clone(),
+            &source,
+            candidate.section.clone(),
+            &repo.config().links,
+        )
+        .map_err(|source| Error::Fragment {
+            path: candidate.relative_path.clone(),
+            source,
+        })?;
+        let used = fragment
+            .items
+            .iter()
+            .flat_map(|item| item.references.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for reference in &used {
+            if should_resolve {
+                targets
+                    .entry(reference.label.clone())
+                    .or_insert_with(|| (reference.sigil.clone(), reference.number));
+            }
+            if let Some(url) = fragment.links.get(&reference.label) {
+                if let Some(existing) = resolved.get(&reference.label)
+                    && existing != url
+                {
+                    return Err(Error::ConflictingResolvedLinks {
+                        label: reference.label.clone(),
+                        first: existing.clone(),
+                        second: url.clone(),
+                    });
+                }
+                resolved.insert(reference.label.clone(), url.clone());
+            }
+        }
+        parsed.push((
+            candidate.relative_path,
+            candidate.section,
+            source,
+            fragment,
+            used,
+            should_resolve,
+        ));
+    }
+
+    let resolver = ReferenceUrlResolver::new();
+    for (label, (sigil, number)) in &targets {
+        if resolved.contains_key(label) {
+            continue;
+        }
+        let template = repo
+            .config()
+            .links
+            .iter()
+            .find(|(configured, _)| configured.as_str() == sigil)
+            .map(|(_, template)| template)
+            .expect("parsed references always retain a configured sigil");
+        let source_url = template.as_str().replace("{n}", &number.to_string());
+        if !is_http_reference_url(&source_url) {
+            continue;
+        }
+        resolved.insert(label.clone(), resolver.resolve(label, &source_url)?);
+    }
+
+    parsed
+        .into_iter()
+        .map(
+            |(path, section, before, parsed_before, used, should_resolve)| {
+                if !should_resolve {
+                    return Ok(ResolvedFragmentSnapshot {
+                        path,
+                        after: before.clone(),
+                        before,
+                        parsed_after: parsed_before.clone(),
+                        parsed_before,
+                    });
+                }
+                let links = used
+                    .iter()
+                    .filter_map(|reference| {
+                        resolved
+                            .get(&reference.label)
+                            .map(|url| (reference.label.clone(), url.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let after = source_with_resolved_links(&before, &links)
+                    .map_err(|error| with_fragment_path(error, path.clone()))?;
+                let parsed_after =
+                    parse_fragment(path.clone(), &after, section, &repo.config().links).map_err(
+                        |source| Error::Fragment {
+                            path: path.clone(),
+                            source,
+                        },
+                    )?;
+                Ok(ResolvedFragmentSnapshot {
+                    path,
+                    before,
+                    after,
+                    parsed_before,
+                    parsed_after,
+                })
+            },
+        )
+        .collect()
+}
+
+fn source_with_resolved_links(source: &str, links: &BTreeMap<String, String>) -> Result<String> {
+    let mut parsed = parse_frontmatter_for_format(source)?;
+    parsed
+        .frontmatter
+        .retain(|entry| entry.key != Value::String(String::from("links")));
+    if !links.is_empty() {
+        let mut mapping = Mapping::new();
+        for (label, url) in links {
+            mapping.insert(Value::String(label.clone()), Value::String(url.clone()));
+        }
+        parsed.frontmatter.push(FrontmatterEntry {
+            key: Value::String(String::from("links")),
+            value: Value::Mapping(mapping),
+        });
+    }
+    let mut output = canonical_frontmatter(parsed.frontmatter)?;
+    output.push_str(parsed.body);
+    Ok(output)
+}
+
 /// Reads one released section from the configured changelog.
 pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> {
     let config = &repo.config().changelog;
@@ -1504,6 +1850,26 @@ fn apply_sync_unlocked(repo: &Repository, plan: SyncPlan) -> Result<SyncResult> 
 
 /// Plans a release operation.
 pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<ReleasePlan> {
+    plan_release_with_resolved_fragments(repo, options, None)
+}
+
+/// Plans a release whose unpinned reference links are resolved in memory.
+///
+/// The consumed fragment files are not rewritten before they are removed by
+/// [`apply_release`].
+pub fn plan_release_with_link_resolution(
+    repo: &Repository,
+    options: ReleaseOptions,
+) -> Result<ReleasePlan> {
+    let resolved = prepare_resolved_fragments(repo, None)?;
+    plan_release_with_resolved_fragments(repo, options, Some(resolved))
+}
+
+fn plan_release_with_resolved_fragments(
+    repo: &Repository,
+    options: ReleaseOptions,
+    resolved: Option<Vec<ResolvedFragmentSnapshot>>,
+) -> Result<ReleasePlan> {
     let _lock = acquire_mutation_lock(repo)?;
 
     let changelog_path = repo.config().changelog.path.clone();
@@ -1540,23 +1906,57 @@ pub fn plan_release(repo: &Repository, options: ReleaseOptions) -> Result<Releas
             date: format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
         });
     }
-    let (consumed_fragments, parsed_fragments) = snapshot_release_fragments(repo)?;
+    let (consumed_fragments, parsed_fragments_before) = snapshot_release_fragments(repo)?;
+    let parsed_fragments = if let Some(resolved) = resolved {
+        if consumed_fragments.len() != resolved.len() {
+            return Err(Error::StaleReleasePlan {
+                path: resolved
+                    .first()
+                    .map(|planned| planned.path.clone())
+                    .unwrap_or_else(|| repo.config().fragments.directory.clone()),
+            });
+        }
+        for (actual, planned) in consumed_fragments.iter().zip(&resolved) {
+            if actual.path != planned.path {
+                return Err(Error::StaleReleasePlan {
+                    path: planned.path.clone(),
+                });
+            }
+            if actual.contents != planned.before {
+                return Err(Error::StaleReleasePlan {
+                    path: planned.path.clone(),
+                });
+            }
+        }
+        resolved
+            .into_iter()
+            .map(|snapshot| snapshot.parsed_after)
+            .collect()
+    } else {
+        parsed_fragments_before.clone()
+    };
     let version_label = next_version
         .as_ref()
         .map_or(VersionLabel::Unreleased, |version| {
             VersionLabel::Version(version.clone())
         });
-    let compiled = compile_parsed_fragments(
+    let compiled_before = compile_parsed_fragments(
         repo,
         CompileOptions::default(),
-        version_label,
-        parsed_fragments,
+        version_label.clone(),
+        parsed_fragments_before,
     )?;
     ensure_materialized_release_snapshot_current(
         repo,
         &changelog_path,
         &changelog_before,
-        &compiled,
+        &compiled_before,
+    )?;
+    let compiled = compile_parsed_fragments(
+        repo,
+        CompileOptions::default(),
+        version_label,
+        parsed_fragments,
     )?;
     let old_changelog = release_file_state_utf8(repo, &changelog_path, &changelog_before)?
         .map_or_else(
@@ -1983,6 +2383,9 @@ fn plan_carry_mutation(
         .materialize
         .then(|| parse_release_fragment_sources(repo, &after_sources))
         .transpose()?;
+    if parsed_after.is_none() {
+        validate_parseable_fragment_pin_consistency(repo, &after_sources)?;
+    }
     let next_path = next_version_path(repo);
     let next_state = read_release_file_state(repo, &next_path)?;
     let mut participants = Vec::with_capacity(after_sources.len() + 2);
@@ -2171,6 +2574,10 @@ pub fn check(repo: &Repository, options: CheckOptions) -> Result<CheckReport> {
     }
 
     if violations.is_empty() {
+        // Validate repository-wide resolved-link consistency even when
+        // materialization is disabled. Compilation never performs network
+        // resolution on the check path.
+        compile_unreleased(repo, CompileOptions::default())?;
         match plan_sync(repo, SyncOptions { force: false })? {
             SyncPlan::NeedsConfirmation { diff, .. } => {
                 violations.push(CheckViolation {
@@ -3029,6 +3436,26 @@ fn parse_release_fragment_sources(
             })
         })
         .collect()
+}
+
+fn validate_parseable_fragment_pin_consistency(
+    repo: &Repository,
+    sources: &[ReleaseFragmentSource],
+) -> Result<()> {
+    let fragments = sources
+        .iter()
+        .filter_map(|source| {
+            let contents = std::str::from_utf8(&source.contents).ok()?;
+            parse_fragment(
+                source.path.clone(),
+                contents,
+                source.section.clone(),
+                &repo.config().links,
+            )
+            .ok()
+        })
+        .collect::<Vec<_>>();
+    validate_resolved_link_consistency(&fragments)
 }
 
 struct MutationLock {
@@ -4947,6 +5374,16 @@ fn canonical_frontmatter(mut frontmatter: Vec<FrontmatterEntry>) -> Result<Strin
         return Ok(String::new());
     }
 
+    for entry in &mut frontmatter {
+        if entry.key == Value::String(String::from("links"))
+            && let Value::Mapping(mapping) = &entry.value
+        {
+            let mut values = mapping.clone().into_iter().collect::<Vec<_>>();
+            values.sort_by_key(|(key, _)| yaml_key_sort_text(key));
+            entry.value = Value::Mapping(values.into_iter().collect());
+        }
+    }
+
     let mut output = String::from("---\n");
     if priority != 0 {
         output.push_str("priority: ");
@@ -5986,7 +6423,10 @@ fn unified_diff(old_contents: &str, new_contents: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::thread;
 
     use proptest::prelude::*;
     use tempfile::TempDir;
@@ -6083,6 +6523,80 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    struct TestHttpServer {
+        base: String,
+        address: SocketAddr,
+        response_count: usize,
+        handle: Option<thread::JoinHandle<Vec<String>>>,
+    }
+
+    impl TestHttpServer {
+        fn spawn(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+            let address = listener.local_addr().expect("address");
+            let base = format!("http://{address}");
+            let response_count = responses.len();
+            let handle = thread::spawn(move || {
+                let mut requests = Vec::new();
+                for response in responses {
+                    let (mut stream, _) = listener.accept().expect("connection");
+                    requests.push(
+                        BufReader::new(&stream)
+                            .lines()
+                            .next()
+                            .expect("request line")
+                            .expect("request contents"),
+                    );
+                    stream.write_all(response.as_bytes()).expect("response");
+                }
+                requests
+            });
+            Self {
+                base,
+                address,
+                response_count,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            wake_http_server(self.address, self.response_count);
+            self.handle.take().expect("handle").join().expect("server")
+        }
+    }
+
+    impl Drop for TestHttpServer {
+        fn drop(&mut self) {
+            let Some(handle) = self.handle.take() else {
+                return;
+            };
+            wake_http_server(self.address, self.response_count);
+            handle.join().expect("server");
+        }
+    }
+
+    fn wake_http_server(address: SocketAddr, attempts: usize) {
+        for _ in 0..attempts {
+            let Ok(mut stream) = TcpStream::connect(address) else {
+                break;
+            };
+            stream
+                .write_all(b"HEAD /test-server-shutdown HTTP/1.1\r\n\r\n")
+                .expect("shutdown request");
+        }
+    }
+
+    fn http_response(status: &str, location: Option<&str>) -> String {
+        let mut output = format!("HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n");
+        if let Some(location) = location {
+            output.push_str("Location: ");
+            output.push_str(location);
+            output.push_str("\r\n");
+        }
+        output.push_str("\r\n");
+        output
     }
 
     fn release_date() -> ReleaseDate {
@@ -7978,7 +8492,7 @@ mod tests {
         .expect("old fragment");
         fs::write(
             temp.path().join("CHANGES.md"),
-            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.  [[#8]]\n\n[#8]: https://example.com/issues/8\n",
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Fixed carry.  [[#8](https://example.com/pull/8)]\n\n[#8]: https://example.com/pull/8\n",
         )
         .expect("changelog");
 
@@ -7998,8 +8512,37 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.path().join("changes.d/carried-from-1.1.5.md"))
                 .expect("fragment"),
-            " -  Fixed carry.  [[#8]]\n"
+            "---\nlinks:\n  '#8': https://example.com/pull/8\n---\n -  Fixed carry.  [[#8]]\n"
         );
+    }
+
+    #[test]
+    fn import_unreleased_preserves_resolved_reference_destinations() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Fixed import.  [[#9](https://example.com/discussions/9)]\n\n[#9]: https://example.com/discussions/9\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("import plan");
+        apply_import_unreleased(&repo, plan).expect("apply import");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/imported-unreleased.md"))
+                .expect("fragment"),
+            "---\nlinks:\n  '#9': https://example.com/discussions/9\n---\n -  Fixed import.  [[#9]]\n"
+        );
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains("[#9]: https://example.com/discussions/9"));
+        assert!(!changelog.contains("[#9]: https://example.com/issues/9"));
     }
 
     #[test]
@@ -8108,6 +8651,55 @@ mod tests {
                 .expect("carried fragment"),
             " -  Fixed carry.\n"
         );
+    }
+
+    #[test]
+    fn fragments_only_carry_rejects_a_pin_conflicting_with_an_existing_fragment() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let existing = temp.path().join("changes.d/existing.md");
+        let existing_source = "\
+---
+links:
+  '#1': https://example.com/issues/1
+---
+ -  Existing change.  [[#1]]
+";
+        fs::write(&existing, existing_source).expect("existing fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 1.1.5\n-------------\n\nReleased on July 1, 2026.\n\n -  Carried change.  [[#1](https://example.com/pull/1)]\n\n[#1]: https://example.com/pull/1\n",
+        )
+        .expect("changelog");
+
+        let error = carry(
+            &repo,
+            CarryOptions {
+                version: String::from("1.1.5"),
+            },
+        )
+        .expect_err("conflicting pins");
+
+        assert!(matches!(
+            error,
+            Error::ConflictingResolvedLinks { ref label, ref first, ref second }
+                if label == "#1"
+                    && first == "https://example.com/pull/1"
+                    && second == "https://example.com/issues/1"
+        ));
+        assert_eq!(
+            fs::read_to_string(existing).expect("existing fragment"),
+            existing_source
+        );
+        assert!(!temp.path().join("changes.d/carried-from-1.1.5.md").exists());
     }
 
     // APFS rejects the deliberately non-UTF-8 path before carry can inspect it.
@@ -8846,6 +9438,100 @@ mod tests {
             fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
             "Project changes\n===============\n\nVersion 1.2.0\n-------------\n\nReleased on July 8, 2026.\n\n -\n\n\nVersion 1.1.0\n-------------\n\nReleased on July 1, 2026.\n"
         );
+    }
+
+    #[test]
+    fn release_resolves_links_in_memory_before_consuming_fragments() {
+        let server = TestHttpServer::spawn(vec![
+            http_response("302 Found", Some("/pull/3")),
+            http_response("200 OK", None),
+        ]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "0.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/release.md"),
+            " -  Fixed release links.  [[#3]]\n",
+        )
+        .expect("fragment");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+
+        let plan = plan_release_with_link_resolution(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect("release plan");
+        assert!(
+            plan.released_markdown
+                .contains(&format!("[#3]: {}/pull/3", server.base))
+        );
+
+        apply_release(&repo, plan).expect("release");
+
+        assert!(!temp.path().join("changes.d/release.md").exists());
+        assert!(
+            fs::read_to_string(temp.path().join("CHANGES.md"))
+                .expect("changelog")
+                .contains(&format!("[#3]: {}/pull/3", server.base))
+        );
+        assert_eq!(
+            server.finish(),
+            vec!["HEAD /issues/3 HTTP/1.1", "HEAD /pull/3 HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn resolving_release_rejects_a_fragment_changed_after_resolution() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "0.2.0\n").expect("next");
+        let fragment = temp.path().join("changes.d/release.md");
+        fs::write(
+            &fragment,
+            "---\nlinks:\n  '#3': https://example.com/pull/3\n---\n -  Before.  [[#3]]\n",
+        )
+        .expect("fragment");
+        fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
+        let resolved = prepare_resolved_fragments(&repo, None).expect("resolved snapshots");
+        fs::write(
+            &fragment,
+            "---\nlinks:\n  '#3': https://example.com/pull/3\n---\n -  After.  [[#3]]\n",
+        )
+        .expect("concurrent edit");
+
+        let error = plan_release_with_resolved_fragments(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+            Some(resolved),
+        )
+        .expect_err("stale fragment");
+
+        assert!(matches!(
+            error,
+            Error::StaleReleasePlan { ref path }
+                if path == Path::new("changes.d/release.md")
+        ));
     }
 
     #[test]
@@ -11851,6 +12537,463 @@ mod tests {
     }
 
     #[test]
+    fn resolve_links_pins_fragments_and_syncs_generated_output_atomically() {
+        let server = TestHttpServer::spawn(vec![
+            http_response("302 Found", Some("/pull/1")),
+            http_response("200 OK", None),
+        ]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let fragment_path = temp.path().join("changes.d/change.md");
+        let fragment_before = " -  Fixed links.  [[#1]]\n";
+        fs::write(&fragment_path, fragment_before).expect("fragment");
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let changelog_before = format!("Changelog\n=========\n\n{}", compiled.markdown);
+        fs::write(temp.path().join("CHANGES.md"), &changelog_before).expect("changelog");
+
+        let plan = plan_resolve_links(&repo, ResolveLinksOptions::default()).expect("plan");
+
+        assert_eq!(
+            plan.changed_fragments,
+            vec![PathBuf::from("changes.d/change.md")]
+        );
+        assert!(matches!(plan.sync, SyncPlan::Apply(_)));
+        assert_eq!(
+            fs::read_to_string(&fragment_path).expect("fragment"),
+            fragment_before
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog_before
+        );
+
+        let result = apply_resolve_links(&repo, plan).expect("apply");
+
+        assert!(result.changelog_changed);
+        let fragment = fs::read_to_string(&fragment_path).expect("resolved fragment");
+        assert!(fragment.contains("'#1':"));
+        assert!(fragment.contains(&format!("{}/pull/1", server.base)));
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains(&format!("[#1]: {}/pull/1", server.base)));
+        assert_eq!(
+            server.finish(),
+            vec!["HEAD /issues/1 HTTP/1.1", "HEAD /pull/1 HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn resolving_preview_uses_existing_pin_without_writing_or_network() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let source =
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Fixed links.  [[#1]]\n";
+        let path = temp.path().join("changes.d/change.md");
+        fs::write(&path, source).expect("fragment");
+
+        let compiled = compile_unreleased_with_link_resolution(
+            &repo,
+            CompileOptions::default(),
+            LinkResolutionPolicy::Always,
+        )
+        .expect("preview");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/pull/1")
+        );
+        assert_eq!(fs::read_to_string(path).expect("fragment"), source);
+    }
+
+    #[test]
+    fn resolving_preview_only_requests_links_from_the_selected_section() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("core fragments");
+        fs::create_dir_all(temp.path().join("changes.d/cli")).expect("CLI fragments");
+        fs::write(
+            temp.path().join("changes.d/core/change.md"),
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Fixed core.  [[#1]]\n",
+        )
+        .expect("core fragment");
+        fs::write(
+            temp.path().join("changes.d/cli/change.md"),
+            " -  Fixed CLI.  [[#2]]\n",
+        )
+        .expect("CLI fragment");
+
+        let compiled = compile_unreleased_with_link_resolution(
+            &repo,
+            CompileOptions {
+                section: Some(String::from("core")),
+                ..CompileOptions::default()
+            },
+            LinkResolutionPolicy::Always,
+        )
+        .expect("selected preview");
+
+        assert!(compiled.markdown.contains("Fixed core."));
+        assert!(!compiled.markdown.contains("Fixed CLI."));
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/pull/1")
+        );
+    }
+
+    #[test]
+    fn resolving_preview_uses_a_pin_from_an_unselected_section() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("core fragments");
+        fs::create_dir_all(temp.path().join("changes.d/cli")).expect("CLI fragments");
+        fs::write(
+            temp.path().join("changes.d/core/change.md"),
+            " -  Fixed core.  [[#1]]\n",
+        )
+        .expect("core fragment");
+        fs::write(
+            temp.path().join("changes.d/cli/change.md"),
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Fixed CLI.  [[#1]]\n",
+        )
+        .expect("CLI fragment");
+
+        let compiled = compile_unreleased_with_link_resolution(
+            &repo,
+            CompileOptions {
+                section: Some(String::from("core")),
+                ..CompileOptions::default()
+            },
+            LinkResolutionPolicy::Always,
+        )
+        .expect("selected preview");
+
+        assert!(compiled.markdown.contains("Fixed core."));
+        assert!(!compiled.markdown.contains("Fixed CLI."));
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/pull/1")
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn resolving_preview_leaves_non_http_references_unpinned(
+            template in prop_oneof![
+                Just("/issues/{n}"),
+                Just("mailto:issue-{n}@example.com"),
+            ],
+        ) {
+            let config = format!(
+                "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{template}\"\n"
+            );
+            let (temp, repo) = repo_with_config(&config);
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+            fs::write(
+                temp.path().join("changes.d/change.md"),
+                " -  Fixed links.  [[#1]]\n",
+            )
+            .expect("fragment");
+
+            let compiled = compile_unreleased_with_link_resolution(
+                &repo,
+                CompileOptions::default(),
+                LinkResolutionPolicy::Always,
+            )
+            .expect("preview");
+
+            let expected = format!("[#1]: {}", template.replace("{n}", "1"));
+            prop_assert!(compiled.markdown.contains(&expected));
+        }
+    }
+
+    #[test]
+    fn resolve_links_still_pins_fragments_when_materialization_is_disabled() {
+        let server = TestHttpServer::spawn(vec![http_response("200 OK", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let path = temp.path().join("changes.d/change.md");
+        fs::write(&path, " -  Fixed links.  [[#1]]\n").expect("fragment");
+
+        let plan = plan_resolve_links(&repo, ResolveLinksOptions::default()).expect("plan");
+        assert!(matches!(
+            plan.sync,
+            SyncPlan::Skipped(SyncSkipReason::MaterializationDisabled)
+        ));
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        assert!(
+            fs::read_to_string(path)
+                .expect("fragment")
+                .contains("links:")
+        );
+        assert_eq!(server.finish(), vec!["HEAD /issues/1 HTTP/1.1"]);
+    }
+
+    #[test]
+    fn resolve_links_requests_each_label_once_and_pins_every_using_fragment() {
+        let server = TestHttpServer::spawn(vec![http_response("200 OK", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        fs::write(&first, " -  Fixed the first path.  [[#1]]\n").expect("first fragment");
+        fs::write(&second, " -  Fixed the second path.  [[#1]]\n").expect("second fragment");
+
+        let plan = plan_resolve_links(&repo, ResolveLinksOptions::default()).expect("plan");
+        assert_eq!(
+            plan.changed_fragments,
+            vec![
+                PathBuf::from("changes.d/first.md"),
+                PathBuf::from("changes.d/second.md"),
+            ]
+        );
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        let expected_url = format!("{}/issues/1", server.base);
+        assert!(
+            fs::read_to_string(first)
+                .expect("first")
+                .contains(&expected_url)
+        );
+        assert!(
+            fs::read_to_string(second)
+                .expect("second")
+                .contains(&expected_url)
+        );
+        assert_eq!(server.finish(), vec!["HEAD /issues/1 HTTP/1.1"]);
+    }
+
+    #[test]
+    fn resolve_links_propagates_an_existing_pin_without_network_access() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        fs::write(
+            &first,
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  First.  [[#1]]\n",
+        )
+        .expect("first fragment");
+        fs::write(&second, " -  Second.  [[#1]]\n").expect("second fragment");
+
+        let plan = plan_resolve_links(&repo, ResolveLinksOptions::default()).expect("plan");
+        assert_eq!(
+            plan.changed_fragments,
+            vec![PathBuf::from("changes.d/second.md")]
+        );
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        assert!(
+            fs::read_to_string(second)
+                .expect("second")
+                .contains("https://example.com/pull/1")
+        );
+    }
+
+    #[test]
+    fn resolve_links_rejects_conflicting_existing_pins_before_network_access() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/first.md"),
+            "---\nlinks:\n  '#1': https://example.com/issues/1\n---\n -  First.  [[#1]]\n",
+        )
+        .expect("first fragment");
+        fs::write(
+            temp.path().join("changes.d/second.md"),
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Second.  [[#1]]\n",
+        )
+        .expect("second fragment");
+
+        let error = plan_resolve_links(&repo, ResolveLinksOptions::default())
+            .expect_err("conflicting pins");
+
+        assert!(matches!(
+            error,
+            Error::ConflictingResolvedLinks { ref label, ref first, ref second }
+                if label == "#1"
+                    && first == "https://example.com/issues/1"
+                    && second == "https://example.com/pull/1"
+        ));
+    }
+
+    #[test]
+    fn resolved_sync_rejects_next_file_changed_after_version_snapshot() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let next = temp.path().join("changes.d/next");
+        fs::write(&next, "0.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/change.md"),
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Fixed links.  [[#1]]\n",
+        )
+        .expect("fragment");
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!("Changelog\n=========\n\n{}", compiled.markdown),
+        )
+        .expect("changelog");
+
+        let plan = plan_resolve_links_with_snapshot_hook(
+            &repo,
+            ResolveLinksOptions { force: true },
+            || fs::write(&next, "0.3.0\n").expect("concurrent next"),
+        )
+        .expect("plan");
+
+        let error = apply_resolve_links(&repo, plan).expect_err("stale next snapshot");
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::ResolveLinks,
+                ref path,
+            } if path == Path::new("changes.d/next")
+        ));
+        assert_eq!(fs::read_to_string(next).expect("next"), "0.3.0\n");
+    }
+
+    proptest! {
+        #[test]
+        fn resolved_link_frontmatter_is_idempotent(
+            numbers in prop::collection::btree_set(1_u64..10_000, 0..20),
+        ) {
+            let links = numbers
+                .into_iter()
+                .map(|number| {
+                    (
+                        format!("#{number}"),
+                        format!("https://example.com/pull/{number}"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let source = "---\npriority: 2\nlinks:\n  stale: https://example.com/stale\n---\n -  Fixed links.\n";
+
+            let once = source_with_resolved_links(source, &links).expect("first rewrite");
+            let twice = source_with_resolved_links(&once, &links).expect("second rewrite");
+
+            prop_assert_eq!(once, twice);
+        }
+    }
+
+    #[test]
+    fn link_resolution_failure_leaves_every_fragment_unchanged() {
+        let server = TestHttpServer::spawn(vec![http_response("404 Not Found", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let path = temp.path().join("changes.d/change.md");
+        let source = " -  Fixed links.  [[#1]]\n";
+        fs::write(&path, source).expect("fragment");
+
+        let error = plan_resolve_links(&repo, ResolveLinksOptions::default())
+            .expect_err("resolution failure");
+
+        assert!(matches!(error, Error::LinkResolutionFailed { .. }));
+        assert_eq!(fs::read_to_string(path).expect("fragment"), source);
+        server.finish();
+    }
+
+    #[test]
+    fn resolved_link_plan_rejects_a_concurrent_fragment_edit() {
+        let server = TestHttpServer::spawn(vec![http_response("200 OK", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let path = temp.path().join("changes.d/change.md");
+        fs::write(&path, " -  Fixed links.  [[#1]]\n").expect("fragment");
+        let plan = plan_resolve_links(&repo, ResolveLinksOptions::default()).expect("plan");
+        let concurrent = " -  Changed concurrently.  [[#1]]\n";
+        fs::write(&path, concurrent).expect("concurrent edit");
+
+        let error = apply_resolve_links(&repo, plan).expect_err("stale plan");
+
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::ResolveLinks,
+                ..
+            }
+        ));
+        assert_eq!(fs::read_to_string(path).expect("fragment"), concurrent);
+        server.finish();
+    }
+
+    #[test]
     fn sync_starts_materialized_region_for_new_fragment_after_closed_release() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
@@ -12765,6 +13908,60 @@ mod tests {
     }
 
     #[test]
+    fn check_allows_unpinned_links_without_network_when_resolution_is_enabled() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "http://127.0.0.1:1/issues/{n}"
+
+            [link-resolution]
+            enabled = true
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/change.md"),
+            " -  Fixed links.  [[#1]]\n",
+        )
+        .expect("fragment");
+
+        let report = check(&repo, CheckOptions::default()).expect("check");
+
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn check_rejects_conflicting_pins_when_materialization_is_disabled() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/one.md"),
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Fixed one. [[#1]]\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("changes.d/two.md"),
+            "---\nlinks:\n  '#1': https://example.net/pull/1\n---\n -  Fixed two. [[#1]]\n",
+        )
+        .expect("fragment");
+
+        let error = check(&repo, CheckOptions::default()).expect_err("conflicting pins");
+
+        assert!(matches!(error, Error::ConflictingResolvedLinks { .. }));
+    }
+
+    #[test]
     fn check_reports_formatting_mismatch() {
         let (temp, repo) = repo_with_config(
             r#"
@@ -13359,6 +14556,19 @@ mod tests {
         assert_eq!(
             formatted,
             "---\npriority: -2\nowner: core\n---\n -  Added \"quotes...\" and 'apostrophes'.\n"
+        );
+    }
+
+    #[test]
+    fn format_fragment_source_sorts_resolved_links() {
+        let formatted = format_fragment_source(
+            "---\nlinks:\n  \"#2\": https://example.com/issues/2\n  \"#1\": https://example.com/pull/1\n---\n- Fixed links. [[#1], [#2]]\n",
+        )
+        .expect("format");
+
+        assert_eq!(
+            formatted,
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n  '#2': https://example.com/issues/2\n---\n -  Fixed links. [[#1], [#2]]\n"
         );
     }
 

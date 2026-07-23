@@ -197,6 +197,7 @@ before committing:
 
 ~~~~ sh
 sacho fmt
+sacho resolve-links  # optional: pin final redirected reference URLs
 sacho preview
 sacho check
 ~~~~

@@ -29,6 +29,7 @@ snafu = "0.9.1"
 thiserror = "2.0.18"
 toml = "1.1.2"
 url = "2.5.8"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

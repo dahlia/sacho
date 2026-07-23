@@ -13,8 +13,9 @@ use snafu::ResultExt;
 use crate::config::{ReferenceSigil, UrlTemplate};
 use crate::error::{
     FragmentError, FrontmatterSnafu, ReadFileSnafu, Result, UnclosedFrontmatterSnafu,
-    UnknownReferenceSnafu,
+    UnknownReferenceSnafu, redact_url_credentials,
 };
+use crate::link_resolution::validate_http_url;
 use crate::repo::Repository;
 
 /// Parsed changelog fragment.
@@ -28,6 +29,9 @@ pub struct Fragment {
 
     /// Sort priority read from frontmatter.
     pub priority: i32,
+
+    /// Resolved reference URLs pinned in frontmatter.
+    pub links: BTreeMap<String, String>,
 
     /// Items contributed by the fragment.
     pub items: Vec<FragmentItem>,
@@ -60,6 +64,9 @@ pub struct FragmentItem {
 pub struct Frontmatter {
     /// Sort priority for all items in the fragment.
     pub priority: i32,
+
+    /// Resolved reference URLs keyed by complete reference label.
+    pub links: BTreeMap<String, String>,
 
     /// Frontmatter keys Sacho does not understand.
     pub unknown_keys: Vec<String>,
@@ -137,6 +144,8 @@ pub enum DiscoveryWarning {
 #[derive(Debug, Deserialize)]
 struct RawFrontmatter {
     priority: Option<i32>,
+    #[serde(default)]
+    links: BTreeMap<String, String>,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_yaml_ng::Value>,
 }
@@ -294,14 +303,54 @@ pub fn parse_fragment(
             references,
         });
     }
+    validate_resolved_link_labels(&frontmatter.links, &items, link_templates)?;
 
     Ok(Fragment {
         path,
         section,
         priority: frontmatter.priority,
+        links: frontmatter.links,
         items,
         warnings,
     })
+}
+
+fn validate_resolved_link_labels(
+    links: &BTreeMap<String, String>,
+    items: &[FragmentItem],
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> std::result::Result<(), FragmentError> {
+    for label in links.keys() {
+        if !is_complete_reference_label(label, link_templates) {
+            return Err(FragmentError::InvalidResolvedLinkLabel {
+                label: label.clone(),
+                reason: String::from(
+                    "must be a configured link sigil followed by a reference number",
+                ),
+            });
+        }
+        let is_used = items
+            .iter()
+            .flat_map(|item| &item.references)
+            .any(|reference| reference.label == *label);
+        if !is_used {
+            return Err(FragmentError::InvalidResolvedLinkLabel {
+                label: label.clone(),
+                reason: String::from("label is not used by this fragment"),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_complete_reference_label(
+    label: &str,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> bool {
+    matches!(
+        parse_reference_label(label, link_templates),
+        Ok(Some(reference)) if reference.label == label
+    )
 }
 
 fn collect_markdown_files(
@@ -408,11 +457,28 @@ impl Frontmatter {
             return Ok(Self::default());
         }
         let raw: RawFrontmatter = serde_yaml_ng::from_str(yaml).context(FrontmatterSnafu)?;
+        for (label, value) in &raw.links {
+            validate_resolved_link(label, value)?;
+        }
         Ok(Self {
             priority: raw.priority.unwrap_or_default(),
+            links: raw.links,
             unknown_keys: raw.extra.into_keys().collect(),
         })
     }
+}
+
+pub(crate) fn validate_resolved_link(
+    label: &str,
+    value: &str,
+) -> std::result::Result<(), FragmentError> {
+    validate_http_url(value)
+        .map(drop)
+        .map_err(|reason| FragmentError::InvalidResolvedLink {
+            label: label.to_owned(),
+            url: redact_url_credentials(value),
+            reason,
+        })
 }
 
 fn comrak_options() -> ComrakOptions<'static> {
@@ -672,6 +738,19 @@ mod tests {
     }
 
     #[test]
+    fn treats_null_resolved_links_as_empty() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n---\n -  Added thing.\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert!(fragment.links.is_empty());
+    }
+
+    #[test]
     fn parses_empty_frontmatter() {
         let fragment = parse_fragment(
             "change.md".into(),
@@ -682,6 +761,106 @@ mod tests {
         .expect("fragment");
 
         assert_eq!(fragment.priority, 0);
+    }
+
+    #[test]
+    fn parses_resolved_links_from_frontmatter() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#123\": https://example.com/pull/123\n---\n -  Fixed thing.  [[#123]]\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(
+            fragment.links,
+            BTreeMap::from([(
+                String::from("#123"),
+                String::from("https://example.com/pull/123")
+            )])
+        );
+        assert!(fragment.warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_resolved_link_labels() {
+        let error = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#l\": https://example.com/pull/1\n---\n -  Fixed thing.  [[#1]]\n",
+            None,
+            &links(),
+        )
+        .expect_err("resolved link labels must be complete configured references");
+
+        assert!(error.to_string().contains("resolved link label"));
+        assert!(error.to_string().contains("#l"));
+    }
+
+    proptest! {
+        #[test]
+        fn resolved_link_labels_must_be_used_by_the_fragment(
+            pinned in 0_u64..10_000,
+            used in 0_u64..10_000,
+        ) {
+            let source = format!(
+                "---\nlinks:\n  \"#{pinned}\": https://example.com/pull/{pinned}\n---\n -  Fixed thing.  [[#{used}]]\n"
+            );
+            let result = parse_fragment("change.md".into(), &source, None, &links());
+
+            if pinned == used {
+                prop_assert!(result.is_ok());
+            } else {
+                let error = result.expect_err("unused resolved link labels must fail");
+                prop_assert!(error.to_string().contains("resolved link label"));
+                prop_assert!(error.to_string().contains("not used"));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_non_http_resolved_link() {
+        let error = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#123\": file:///tmp/123\n---\n -  Fixed thing.  [[#123]]\n",
+            None,
+            &links(),
+        )
+        .expect_err("resolved links must be HTTP URLs");
+
+        assert!(matches!(
+            error,
+            FragmentError::InvalidResolvedLink { ref label, .. } if label == "#123"
+        ));
+    }
+
+    #[test]
+    fn rejects_resolved_links_with_username_or_password() {
+        for url in [
+            "https://user:secret@example.com/pull/123",
+            "https://:secret@example.com/pull/123",
+        ] {
+            let source =
+                format!("---\nlinks:\n  \"#123\": {url}\n---\n -  Fixed thing.  [[#123]]\n");
+            let error = parse_fragment("change.md".into(), &source, None, &links())
+                .expect_err("resolved links must not contain userinfo");
+
+            assert!(matches!(
+                error,
+                FragmentError::InvalidResolvedLink { ref label, ref reason, .. }
+                    if label == "#123" && reason.contains("userinfo")
+            ));
+            let FragmentError::InvalidResolvedLink {
+                url: reported_url, ..
+            } = &error
+            else {
+                unreachable!("checked above");
+            };
+            assert!(!reported_url.contains("user:secret"));
+            assert!(!reported_url.contains(":secret@"));
+            assert!(!error.to_string().contains("user:secret"));
+            assert!(!error.to_string().contains(":secret@"));
+        }
     }
 
     #[test]

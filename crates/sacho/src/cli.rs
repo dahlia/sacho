@@ -10,13 +10,15 @@ use miette::{Diagnostic, GraphicalReportHandler, GraphicalTheme, Report};
 use sacho::commands::{
     AddOptions, CarryOptions, CheckOptions, CheckReport, CompileOptions, FormatOptions,
     ImportUnreleasedOptions, ImportUnreleasedPlan, InitOptions, InitResult, MutationCleanupWarning,
-    NextOptions, ReleaseDate, ReleaseOptions, ShowOptions, SyncOptions, SyncPlan, add_fragment,
-    apply_format, apply_import_unreleased, apply_merge_driver, apply_release, apply_sync, carry,
-    check, commit_message_hook, compile_unreleased, infer_repository_url, infer_section_paths,
+    NextOptions, ReleaseDate, ReleaseOptions, ResolveLinksOptions, ResolveLinksResult, ShowOptions,
+    SyncOptions, SyncPlan, add_fragment, apply_format, apply_import_unreleased, apply_merge_driver,
+    apply_release, apply_resolve_links, apply_sync, carry, check, commit_message_hook,
+    compile_unreleased_with_link_resolution, infer_repository_url, infer_section_paths,
     init_repository, initialization_root, mercurial_update_hook, plan_format,
-    plan_import_unreleased, plan_release, plan_sync, reference_transaction_hook, set_next_version,
-    show, suggest_section_directory,
+    plan_import_unreleased, plan_release, plan_release_with_link_resolution, plan_resolve_links,
+    plan_sync, reference_transaction_hook, set_next_version, show, suggest_section_directory,
 };
+use sacho::link_resolution::LinkResolutionPolicy;
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::released::discover_section_candidates;
 use sacho::{Error, Repository, SectionConfig};
@@ -121,11 +123,30 @@ enum Command {
     /// Format changelog fragments.
     Fmt,
 
+    /// Resolve and pin unpinned reference links.
+    ResolveLinks,
+
     /// Print the compiled unreleased region.
     Preview {
         /// Section id to preview by itself.
         #[arg(long, help = "Section id to preview by itself")]
         section: Option<String>,
+
+        /// Resolve unpinned reference links for this preview.
+        #[arg(
+            long,
+            conflicts_with = "no_resolve_links",
+            help = "Resolve unpinned reference links"
+        )]
+        resolve_links: bool,
+
+        /// Do not resolve unpinned reference links.
+        #[arg(
+            long,
+            conflicts_with = "resolve_links",
+            help = "Do not resolve unpinned reference links"
+        )]
+        no_resolve_links: bool,
     },
 
     /// Print a released changelog section.
@@ -153,6 +174,22 @@ enum Command {
         /// Apply the sync even when existing edits would be discarded.
         #[arg(long, help = "Apply even when existing edits would be discarded")]
         force: bool,
+
+        /// Resolve and pin unpinned reference links before synchronizing.
+        #[arg(
+            long,
+            conflicts_with = "no_resolve_links",
+            help = "Resolve unpinned reference links"
+        )]
+        resolve_links: bool,
+
+        /// Do not resolve unpinned reference links.
+        #[arg(
+            long,
+            conflicts_with = "resolve_links",
+            help = "Do not resolve unpinned reference links"
+        )]
+        no_resolve_links: bool,
     },
 
     /// Compile fragments into a released changelog section.
@@ -175,6 +212,22 @@ enum Command {
         /// Allow a release without substantive changelog items.
         #[arg(long, help = "Allow a release without changelog items")]
         allow_empty: bool,
+
+        /// Resolve unpinned reference links before releasing.
+        #[arg(
+            long,
+            conflicts_with = "no_resolve_links",
+            help = "Resolve unpinned reference links"
+        )]
+        resolve_links: bool,
+
+        /// Do not resolve unpinned reference links.
+        #[arg(
+            long,
+            conflicts_with = "resolve_links",
+            help = "Do not resolve unpinned reference links"
+        )]
+        no_resolve_links: bool,
     },
 
     /// Carry entries from a released section back into fragments.
@@ -269,7 +322,11 @@ impl Cli {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 if fix {
                     let prepared = plan_format(&repo, FormatOptions)?;
-                    if !confirm_sync_plan(&prepared.sync, Some("sacho check --fix"))? {
+                    if !confirm_sync_plan(
+                        &prepared.sync,
+                        Some("sacho check --fix"),
+                        LinkResolutionPolicy::Configured,
+                    )? {
                         return Ok(ExitCode::from(2));
                     }
                     let result = apply_format(&repo, prepared)?;
@@ -288,21 +345,44 @@ impl Cli {
             Command::Fmt => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let plan = plan_format(&repo, FormatOptions)?;
-                if !confirm_sync_plan(&plan.sync, Some("sacho fmt"))? {
+                if !confirm_sync_plan(
+                    &plan.sync,
+                    Some("sacho fmt"),
+                    LinkResolutionPolicy::Configured,
+                )? {
                     return Ok(ExitCode::from(2));
                 }
                 let result = apply_format(&repo, plan)?;
                 print_mutation_cleanup_warnings("sacho fmt", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Preview { section } => {
+            Command::ResolveLinks => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let compiled = compile_unreleased(
+                let plan = plan_resolve_links(&repo, ResolveLinksOptions::default())?;
+                if !confirm_sync_plan(
+                    &plan.sync,
+                    Some("sacho resolve-links"),
+                    LinkResolutionPolicy::Configured,
+                )? {
+                    return Ok(ExitCode::from(2));
+                }
+                let result = apply_resolve_links(&repo, plan)?;
+                print_resolve_links_result(&repo, "sacho resolve-links", result);
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Preview {
+                section,
+                resolve_links,
+                no_resolve_links,
+            } => {
+                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let compiled = compile_unreleased_with_link_resolution(
                     &repo,
                     CompileOptions {
                         section,
                         include_empty_region: true,
                     },
+                    link_resolution_policy(resolve_links, no_resolve_links),
                 )?;
                 print!("{}", compiled.markdown);
                 Ok(ExitCode::SUCCESS)
@@ -328,13 +408,27 @@ impl Cli {
                 }
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Sync { force } => {
+            Command::Sync {
+                force,
+                resolve_links,
+                no_resolve_links,
+            } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let plan = plan_sync(&repo, SyncOptions { force })?;
-                if !confirm_sync_plan(&plan, None)? {
-                    return Ok(ExitCode::from(2));
+                let policy = link_resolution_policy(resolve_links, no_resolve_links);
+                if policy.is_enabled(repo.config()) {
+                    let plan = plan_resolve_links(&repo, ResolveLinksOptions { force })?;
+                    if !confirm_sync_plan(&plan.sync, None, policy)? {
+                        return Ok(ExitCode::from(2));
+                    }
+                    let result = apply_resolve_links(&repo, plan)?;
+                    print_resolve_links_result(&repo, "sacho sync", result);
+                } else {
+                    let plan = plan_sync(&repo, SyncOptions { force })?;
+                    if !confirm_sync_plan(&plan, None, policy)? {
+                        return Ok(ExitCode::from(2));
+                    }
+                    apply_sync(&repo, plan)?;
                 }
-                apply_sync(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Release {
@@ -342,18 +436,23 @@ impl Cli {
                 date,
                 next,
                 allow_empty,
+                resolve_links,
+                no_resolve_links,
             } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let date = resolve_release_date(date)?;
-                let plan = plan_release(
-                    &repo,
-                    ReleaseOptions {
-                        version,
-                        date,
-                        next,
-                        allow_empty,
-                    },
-                )?;
+                let options = ReleaseOptions {
+                    version,
+                    date,
+                    next,
+                    allow_empty,
+                };
+                let policy = link_resolution_policy(resolve_links, no_resolve_links);
+                let plan = if policy.is_enabled(repo.config()) {
+                    plan_release_with_link_resolution(&repo, options)?
+                } else {
+                    plan_release(&repo, options)?
+                };
                 apply_release(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -441,6 +540,16 @@ fn print_mutation_cleanup_warnings(command: &str, warnings: &[MutationCleanupWar
     }
 }
 
+fn print_resolve_links_result(repo: &Repository, command: &str, result: ResolveLinksResult) {
+    print_mutation_cleanup_warnings(command, &result.cleanup_warnings);
+    for path in result.changed_fragments {
+        println!("{}", path.display());
+    }
+    if result.changelog_changed {
+        println!("{}", repo.config().changelog.path.display());
+    }
+}
+
 fn resolve_release_date(date: Option<String>) -> Result<ReleaseDate, CliReport> {
     match date {
         Some(date) => Ok(ReleaseDate::parse(&date)?),
@@ -490,7 +599,11 @@ fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
     }
 }
 
-fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Result<bool, CliReport> {
+fn confirm_sync_plan(
+    plan: &SyncPlan,
+    formatting_command: Option<&str>,
+    link_policy: LinkResolutionPolicy,
+) -> Result<bool, CliReport> {
     let SyncPlan::NeedsConfirmation { diff, .. } = plan else {
         return Ok(true);
     };
@@ -506,12 +619,13 @@ fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Resul
         eprintln!(
             "the synchronization shown above replaces the materialized unreleased region and may discard hand edits"
         );
+        let sync_command = sync_force_command(link_policy);
         if let Some(command) = formatting_command {
             eprintln!(
-                "run `sacho sync --force`, then rerun `{command}` to apply all fixes non-interactively"
+                "run `{sync_command}`, then rerun `{command}` to apply all fixes non-interactively"
             );
         } else {
-            eprintln!("rerun with `sacho sync --force` to apply it non-interactively");
+            eprintln!("rerun with `{sync_command}` to apply it non-interactively");
         }
         return Ok(false);
     }
@@ -520,6 +634,24 @@ fn confirm_sync_plan(plan: &SyncPlan, formatting_command: Option<&str>) -> Resul
     } else {
         eprintln!("synchronization cancelled; the repository was not changed");
         Ok(false)
+    }
+}
+
+fn sync_force_command(policy: LinkResolutionPolicy) -> &'static str {
+    match policy {
+        LinkResolutionPolicy::Always => "sacho sync --resolve-links --force",
+        LinkResolutionPolicy::Never => "sacho sync --no-resolve-links --force",
+        LinkResolutionPolicy::Configured => "sacho sync --force",
+    }
+}
+
+fn link_resolution_policy(resolve_links: bool, no_resolve_links: bool) -> LinkResolutionPolicy {
+    if resolve_links {
+        LinkResolutionPolicy::Always
+    } else if no_resolve_links {
+        LinkResolutionPolicy::Never
+    } else {
+        LinkResolutionPolicy::Configured
     }
 }
 
@@ -998,6 +1130,32 @@ mod tests {
             panic!("expected init command");
         };
         assert_eq!(integration_executable, Some(PathBuf::from("tools/sacho-1")));
+    }
+
+    #[test]
+    fn link_resolution_flags_are_mutually_exclusive() {
+        for command in ["preview", "sync", "release"] {
+            let error =
+                Cli::try_parse_from(["sacho", command, "--resolve-links", "--no-resolve-links"])
+                    .expect_err("conflicting link resolution flags");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn link_resolution_flags_select_the_expected_policy() {
+        assert_eq!(
+            link_resolution_policy(true, false),
+            LinkResolutionPolicy::Always
+        );
+        assert_eq!(
+            link_resolution_policy(false, true),
+            LinkResolutionPolicy::Never
+        );
+        assert_eq!(
+            link_resolution_policy(false, false),
+            LinkResolutionPolicy::Configured
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -147,6 +147,7 @@ pub(crate) fn compile_parsed_fragments(
     let config = repo.config();
 
     validate_requested_section(repo, options.section.as_deref(), &fragments)?;
+    let resolved_links = resolved_link_overrides(&fragments)?;
     let mut items = sortable_items(fragments);
     if let Some(section) = &options.section {
         items.retain(|item| item.section.as_deref() == Some(section.as_str()));
@@ -167,7 +168,12 @@ pub(crate) fn compile_parsed_fragments(
         if section_items.is_empty() {
             continue;
         }
-        sections.push(compile_section(section_id, section_items, &config.links));
+        sections.push(compile_section(
+            section_id,
+            section_items,
+            &config.links,
+            &resolved_links,
+        ));
     }
 
     let markdown = if sections.is_empty() && !options.include_empty_region {
@@ -186,6 +192,38 @@ pub(crate) fn compile_parsed_fragments(
         sections,
         substantive_item_count,
     })
+}
+
+fn resolved_link_overrides(fragments: &[Fragment]) -> Result<BTreeMap<String, String>> {
+    let mut resolved = BTreeMap::<String, String>::new();
+    for fragment in fragments {
+        let used_labels = fragment
+            .items
+            .iter()
+            .flat_map(|item| item.references.iter())
+            .map(|reference| reference.label.as_str())
+            .collect::<BTreeSet<_>>();
+        for label in used_labels {
+            let Some(url) = fragment.links.get(label) else {
+                continue;
+            };
+            if let Some(existing) = resolved.get(label)
+                && existing != url
+            {
+                return Err(crate::Error::ConflictingResolvedLinks {
+                    label: label.to_owned(),
+                    first: existing.clone(),
+                    second: url.clone(),
+                });
+            }
+            resolved.insert(label.to_owned(), url.clone());
+        }
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn validate_resolved_link_consistency(fragments: &[Fragment]) -> Result<()> {
+    resolved_link_overrides(fragments).map(drop)
 }
 
 fn validate_requested_section(
@@ -321,10 +359,12 @@ fn compile_section(
     id: Option<SectionId>,
     items: Vec<&SortableItem>,
     link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+    resolved_links: &BTreeMap<String, String>,
 ) -> CompiledSection {
     let references = compile_references(
         items.iter().flat_map(|item| item.references.iter()),
         link_templates,
+        resolved_links,
     );
     let mut markdown = String::new();
     if let Some(id) = &id {
@@ -355,6 +395,7 @@ fn compile_section(
 fn compile_references<'a>(
     references: impl Iterator<Item = &'a ReferenceUse>,
     link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+    resolved_links: &BTreeMap<String, String>,
 ) -> Vec<CompiledReference> {
     let sigil_order = link_templates
         .keys()
@@ -377,10 +418,15 @@ fn compile_references<'a>(
                 .iter()
                 .find(|(sigil, _)| sigil.as_str() == reference.sigil)
                 .map(|(_, template)| CompiledReference {
+                    url: resolved_links
+                        .get(&reference.label)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            template
+                                .as_str()
+                                .replace("{n}", &reference.number.to_string())
+                        }),
                     label: reference.label,
-                    url: template
-                        .as_str()
-                        .replace("{n}", &reference.number.to_string()),
                 })
         })
         .collect()
@@ -641,6 +687,59 @@ mod tests {
         );
         assert_eq!(compiled.sections[0].id, None);
         assert_eq!(compiled.sections[0].references.len(), 1);
+    }
+
+    #[test]
+    fn resolved_frontmatter_link_overrides_the_template() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/change.md"),
+            "---\nlinks:\n  \"#2\": https://example.com/pull/2\n---\n -  Fixed thing.  [[#2]]\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("[#2]: https://example.com/pull/2")
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_resolved_links_across_fragments() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/one.md"),
+            "---\nlinks:\n  \"#2\": https://example.com/pull/2\n---\n -  Fixed one.  [[#2]]\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("changes.d/two.md"),
+            "---\nlinks:\n  \"#2\": https://example.net/pull/2\n---\n -  Fixed two.  [[#2]]\n",
+        )
+        .expect("fragment");
+
+        let error = compile_unreleased(&repo, CompileOptions::default())
+            .expect_err("conflicting link overrides");
+
+        assert!(matches!(
+            error,
+            crate::Error::ConflictingResolvedLinks { ref label, .. } if label == "#2"
+        ));
     }
 
     #[test]
