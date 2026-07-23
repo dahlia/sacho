@@ -53,9 +53,10 @@ This pattern matches `packages/acme/plugin-http` with `scope = "acme"` and
 Use doubled braces for literal brace characters. `{{draft}}-{name}` matches a
 segment such as `{draft}-core`.
 
-A captured value is one nonempty path segment. It cannot be `.`, `..`, or
-contain `/` or `\`. Sacho applies these rules when matching and rendering, so a
-capture cannot escape its fragment directory.
+A captured value is nonempty and stays within one path segment. It may occupy
+only part of that segment, as `http` does in `plugin-{name}`. It cannot be `.`,
+`..`, or contain `/` or `\`. Sacho applies these rules when matching and
+rendering, so a capture cannot escape its fragment directory.
 
 Generated fragment directories must resolve to their rendered path exactly.
 This rejects symbolic-link and case aliases that could make one physical
