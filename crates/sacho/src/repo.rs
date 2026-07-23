@@ -269,6 +269,73 @@ impl Repository {
         })
     }
 
+    pub(crate) fn validate_pattern_section_directory(&self, directory: &Path) -> Result<PathBuf> {
+        let lock_path = self
+            .fixed_mutation_lock_path
+            .clone()
+            .unwrap_or_else(|| mutation_lock_path(&self.root));
+        let mut validation_cache = PathValidationCache::default();
+        let configured = validate_repository_config_paths_with_cache(
+            &self.root,
+            &self.config,
+            &mut validation_cache,
+        )
+        .context(ConfigSnafu {
+            path: self.root.join(Self::CONFIG_FILE),
+        })?;
+        let [_changelog, fragments, next, sections @ ..] = &configured[..] else {
+            unreachable!("repository path validation always returns its three base paths");
+        };
+        let section = configured_path_identity(
+            "resolved section-patterns[].directory",
+            directory,
+            self.root
+                .join(&self.config.fragments.directory)
+                .join(directory),
+            &mut validation_cache,
+        )
+        .context(ConfigSnafu {
+            path: self.root.join(Self::CONFIG_FILE),
+        })?;
+        validate_strict_descendant(
+            &section,
+            "fragments.directory",
+            &self.config.fragments.directory,
+            &fragments.identity,
+        )
+        .context(ConfigSnafu {
+            path: self.root.join(Self::CONFIG_FILE),
+        })?;
+        if section.identity != fragments.identity.join(directory) {
+            return Err(ConfigError::InvalidPath {
+                key: String::from("resolved section-patterns[].directory"),
+                path: directory.to_path_buf(),
+                reason: "must resolve to exactly its rendered path below fragments.directory",
+            })
+            .context(ConfigSnafu {
+                path: self.root.join(Self::CONFIG_FILE),
+            });
+        }
+        validate_path_overlap(next, &section).context(ConfigSnafu {
+            path: self.root.join(Self::CONFIG_FILE),
+        })?;
+        for other in sections {
+            validate_path_overlap(other, &section).context(ConfigSnafu {
+                path: self.root.join(Self::CONFIG_FILE),
+            })?;
+        }
+        validate_configured_paths_against_reserved_with_cache(
+            std::slice::from_ref(&section),
+            "repository mutation lock",
+            &lock_path,
+            &mut validation_cache,
+        )
+        .context(ConfigSnafu {
+            path: self.root.join(Self::CONFIG_FILE),
+        })?;
+        Ok(section.identity)
+    }
+
     /// Resolves a repository-relative path against the repository root.
     pub fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
         self.root.join(path)

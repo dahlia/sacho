@@ -9,11 +9,11 @@ use comrak::{Arena, Options as ComrakOptions, format_commonmark, parse_document}
 use serde::Serialize;
 
 use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
-use crate::config::SectionConfig;
 use crate::error::{Error, Result};
 use crate::fragment::{is_complete_reference_label, validate_resolved_link};
 use crate::markdown::format_markdown_with_word_wrap;
 use crate::repo::Repository;
+use crate::section::{ResolvedSection, SectionResolver, has_sections};
 
 /// Entries decompiled from a released changelog section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,7 +196,7 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
     }
 
     let mut fragments = Vec::new();
-    if repo.config().sections.is_empty() {
+    if !has_sections(repo.config()) {
         let contents = grouped.remove(&None).unwrap_or_default();
         if !contents.items.is_empty() {
             let path = carried_fragment_path(repo, None, version)?;
@@ -207,12 +207,12 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
             });
         }
     } else {
-        for section in &repo.config().sections {
+        for section in grouped_sections(repo, &grouped)? {
             let section_id = Some(section.id.clone());
             let Some(contents) = grouped.remove(&section_id) else {
                 continue;
             };
-            let path = carried_fragment_path(repo, Some(section), version)?;
+            let path = carried_fragment_path(repo, Some(&section.directory), version)?;
             fragments.push(CarriedFragment {
                 section: section_id,
                 markdown: fragment_markdown(&path, contents)?,
@@ -261,9 +261,7 @@ pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<Impor
                 }
                 saw_heading = true;
             }
-            NodeValue::Heading(heading)
-                if heading.level == 3 && !repo.config().sections.is_empty() =>
-            {
+            NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
                 if !saw_heading {
                     return Err(import_incompatible(
                         "section heading appears before version heading",
@@ -287,7 +285,7 @@ pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<Impor
                 if saw_heading
                     && plain_text(child).trim() == repo.config().changelog.unreleased_heading => {}
             NodeValue::List(list) if saw_heading && list.list_type == ListType::Bullet => {
-                if !repo.config().sections.is_empty() && current_section.is_none() {
+                if has_sections(repo.config()) && current_section.is_none() {
                     return Err(Error::ReleasedEntryWithoutSection);
                 }
                 for item in child.children() {
@@ -338,7 +336,7 @@ fn fragments_from_entries(
         merge_fragment_entry(&mut grouped, entry)?;
     }
     let mut fragments = Vec::new();
-    if repo.config().sections.is_empty() {
+    if !has_sections(repo.config()) {
         let contents = grouped.remove(&None).unwrap_or_default();
         if !contents.items.is_empty() {
             let path = repo.config().fragments.directory.join(filename);
@@ -349,7 +347,7 @@ fn fragments_from_entries(
             });
         }
     } else {
-        for section in &repo.config().sections {
+        for section in grouped_sections(repo, &grouped)? {
             let section_id = Some(section.id.clone());
             let Some(contents) = grouped.remove(&section_id) else {
                 continue;
@@ -358,7 +356,7 @@ fn fragments_from_entries(
                 .config()
                 .fragments
                 .directory
-                .join(&section.directory)
+                .join(section.directory)
                 .join(filename);
             fragments.push(CarriedFragment {
                 section: section_id,
@@ -525,17 +523,17 @@ fn collect_footnote_references<'a>(node: &'a AstNode<'a>, references: &mut BTree
 
 fn carried_fragment_path(
     repo: &Repository,
-    section: Option<&SectionConfig>,
+    section_directory: Option<&Path>,
     version: &str,
 ) -> Result<PathBuf> {
     let filename = format!("carried-from-{version}.md");
     validate_carried_filename(&filename)?;
-    let path = match section {
-        Some(section) => repo
+    let path = match section_directory {
+        Some(directory) => repo
             .config()
             .fragments
             .directory
-            .join(&section.directory)
+            .join(directory)
             .join(filename),
         None => repo.config().fragments.directory.join(filename),
     };
@@ -635,15 +633,13 @@ fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
     for child in root.children() {
         let value = child.data().value.clone();
         match value {
-            NodeValue::Heading(heading)
-                if heading.level == 3 && !repo.config().sections.is_empty() =>
-            {
+            NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
                 let section = plain_text(child).trim().to_owned();
                 ensure_known_section(repo, &section)?;
                 current_section = Some(section);
             }
             NodeValue::List(list) if list.list_type == ListType::Bullet => {
-                if !repo.config().sections.is_empty() && current_section.is_none() {
+                if has_sections(repo.config()) && current_section.is_none() {
                     return Err(Error::ReleasedEntryWithoutSection);
                 }
                 for item in child.children() {
@@ -666,11 +662,12 @@ fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
 }
 
 fn ensure_known_section(repo: &Repository, section: &str) -> Result<()> {
-    if repo
-        .config()
-        .sections
-        .iter()
-        .any(|configured| configured.id == section)
+    if SectionResolver::from_config(repo.config())?
+        .resolve_id(section)
+        .map_err(|error| Error::SectionPattern {
+            message: error.to_string(),
+        })?
+        .is_some()
     {
         Ok(())
     } else {
@@ -678,6 +675,38 @@ fn ensure_known_section(repo: &Repository, section: &str) -> Result<()> {
             section: section.to_owned(),
         })
     }
+}
+
+fn grouped_sections(
+    repo: &Repository,
+    grouped: &BTreeMap<Option<String>, FragmentContents>,
+) -> Result<Vec<ResolvedSection>> {
+    let present = grouped
+        .keys()
+        .filter_map(Clone::clone)
+        .collect::<BTreeSet<_>>();
+    let resolver = SectionResolver::from_config(repo.config())?;
+    let sections = resolver
+        .ordered_present(&present)
+        .map_err(|error| Error::SectionPattern {
+            message: error.to_string(),
+        })?
+        .into_iter()
+        .map(|id| {
+            resolver
+                .resolve_id(&id)
+                .map_err(|error| Error::SectionPattern {
+                    message: error.to_string(),
+                })?
+                .ok_or(Error::UnknownSection { section: id })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for section in &sections {
+        if section.pattern_index.is_some() {
+            repo.validate_pattern_section_directory(&section.directory)?;
+        }
+    }
+    Ok(sections)
 }
 
 fn fold_item_references<'a>(
@@ -1603,6 +1632,83 @@ Released on July 7, 2026.
         assert_eq!(
             carried.fragments[0].path,
             PathBuf::from("changes.d/core/carried-from-1.1.5.md")
+        );
+    }
+
+    #[test]
+    fn maps_patterned_section_heading_to_directory_without_source_tree() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@optique/{name}"
+            directory = "{name}"
+            "#,
+        );
+        let changelog = "\
+## Version 1.1.5
+
+Released on July 7, 2026.
+
+### @optique/core
+
+ -  Added core change.
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+
+        assert_eq!(
+            carried.fragments[0].path,
+            PathBuf::from("changes.d/core/carried-from-1.1.5.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_patterned_carry_directory_symlinked_outside_the_repository() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@optique/{name}"
+            directory = "{name}"
+            "#,
+        );
+        let outside = TempDir::new().expect("outside tempdir");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        symlink(outside.path(), temp.path().join("changes.d/core")).expect("outside symlink");
+        let changelog = "\
+## Version 1.1.5
+
+Released on July 7, 2026.
+
+### @optique/core
+
+ -  Added core change.
+";
+
+        let error = carry_release(&repo, changelog, "1.1.5").expect_err("outside directory");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
+        assert!(
+            outside
+                .path()
+                .read_dir()
+                .expect("outside directory")
+                .next()
+                .is_none()
         );
     }
 

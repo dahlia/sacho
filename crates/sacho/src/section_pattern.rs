@@ -65,6 +65,16 @@ pub enum SectionPatternError {
         /// Invalid capture value.
         value: String,
     },
+
+    /// A requested literal glob prefix is not a structural pattern prefix.
+    #[error("section pattern {prefix:?} is not a prefix of {pattern:?}")]
+    InvalidGlobPrefix {
+        /// Pattern being rendered.
+        pattern: String,
+
+        /// Pattern expected to form its literal prefix.
+        prefix: String,
+    },
 }
 
 /// Configuration for a family of changelog sections.
@@ -175,6 +185,37 @@ impl SectionPattern {
         self.render_with(captures, globset::escape)
     }
 
+    /// Renders a glob while treating a structural prefix as literal text.
+    ///
+    /// This is useful for path globs whose repository subtree must match
+    /// exactly while later segments retain glob syntax.
+    pub fn render_glob_with_literal_prefix(
+        &self,
+        prefix: &Self,
+        captures: &BTreeMap<String, String>,
+    ) -> Result<String, SectionPatternError> {
+        if !self.segments.starts_with(&prefix.segments) {
+            return Err(SectionPatternError::InvalidGlobPrefix {
+                pattern: self.to_string(),
+                prefix: prefix.to_string(),
+            });
+        }
+
+        let mut rendered = String::new();
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index != 0 {
+                rendered.push('/');
+            }
+            if index < prefix.segments.len() {
+                let literal = render_segment(segment, captures, str::to_owned)?;
+                rendered.push_str(&globset::escape(&literal));
+            } else {
+                rendered.push_str(&render_segment(segment, captures, globset::escape)?);
+            }
+        }
+        Ok(rendered)
+    }
+
     fn render_with(
         &self,
         captures: &BTreeMap<String, String>,
@@ -187,27 +228,7 @@ impl SectionPattern {
             }
             match segment {
                 SectionPatternSegment::Literal(literal) => rendered.push_str(literal),
-                SectionPatternSegment::Capture {
-                    prefix,
-                    name,
-                    suffix,
-                } => {
-                    let value =
-                        captures
-                            .get(name)
-                            .ok_or_else(|| SectionPatternError::MissingCapture {
-                                name: name.clone(),
-                            })?;
-                    if invalid_capture_value(value) {
-                        return Err(SectionPatternError::InvalidCapture {
-                            name: name.clone(),
-                            value: value.clone(),
-                        });
-                    }
-                    rendered.push_str(prefix);
-                    rendered.push_str(&render_capture(value));
-                    rendered.push_str(suffix);
-                }
+                segment => rendered.push_str(&render_segment(segment, captures, &render_capture)?),
             }
         }
         Ok(rendered)
@@ -219,9 +240,23 @@ impl SectionPattern {
         if values.len() != self.segments.len() {
             return None;
         }
+        self.captures_segments(&values)
+    }
 
+    /// Matches this pattern at the start of a slash-delimited value.
+    ///
+    /// Any complete segments after the pattern are ignored.
+    pub fn captures_prefix(&self, value: &str) -> Option<BTreeMap<String, String>> {
+        let values = value.split('/').collect::<Vec<_>>();
+        if values.len() < self.segments.len() {
+            return None;
+        }
+        self.captures_segments(&values[..self.segments.len()])
+    }
+
+    fn captures_segments(&self, values: &[&str]) -> Option<BTreeMap<String, String>> {
         let mut captures = BTreeMap::new();
-        for (segment, value) in self.segments.iter().zip(values) {
+        for (segment, value) in self.segments.iter().zip(values.iter().copied()) {
             match segment {
                 SectionPatternSegment::Literal(literal) if literal == value => {}
                 SectionPatternSegment::Literal(_) => return None,
@@ -386,6 +421,32 @@ fn invalid_capture_value(value: &str) -> bool {
     value.is_empty() || value == "." || value == ".." || value.contains('/') || value.contains('\\')
 }
 
+fn render_segment(
+    segment: &SectionPatternSegment,
+    captures: &BTreeMap<String, String>,
+    render_capture: impl Fn(&str) -> String,
+) -> Result<String, SectionPatternError> {
+    match segment {
+        SectionPatternSegment::Literal(literal) => Ok(literal.clone()),
+        SectionPatternSegment::Capture {
+            prefix,
+            name,
+            suffix,
+        } => {
+            let value = captures
+                .get(name)
+                .ok_or_else(|| SectionPatternError::MissingCapture { name: name.clone() })?;
+            if invalid_capture_value(value) {
+                return Err(SectionPatternError::InvalidCapture {
+                    name: name.clone(),
+                    value: value.clone(),
+                });
+            }
+            Ok(format!("{prefix}{}{suffix}", render_capture(value)))
+        }
+    }
+}
+
 fn invalid(pattern: &str, reason: &'static str) -> SectionPatternError {
     SectionPatternError::InvalidSyntax {
         pattern: pattern.to_owned(),
@@ -534,6 +595,25 @@ mod tests {
         assert_eq!(
             pattern.render_glob(&captures).expect("glob"),
             r"packages/core[[]0[]][*][?]/src/**"
+        );
+    }
+
+    #[test]
+    fn literal_prefix_ends_before_the_first_custom_glob_segment() {
+        let prefix = SectionPattern::from_str("packages/{name}").expect("prefix");
+        let pattern = SectionPattern::from_str("packages/{name}/[st]rc/**").expect("path pattern");
+        let captures = BTreeMap::from([(String::from("name"), String::from("core"))]);
+
+        let rendered = pattern
+            .render_glob_with_literal_prefix(&prefix, &captures)
+            .expect("rendered glob");
+
+        assert_eq!(rendered, "packages/core/[st]rc/**");
+        assert!(
+            globset::Glob::new(&rendered)
+                .expect("glob")
+                .compile_matcher()
+                .is_match("packages/core/src/lib.rs")
         );
     }
 

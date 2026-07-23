@@ -17,6 +17,7 @@ use crate::error::{
 };
 use crate::link_resolution::validate_http_url;
 use crate::repo::Repository;
+use crate::section::{SectionResolver, has_sections};
 
 /// Parsed changelog fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,9 +187,10 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
     let mut candidates = Vec::new();
     let mut warnings = Vec::new();
 
-    if config.sections.is_empty() {
+    if !has_sections(config) {
         collect_markdown_files(&fragment_dir, None, &mut candidates)?;
     } else {
+        let resolver = SectionResolver::from_config(config)?;
         for section in &config.sections {
             collect_markdown_files(
                 &fragment_dir.join(&section.directory),
@@ -196,6 +198,21 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
                 &mut candidates,
             )?;
         }
+        let max_pattern_depth = config
+            .section_patterns
+            .iter()
+            .map(|pattern| pattern.directory.segments().len())
+            .max()
+            .unwrap_or(0);
+        collect_pattern_markdown_files(
+            repo,
+            &fragment_dir,
+            &fragment_dir,
+            Path::new(""),
+            max_pattern_depth,
+            &resolver,
+            &mut candidates,
+        )?;
 
         let entries = match fs::read_dir(&fragment_dir) {
             Ok(entries) => Some(entries),
@@ -212,7 +229,20 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
                 path: fragment_dir.clone(),
             })?;
             let path = entry.path();
-            if !path.is_dir() || is_configured_section_dir(repo, &path) {
+            if !path.is_dir() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&fragment_dir)
+                .expect("fragment entry remains below fragment directory");
+            if resolver
+                .resolve_directory(relative)
+                .map_err(|error| crate::Error::SectionPattern {
+                    message: error.to_string(),
+                })?
+                .is_some()
+                || is_configured_section_dir(repo, &path)
+            {
                 continue;
             }
             let Some(section) = path
@@ -248,6 +278,65 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
         candidates,
         warnings,
     })
+}
+
+fn collect_pattern_markdown_files(
+    repo: &Repository,
+    fragment_dir: &Path,
+    directory: &Path,
+    relative: &Path,
+    remaining_depth: usize,
+    resolver: &SectionResolver<'_>,
+    candidates: &mut Vec<(PathBuf, Option<String>)>,
+) -> Result<()> {
+    if !relative.as_os_str().is_empty()
+        && let Some(section) =
+            resolver
+                .resolve_directory(relative)
+                .map_err(|error| crate::Error::SectionPattern {
+                    message: error.to_string(),
+                })?
+        && section.pattern_index.is_some()
+    {
+        repo.validate_pattern_section_directory(relative)?;
+        collect_markdown_files(directory, Some(section.id), candidates)?;
+    }
+    if remaining_depth == 0 {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(crate::Error::ReadFile {
+                path: directory.to_path_buf(),
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.context(ReadFileSnafu {
+            path: directory.to_path_buf(),
+        })?;
+        let file_type = entry
+            .file_type()
+            .context(ReadFileSnafu { path: entry.path() })?;
+        if !file_type.is_dir() && !file_type.is_symlink() {
+            continue;
+        }
+        let child_relative = relative.join(entry.file_name());
+        collect_pattern_markdown_files(
+            repo,
+            fragment_dir,
+            &fragment_dir.join(&child_relative),
+            &child_relative,
+            remaining_depth - 1,
+            resolver,
+            candidates,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn compare_fragment_paths(left: &Path, right: &Path) -> Ordering {
@@ -384,9 +473,8 @@ fn is_configured_section_dir(repo: &Repository, path: &Path) -> bool {
     let Ok(identity) = fs::canonicalize(path) else {
         return false;
     };
-    let config = repo.config();
-    let fragment_dir = repo.resolve(&config.fragments.directory);
-    config
+    let fragment_dir = repo.resolve(&repo.config().fragments.directory);
+    repo.config()
         .sections
         .iter()
         .filter_map(|section| fs::canonicalize(fragment_dir.join(&section.directory)).ok())
@@ -1279,6 +1367,152 @@ mod tests {
                 PathBuf::from("changes.d/core/z.md")
             ]
         );
+    }
+
+    #[test]
+    fn discovers_nested_patterned_section_fragments() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{scope}/{name}"
+            id = "@{scope}/{name}"
+            directory = "{scope}/{name}"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d/acme/core")).expect("section dir");
+        std::fs::write(
+            temp.path().join("changes.d/acme/core/change.md"),
+            " -  Fixed core.\n",
+        )
+        .expect("fragment");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(
+            discovered.candidates[0].section.as_deref(),
+            Some("@acme/core")
+        );
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[test]
+    fn patterned_discovery_accepts_a_missing_fragment_directory() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        )
+        .expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert!(discovered.candidates.is_empty());
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patterned_discovery_stops_at_the_maximum_directory_depth() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{scope}/{name}"
+            id = "@{scope}/{name}"
+            directory = "{scope}/{name}"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d/acme/core")).expect("section dir");
+        symlink("loop", temp.path().join("changes.d/acme/core/loop")).expect("symlink loop");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert!(discovered.candidates.is_empty());
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_patterned_fragment_directory_symlinked_outside_the_repository() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        std::fs::write(outside.path().join("change.md"), " -  Escaped.\n")
+            .expect("outside fragment");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+        symlink(outside.path(), temp.path().join("changes.d/core")).expect("outside symlink");
+
+        let error = discover_fragment_candidates(&repo).expect_err("outside patterned directory");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
+        assert!(message.contains("fragments.directory"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_symlinked_unknown_section_with_a_warning() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        std::fs::create_dir(temp.path().join("shared-extra")).expect("shared directory");
+        std::fs::write(temp.path().join("shared-extra/change.md"), " -  Shared.\n")
+            .expect("shared fragment");
+        symlink("../shared-extra", temp.path().join("changes.d/extra")).expect("section symlink");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(
+            discovered.candidates[0].relative_path,
+            PathBuf::from("changes.d/extra/change.md")
+        );
+        assert!(matches!(
+            &discovered.warnings[0],
+            DiscoveryWarning::UnknownSectionFragment { section, .. } if section == "extra"
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
+use crate::section_pattern::SectionPatternConfig;
 
 /// Parsed Sacho configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,6 +40,10 @@ pub struct Config {
     /// Ordered section configuration.
     #[serde(default)]
     pub sections: Vec<SectionConfig>,
+
+    /// Ordered section pattern configuration.
+    #[serde(default)]
+    pub section_patterns: Vec<SectionPatternConfig>,
 }
 
 impl Config {
@@ -106,6 +111,14 @@ impl Config {
                 });
             }
             section_directories.push((comparison_path, directory_key));
+        }
+        for (index, pattern) in self.section_patterns.iter().enumerate() {
+            pattern
+                .validate()
+                .map_err(|source| ConfigError::InvalidSectionPattern { index, source })?;
+            if self.section_patterns[..index].contains(pattern) {
+                return Err(ConfigError::DuplicateSectionPattern { index });
+            }
         }
         self.vcs.validate()?;
         Ok(())
@@ -534,6 +547,7 @@ mod tests {
                     vcs: VcsConfig::default(),
                     check: CheckConfig::default(),
                     sections: unique_sections,
+                    section_patterns: Vec::new(),
                 }
             })
     }
@@ -547,6 +561,65 @@ mod tests {
         assert!(!config.link_resolution.enabled);
         assert_eq!(config.vcs.preset, VcsPreset::Git);
         assert!(config.vcs.commands.is_empty());
+    }
+
+    #[test]
+    fn parses_section_patterns_and_preserves_path_defaults() {
+        let config = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "@acme/{name}"
+directory = "{name}"
+
+[[section-patterns]]
+source = "tools/{name}"
+id = "tool/{name}"
+directory = "tool-{name}"
+paths = []
+"#,
+        )
+        .expect("section patterns");
+
+        assert_eq!(config.section_patterns.len(), 2);
+        assert_eq!(config.section_patterns[0].paths, None);
+        assert_eq!(config.section_patterns[1].paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_section_patterns() {
+        let invalid = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "{other}"
+directory = "{name}"
+"#,
+        )
+        .expect_err("mismatched captures");
+        assert!(matches!(
+            invalid,
+            ConfigError::InvalidSectionPattern { index: 0, .. }
+        ));
+
+        let duplicate = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+directory = "{name}"
+
+[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+directory = "{name}"
+"#,
+        )
+        .expect_err("duplicate pattern");
+        assert!(matches!(
+            duplicate,
+            ConfigError::DuplicateSectionPattern { index: 1 }
+        ));
     }
 
     #[test]

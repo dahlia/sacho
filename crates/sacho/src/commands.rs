@@ -45,6 +45,7 @@ use crate::repo::{
     validate_configured_paths_against_reserved_with_cache,
     validate_repository_config_paths_with_cache,
 };
+use crate::section::{SectionResolver, has_sections};
 use crate::vcs::{ChangeKind, ChangedPath, CommitId, GitVcs, HgVcs, JjVcs, Vcs};
 
 pub use crate::compile::{CompileOptions, CompiledRegion};
@@ -1039,25 +1040,35 @@ fn validate_init_config_paths(root: &Path, config: &mut Config, lock_path: &Path
 pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult> {
     let name = validate_fragment_name(&options.name)?;
     let config = repo.config();
-    let directory = if config.sections.is_empty() {
+    let (directory, patterned_directory) = if !has_sections(config) {
         if options.section.is_some() {
             return Err(Error::UnexpectedSection);
         }
-        config.fragments.directory.clone()
+        (config.fragments.directory.clone(), None)
     } else {
         let section_id = options.section.as_deref().ok_or(Error::MissingSection)?;
-        let section = config
-            .sections
-            .iter()
-            .find(|section| section.id == section_id)
+        let section = SectionResolver::from_config(config)?
+            .resolve_id(section_id)
+            .map_err(|error| Error::SectionPattern {
+                message: error.to_string(),
+            })?
             .ok_or_else(|| Error::UnknownSection {
                 section: section_id.to_owned(),
             })?;
-        config.fragments.directory.join(&section.directory)
+        let patterned_directory = section.pattern_index.map(|_| section.directory.clone());
+        (
+            config.fragments.directory.join(&section.directory),
+            patterned_directory,
+        )
     };
-    let path = directory.join(name);
-    let absolute = repo.resolve(&path);
+    let path = directory.join(&name);
     let _lock = acquire_mutation_lock(repo)?;
+    let absolute = match patterned_directory {
+        Some(directory) => repo
+            .validate_pattern_section_directory(&directory)?
+            .join(&name),
+        None => repo.resolve(&path),
+    };
     ensure_materialized_current_before_mutation(repo)?;
     if let Some(parent) = absolute.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::CreateDirectory {
@@ -2800,7 +2811,13 @@ fn run_missing_fragment_check(
                     message: String::from("--staged is supported only with vcs.preset = \"git\""),
                 });
             }
-            let vcs = HgVcs::with_fragment_layout(
+            let section_patterns = repo
+                .config()
+                .section_patterns
+                .iter()
+                .map(|pattern| pattern.directory.clone())
+                .collect::<Vec<_>>();
+            let vcs = HgVcs::with_patterned_fragment_layout(
                 repo.root(),
                 &repo.config().vcs,
                 &repo.config().fragments.directory,
@@ -2808,6 +2825,7 @@ fn run_missing_fragment_check(
                     .sections
                     .iter()
                     .map(|section| &section.directory),
+                &section_patterns,
             );
             let report = missing_fragment_violations(
                 repo,
@@ -2836,7 +2854,6 @@ fn missing_fragment_violations(
         });
     }
     let source_patterns = compile_glob_set(&repo.config().check.paths)?;
-    let section_patterns = compile_section_patterns(repo)?;
     let commits = vcs.commits(base)?;
     let final_fragments = final_fragment_paths(repo)?;
     let mut violations = Vec::new();
@@ -2854,9 +2871,8 @@ fn missing_fragment_violations(
             &changed_paths,
             &final_fragments,
             &source_patterns,
-            &section_patterns,
             MissingFragmentMode::Commit,
-        );
+        )?;
         violations.extend(report.violations);
         skipped.extend(report.skipped);
     }
@@ -2878,23 +2894,17 @@ fn staged_missing_fragment_violations(
         });
     }
     let source_patterns = compile_glob_set(&repo.config().check.paths)?;
-    let section_patterns = compile_section_patterns(repo)?;
     let changed_paths = vcs.staged_paths()?;
-    let staged_fragments = changed_paths
-        .iter()
-        .filter(|path| path.kind.path_survives())
-        .filter_map(|path| fragment_target_for_path(repo, &path.path).map(|_| path.path.clone()))
-        .collect::<IndexSet<_>>();
+    let staged_fragments = surviving_fragment_paths(repo, &changed_paths)?;
 
-    Ok(missing_fragment_violations_for_changes(
+    missing_fragment_violations_for_changes(
         repo,
         "staged changes",
         &changed_paths,
         &staged_fragments,
         &source_patterns,
-        &section_patterns,
         MissingFragmentMode::Staged,
-    ))
+    )
 }
 
 fn commit_missing_fragment_violations(
@@ -2912,30 +2922,16 @@ fn commit_missing_fragment_violations(
         return Ok(MissingFragmentReport::default());
     }
     let source_patterns = compile_glob_set(&repo.config().check.paths)?;
-    let section_patterns = compile_section_patterns(repo)?;
     let changed_paths = vcs.changed_paths(commit)?;
-    let surviving_fragments = changed_paths
-        .iter()
-        .filter(|path| path.kind.path_survives())
-        .filter_map(|path| fragment_target_for_path(repo, &path.path).map(|_| path.path.clone()))
-        .collect::<IndexSet<_>>();
-    Ok(missing_fragment_violations_for_changes(
+    let surviving_fragments = surviving_fragment_paths(repo, &changed_paths)?;
+    missing_fragment_violations_for_changes(
         repo,
         commit.as_str(),
         &changed_paths,
         &surviving_fragments,
         &source_patterns,
-        &section_patterns,
         MissingFragmentMode::Commit,
-    ))
-}
-
-fn compile_section_patterns(repo: &Repository) -> Result<Vec<(&str, GlobSet)>> {
-    repo.config()
-        .sections
-        .iter()
-        .map(|section| Ok((section.id.as_str(), compile_glob_set(&section.paths)?)))
-        .collect()
+    )
 }
 
 fn missing_fragment_violations_for_changes(
@@ -2944,9 +2940,8 @@ fn missing_fragment_violations_for_changes(
     changed_paths: &[ChangedPath],
     final_fragments: &IndexSet<PathBuf>,
     source_patterns: &GlobSet,
-    section_patterns: &[(&str, GlobSet)],
     mode: MissingFragmentMode,
-) -> MissingFragmentReport {
+) -> Result<MissingFragmentReport> {
     let mut relevant_paths = changed_paths
         .iter()
         .flat_map(policy_paths)
@@ -2956,10 +2951,10 @@ fn missing_fragment_violations_for_changes(
     relevant_paths.sort();
     relevant_paths.dedup();
     if relevant_paths.is_empty() {
-        return MissingFragmentReport::default();
+        return Ok(MissingFragmentReport::default());
     }
-    let changed_fragments = changed_fragment_changes(repo, changed_paths);
-    let requirements = missing_fragment_requirements(repo, &relevant_paths, section_patterns);
+    let changed_fragments = changed_fragment_changes(repo, changed_paths)?;
+    let requirements = missing_fragment_requirements(repo, &relevant_paths)?;
     let violations = requirements
         .requirements
         .iter()
@@ -2970,10 +2965,10 @@ fn missing_fragment_violations_for_changes(
             message: missing_fragment_message(subject, requirement, mode),
         })
         .collect();
-    MissingFragmentReport {
+    Ok(MissingFragmentReport {
         violations,
         skipped: requirements.skipped,
-    }
+    })
 }
 
 fn no_checked_paths_skip() -> SkippedCheck {
@@ -2997,11 +2992,27 @@ fn compile_glob_set(patterns: &[String]) -> Result<GlobSet> {
     })
 }
 
-fn changed_fragment_changes(repo: &Repository, paths: &[ChangedPath]) -> Vec<FragmentChange> {
+fn changed_fragment_changes(
+    repo: &Repository,
+    paths: &[ChangedPath],
+) -> Result<Vec<FragmentChange>> {
     paths
         .iter()
         .filter(|path| fragment_content_changed(path))
-        .filter_map(|path| fragment_change_for_path(repo, &path.path))
+        .map(|path| fragment_change_for_path(repo, &path.path))
+        .filter_map(Result::transpose)
+        .collect()
+}
+
+fn surviving_fragment_paths(repo: &Repository, paths: &[ChangedPath]) -> Result<IndexSet<PathBuf>> {
+    paths
+        .iter()
+        .filter(|path| path.kind.path_survives())
+        .map(|path| {
+            fragment_target_for_path(repo, &path.path)
+                .map(|target| target.map(|_| path.path.clone()))
+        })
+        .filter_map(Result::transpose)
         .collect()
 }
 
@@ -3027,37 +3038,49 @@ fn final_fragment_paths(repo: &Repository) -> Result<IndexSet<PathBuf>> {
         .collect())
 }
 
-fn fragment_change_for_path(repo: &Repository, path: &Path) -> Option<FragmentChange> {
-    fragment_target_for_path(repo, path).map(|target| FragmentChange {
-        path: path.to_path_buf(),
-        target,
-    })
+fn fragment_change_for_path(repo: &Repository, path: &Path) -> Result<Option<FragmentChange>> {
+    Ok(
+        fragment_target_for_path(repo, path)?.map(|target| FragmentChange {
+            path: path.to_path_buf(),
+            target,
+        }),
+    )
 }
 
-fn fragment_target_for_path(repo: &Repository, path: &Path) -> Option<FragmentTarget> {
+fn fragment_target_for_path(repo: &Repository, path: &Path) -> Result<Option<FragmentTarget>> {
     let config = repo.config();
     if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
-        return None;
+        return Ok(None);
     }
     if !path.starts_with(&config.fragments.directory) {
-        return None;
+        return Ok(None);
     }
-    if config.sections.is_empty() {
+    if !has_sections(config) {
         if path.parent() != Some(config.fragments.directory.as_path()) {
-            return None;
+            return Ok(None);
         }
-        return Some(FragmentTarget::Repository);
+        return Ok(Some(FragmentTarget::Repository));
     }
-    for section in &config.sections {
-        let directory = config.fragments.directory.join(&section.directory);
-        if path.parent() == Some(directory.as_path()) {
-            return Some(FragmentTarget::Section(section.id.clone()));
-        }
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let Ok(relative) = parent.strip_prefix(&config.fragments.directory) else {
+        return Ok(None);
+    };
+    let resolver = SectionResolver::from_config(config)?;
+    if let Some(section) =
+        resolver
+            .resolve_directory(relative)
+            .map_err(|error| Error::SectionPattern {
+                message: error.to_string(),
+            })?
+    {
+        return Ok(Some(FragmentTarget::Section(section.id)));
     }
     if path.parent().and_then(Path::parent) == Some(config.fragments.directory.as_path()) {
-        return Some(FragmentTarget::Repository);
+        return Ok(Some(FragmentTarget::Repository));
     }
-    None
+    Ok(None)
 }
 
 fn requirement_satisfied(
@@ -3084,45 +3107,52 @@ fn fragment_matches_requirement(fragment: &FragmentChange, requirement: &Fragmen
 fn missing_fragment_requirements(
     repo: &Repository,
     paths: &[PathBuf],
-    section_patterns: &[(&str, GlobSet)],
-) -> MissingFragmentRequirements {
-    if repo.config().sections.is_empty() {
-        return MissingFragmentRequirements {
+) -> Result<MissingFragmentRequirements> {
+    if !has_sections(repo.config()) {
+        return Ok(MissingFragmentRequirements {
             requirements: vec![MissingFragmentRequirement::repository(
                 paths.to_vec(),
                 false,
             )],
             skipped: Vec::new(),
-        };
+        });
     }
 
+    let resolver = SectionResolver::from_config(repo.config())?;
     let mut repository_paths = Vec::new();
-    let mut section_paths = section_patterns
-        .iter()
-        .map(|(section, _)| ((*section).to_owned(), Vec::new()))
-        .collect::<Vec<_>>();
+    let mut section_paths = BTreeMap::<String, Vec<PathBuf>>::new();
     for path in paths {
-        let matched_sections = section_patterns
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, patterns))| patterns.is_match(path))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+        let matched_sections =
+            resolver
+                .resolve_source_path(path)
+                .map_err(|error| Error::SectionPattern {
+                    message: error.to_string(),
+                })?;
         if matched_sections.is_empty() {
             repository_paths.push(path.clone());
         } else {
-            for index in matched_sections {
-                section_paths[index].1.push(path.clone());
+            for section in matched_sections {
+                section_paths
+                    .entry(section.id)
+                    .or_default()
+                    .push(path.clone());
             }
         }
     }
 
-    let mut requirements = section_paths
+    let present = section_paths.keys().cloned().collect::<BTreeSet<_>>();
+    let ordered = resolver
+        .ordered_present(&present)
+        .map_err(|error| Error::SectionPattern {
+            message: error.to_string(),
+        })?;
+    let mut requirements = ordered
         .into_iter()
-        .filter(|(_, paths)| !paths.is_empty())
-        .map(|(section, paths)| MissingFragmentRequirement {
+        .map(|section| MissingFragmentRequirement {
+            paths: section_paths
+                .remove(&section)
+                .expect("ordered section came from grouped paths"),
             target: FragmentTarget::Section(section),
-            paths,
             sectioned_repository: false,
         })
         .collect::<Vec<_>>();
@@ -3132,10 +3162,10 @@ fn missing_fragment_requirements(
             true,
         ));
     }
-    MissingFragmentRequirements {
+    Ok(MissingFragmentRequirements {
         requirements,
         skipped: Vec::new(),
-    }
+    })
 }
 
 fn missing_fragment_message(
@@ -13099,6 +13129,138 @@ links:
     }
 
     #[test]
+    fn add_creates_fragment_in_patterned_section() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{scope}/plugin-{name}"
+            id = "@{scope}/{name}"
+            directory = "{scope}/plugin-{name}"
+            "#,
+        );
+
+        let result = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("@acme/http")),
+                name: String::from("timeouts"),
+            },
+        )
+        .expect("add");
+
+        assert_eq!(
+            result.path,
+            PathBuf::from("changes.d/acme/plugin-http/timeouts.md")
+        );
+        assert!(temp.path().join(&result.path).is_file());
+    }
+
+    #[test]
+    fn add_rejects_a_patterned_section_overlapping_the_next_file() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        );
+
+        let error = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("next")),
+                name: String::from("unsafe"),
+            },
+        )
+        .expect_err("next-file overlap");
+
+        let message = error.to_string();
+        assert!(message.contains("fragments.next-file"), "{message}");
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_rejects_a_patterned_section_symlink_outside_the_repository() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        );
+        let outside = TempDir::new().expect("outside tempdir");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        symlink(outside.path(), temp.path().join("changes.d/core")).expect("outside symlink");
+
+        let error = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("core")),
+                name: String::from("unsafe"),
+            },
+        )
+        .expect_err("outside patterned section");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
+        assert!(message.contains("fragments.directory"), "{message}");
+        assert!(!outside.path().join("unsafe.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_rejects_a_patterned_section_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "{name}"
+            directory = "{name}"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/actual")).expect("actual directory");
+        symlink("actual", temp.path().join("changes.d/core")).expect("internal symlink");
+
+        let error = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("core")),
+                name: String::from("safe"),
+            },
+        )
+        .expect_err("patterned section alias");
+
+        let message = error.to_string();
+        assert!(message.contains("exactly its rendered path"), "{message}");
+        assert!(!temp.path().join("changes.d/actual/safe.md").exists());
+    }
+
+    #[test]
     fn add_requires_section_when_repository_has_sections() {
         let (_temp, repo) = repo_with_config(
             r#"
@@ -15058,6 +15220,118 @@ priority: 0
 
         assert!(report.violations.is_empty());
         assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn layer_three_requirements_follow_section_declaration_order() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "zeta"
+            directory = "zeta"
+            paths = ["packages/zeta/**"]
+
+            [[sections]]
+            id = "alpha"
+            directory = "alpha"
+            paths = ["packages/alpha/**"]
+            "#,
+        );
+
+        let requirements = missing_fragment_requirements(
+            &repo,
+            &[
+                PathBuf::from("packages/alpha/src/lib.rs"),
+                PathBuf::from("packages/zeta/src/lib.rs"),
+            ],
+        )
+        .expect("requirements");
+
+        assert_eq!(
+            requirements
+                .requirements
+                .iter()
+                .map(|requirement| &requirement.target)
+                .collect::<Vec<_>>(),
+            [
+                &FragmentTarget::Section(String::from("zeta")),
+                &FragmentTarget::Section(String::from("alpha")),
+            ]
+        );
+    }
+
+    #[test]
+    fn layer_three_attributes_patterned_and_deleted_packages() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@acme/{name}"
+            directory = "{name}"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/core/remove.md"),
+            " -  Removed the legacy API.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/core/src/legacy.rs", "changes.d/core/remove.md"],
+                "Remove legacy API",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn layer_three_rejects_a_fragment_from_another_pattern_instance() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@acme/{name}"
+            directory = "{name}"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/cli")).expect("fragment dir");
+        fs::write(
+            temp.path().join("changes.d/cli/change.md"),
+            " -  Changed the CLI.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/core/src/lib.rs", "changes.d/cli/change.md"],
+                "Change core",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].message.contains("@acme/core"));
     }
 
     #[test]

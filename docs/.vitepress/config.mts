@@ -108,6 +108,7 @@ const config = defineConfig({
         items: [
           { text: "Getting started", link: "/guide/getting-started" },
           { text: "Everyday workflow", link: "/guide/everyday-workflow" },
+          { text: "Package monorepos", link: "/guide/package-monorepos" },
           { text: "Making releases", link: "/guide/releases" },
           { text: "CI and hooks", link: "/guide/ci-and-hooks" },
           { text: "Version control", link: "/guide/version-control" },
@@ -130,6 +131,10 @@ const config = defineConfig({
         items: [
           { text: "Commands", link: "/reference/commands" },
           { text: "Configuration", link: "/reference/configuration" },
+          {
+            text: "Section pattern syntax",
+            link: "/reference/section-patterns",
+          },
           { text: "Troubleshooting", link: "/troubleshooting" },
           { text: "Changelog", link: "/changes" },
         ],

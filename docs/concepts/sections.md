@@ -37,6 +37,12 @@ fragment directory. The example above stores entries under
 `paths` connects source changes to a section for missing-fragment checks. It
 does not select the section when creating a fragment.
 
+When many packages follow one layout, use a `[[section-patterns]]` table
+instead of repeating an explicit section for each package. The
+[*Package monorepos*](../guide/package-monorepos) guide works through a complete
+setup. The [syntax reference](../reference/section-patterns) defines capture
+names, partial-segment captures, path attribution, and precedence.
+
 
 Adding a sectioned fragment
 ---------------------------

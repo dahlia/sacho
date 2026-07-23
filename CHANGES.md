@@ -8,6 +8,9 @@ To be released.
 
  -  Added `--no-word-wrap` to `sacho preview` and `sacho show` for publishing
     release notes without Sacho's canonical 80-column wrapping.  [[#3]]
+ -  Added section patterns for deriving changelog sections from repository
+    layouts, so package-oriented repositories no longer need to list every
+    package separately.
 
 [#3]: https://github.com/dahlia/sacho/pull/3
 
