@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.3.1
 -------------
 
-To be released.
+Released on July 24, 2026.
 
  -  Fixed `sacho import-unreleased` so repositories whose configured section
     order differs from fragment path order no longer fail with a false stale
