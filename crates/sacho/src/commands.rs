@@ -42,7 +42,7 @@ use crate::repo::{
     PathValidationCache, PreparedAtomicWrite, Repository,
     filesystem_path_identity as repo_path_identity, filesystem_paths_overlap, move_path_if_absent,
     mutation_lock_path, normalize_repository_config_paths,
-    validate_configured_paths_against_reserved_with_cache,
+    validate_configured_paths_against_reserved_with_cache, validate_pattern_section_directories,
     validate_repository_config_paths_with_cache,
 };
 use crate::section::{SectionResolver, has_sections};
@@ -827,6 +827,15 @@ pub fn initialization_root(start: impl AsRef<Path>) -> PathBuf {
 
 /// Suggests a safe, unused fragment subdirectory for a section identifier.
 pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
+    suggest_section_directory_avoiding(id, used, &[])
+}
+
+/// Suggests a safe fragment subdirectory outside used and reserved paths.
+pub fn suggest_section_directory_avoiding(
+    id: &str,
+    used: &[PathBuf],
+    reserved: &[PathBuf],
+) -> PathBuf {
     let stem = id.rsplit('/').next().unwrap_or(id);
     let mut slug = String::new();
     let mut separator = false;
@@ -845,17 +854,17 @@ pub fn suggest_section_directory(id: &str, used: &[PathBuf]) -> PathBuf {
         slug.push_str("section");
     }
 
-    for suffix in 1..=used.len() + 1 {
+    for suffix in 1..=used.len() + reserved.len() + 1 {
         let candidate = if suffix == 1 {
             PathBuf::from(&slug)
         } else {
             PathBuf::from(format!("{slug}-{suffix}"))
         };
-        if !used.iter().any(|path| path == &candidate) {
+        if !used.iter().chain(reserved).any(|path| path == &candidate) {
             return candidate;
         }
     }
-    unreachable!("one more candidate than used paths must produce an unused path")
+    unreachable!("one more candidate than excluded paths must produce an unused path")
 }
 
 /// Finds repository directories whose basename resembles a section.
@@ -945,7 +954,8 @@ pub fn infer_section_paths(
 ///
 /// Inference succeeds only when at least two ids share the same prefix and
 /// their final components name sibling directories under exactly one common
-/// repository path.
+/// repository path. Every selected section's rendered fragment directory must
+/// also pass the runtime path-safety checks for patterned sections.
 pub fn infer_section_pattern(
     root: impl AsRef<Path>,
     ids: &[String],
@@ -1012,7 +1022,38 @@ pub fn infer_section_pattern(
     if pattern.validate().is_err() {
         return Ok(None);
     }
+    if !inferred_section_pattern_is_safe(root.as_ref(), ids, fragment_directory, &pattern) {
+        return Ok(None);
+    }
     Ok(Some(pattern))
+}
+
+fn inferred_section_pattern_is_safe(
+    root: &Path,
+    ids: &[String],
+    fragment_directory: &Path,
+    pattern: &SectionPatternConfig,
+) -> bool {
+    let default_config = Config::parse("").expect("default config parses");
+    let mut directories = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(captures) = pattern.id.captures(id) else {
+            return false;
+        };
+        let Ok(directory) = pattern.directory.render(&captures) else {
+            return false;
+        };
+        directories.push(PathBuf::from(directory));
+    }
+    let lock_path = mutation_lock_path(root);
+    validate_pattern_section_directories(
+        root,
+        fragment_directory,
+        &default_config.fragments.next_file,
+        &directories,
+        &lock_path,
+    )
+    .is_ok()
 }
 
 fn escape_section_pattern_literal(value: &str) -> String {
@@ -6948,6 +6989,44 @@ mod tests {
         assert_eq!(pattern.id.to_string(), "@example/{name}");
         assert_eq!(pattern.directory.to_string(), "{name}");
         assert_eq!(pattern.paths, None);
+    }
+
+    #[test]
+    fn section_pattern_inference_rejects_a_directory_overlapping_the_next_file() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("packages/next")).expect("next package");
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/next".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("best-effort inference");
+
+        assert_eq!(pattern, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn section_pattern_inference_checks_the_exact_nondefault_fragment_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+        fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
+        let fragments = temp.path().join("generated/changes");
+        fs::create_dir_all(fragments.join("shared")).expect("shared fragments");
+        symlink("shared", fragments.join("core")).expect("section alias");
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            Path::new("generated/changes"),
+        )
+        .expect("best-effort inference");
+
+        assert_eq!(pattern, None);
     }
 
     #[test]

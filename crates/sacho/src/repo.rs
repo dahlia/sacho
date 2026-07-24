@@ -286,47 +286,13 @@ impl Repository {
         let [_changelog, fragments, next, sections @ ..] = &configured[..] else {
             unreachable!("repository path validation always returns its three base paths");
         };
-        let section = configured_path_identity(
-            "resolved section-patterns[].directory",
-            directory,
-            self.root
-                .join(&self.config.fragments.directory)
-                .join(directory),
-            &mut validation_cache,
-        )
-        .context(ConfigSnafu {
-            path: self.root.join(Self::CONFIG_FILE),
-        })?;
-        validate_strict_descendant(
-            &section,
-            "fragments.directory",
+        let section = validate_pattern_section_directory_with_cache(
+            &self.root,
             &self.config.fragments.directory,
-            &fragments.identity,
-        )
-        .context(ConfigSnafu {
-            path: self.root.join(Self::CONFIG_FILE),
-        })?;
-        if section.identity != fragments.identity.join(directory) {
-            return Err(ConfigError::InvalidPath {
-                key: String::from("resolved section-patterns[].directory"),
-                path: directory.to_path_buf(),
-                reason: "must resolve to exactly its rendered path below fragments.directory",
-            })
-            .context(ConfigSnafu {
-                path: self.root.join(Self::CONFIG_FILE),
-            });
-        }
-        validate_path_overlap(next, &section).context(ConfigSnafu {
-            path: self.root.join(Self::CONFIG_FILE),
-        })?;
-        for other in sections {
-            validate_path_overlap(other, &section).context(ConfigSnafu {
-                path: self.root.join(Self::CONFIG_FILE),
-            })?;
-        }
-        validate_configured_paths_against_reserved_with_cache(
-            std::slice::from_ref(&section),
-            "repository mutation lock",
+            directory,
+            fragments,
+            next,
+            sections,
             &lock_path,
             &mut validation_cache,
         )
@@ -559,6 +525,112 @@ pub(crate) fn validate_repository_config_paths_with_cache(
         validate_path_overlap(path, &config_path)?;
     }
     Ok(configured)
+}
+
+pub(crate) fn validate_pattern_section_directories(
+    root: &Path,
+    fragment_directory: &Path,
+    next_file: &Path,
+    directories: &[PathBuf],
+    lock_path: &Path,
+) -> std::result::Result<(), ConfigError> {
+    let mut validation_cache = PathValidationCache::default();
+    let root_identity =
+        filesystem_path_identity(root).map_err(|source| ConfigError::ConfigPathResolution {
+            key: String::from("repository root"),
+            path: root.to_path_buf(),
+            effective_path: root.to_path_buf(),
+            source,
+        })?;
+    let fragments = configured_path_identity(
+        "fragments.directory",
+        fragment_directory,
+        root.join(fragment_directory),
+        &mut validation_cache,
+    )?;
+    validate_strict_descendant(&fragments, "repository root", root, &root_identity)?;
+    let next = configured_path_identity(
+        "fragments.next-file",
+        next_file,
+        root.join(fragment_directory).join(next_file),
+        &mut validation_cache,
+    )?;
+    if next
+        .identity
+        .extension()
+        .is_some_and(|extension| extension == "md")
+    {
+        return Err(ConfigError::InvalidPath {
+            key: String::from("fragments.next-file"),
+            path: next_file.to_path_buf(),
+            reason: "must not name a Markdown fragment",
+        });
+    }
+    validate_strict_descendant(
+        &next,
+        "fragments.directory",
+        fragment_directory,
+        &fragments.identity,
+    )?;
+
+    let mut sections = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let section = validate_pattern_section_directory_with_cache(
+            root,
+            fragment_directory,
+            directory,
+            &fragments,
+            &next,
+            &sections,
+            lock_path,
+            &mut validation_cache,
+        )?;
+        sections.push(section);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_pattern_section_directory_with_cache(
+    root: &Path,
+    fragment_directory: &Path,
+    directory: &Path,
+    fragments: &ConfiguredPathIdentity,
+    next: &ConfiguredPathIdentity,
+    sections: &[ConfiguredPathIdentity],
+    lock_path: &Path,
+    validation_cache: &mut PathValidationCache,
+) -> std::result::Result<ConfiguredPathIdentity, ConfigError> {
+    let section = configured_path_identity(
+        "resolved section-patterns[].directory",
+        directory,
+        root.join(fragment_directory).join(directory),
+        validation_cache,
+    )?;
+    validate_strict_descendant(
+        &section,
+        "fragments.directory",
+        fragment_directory,
+        &fragments.identity,
+    )?;
+    if section.identity != fragments.identity.join(directory) {
+        return Err(ConfigError::InvalidPath {
+            key: String::from("resolved section-patterns[].directory"),
+            path: directory.to_path_buf(),
+            reason: "must resolve to exactly its rendered path below fragments.directory",
+        });
+    }
+    validate_path_overlap(next, &section)?;
+    for other in sections {
+        validate_path_overlap(other, &section)?;
+    }
+    validate_configured_paths_against_reserved_with_cache(
+        std::slice::from_ref(&section),
+        "repository mutation lock",
+        lock_path,
+        validation_cache,
+    )?;
+    Ok(section)
 }
 
 fn configured_paths_equal(first: &ConfiguredPathIdentity, second: &ConfiguredPathIdentity) -> bool {
@@ -1562,6 +1634,29 @@ mod tests {
 
         assert!(message.contains("fragments.next-file"), "{message}");
         assert!(message.contains("sections[0].directory"), "{message}");
+    }
+
+    #[test]
+    fn inferred_pattern_validation_rejects_a_markdown_next_file() {
+        let temp = TempDir::new().expect("tempdir");
+
+        let error = validate_pattern_section_directories(
+            temp.path(),
+            Path::new("changes.d"),
+            Path::new("next.md"),
+            &[PathBuf::from("core")],
+            &temp.path().join(MUTATION_LOCK_FILE),
+        )
+        .expect_err("Markdown next-file");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidPath {
+                key,
+                path,
+                reason: "must not name a Markdown fragment",
+            } if key == "fragments.next-file" && path == Path::new("next.md")
+        ));
     }
 
     #[cfg(unix)]

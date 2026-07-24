@@ -541,6 +541,46 @@ To be released.
 }
 
 #[test]
+fn init_interactive_keeps_sections_explicit_when_an_inferred_directory_is_unsafe() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    git(temp.path(), ["init"]);
+    std::fs::create_dir_all(temp.path().join("packages/core")).expect("core package");
+    std::fs::create_dir_all(temp.path().join("packages/next")).expect("next package");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "\
+Project changes
+===============
+
+Version 2.0.0
+-------------
+
+To be released.
+
+### @example/core
+
+ -  Added core.
+
+### @example/next
+
+ -  Added next.
+",
+    )
+    .expect("changelog");
+
+    let (success, output) = run_in_terminal(temp.path(), &["init"], "\n\n\n1,2\n\n\n\n\n\n\n");
+
+    assert!(success, "{output}");
+    assert!(!output.contains("Use inferred section pattern"), "{output}");
+    let config = std::fs::read_to_string(temp.path().join("sacho.toml")).expect("configuration");
+    assert_eq!(config.matches("[[sections]]").count(), 2, "{config}");
+    assert!(config.contains("id = \"@example/core\""), "{config}");
+    assert!(config.contains("id = \"@example/next\""), "{config}");
+    assert!(config.contains("directory = \"next-2\""), "{config}");
+    assert!(!config.contains("[[section-patterns]]"), "{config}");
+}
+
+#[test]
 fn init_interactive_can_decline_an_inferred_section_pattern() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     git(temp.path(), ["init"]);

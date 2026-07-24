@@ -17,12 +17,12 @@ use sacho::commands::{
     infer_section_pattern, init_repository, initialization_root, mercurial_update_hook,
     plan_format, plan_import_unreleased, plan_release, plan_release_with_link_resolution,
     plan_resolve_links, plan_sync, reference_transaction_hook, set_next_version, show,
-    suggest_section_directory,
+    suggest_section_directory_avoiding,
 };
 use sacho::link_resolution::LinkResolutionPolicy;
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::released::discover_section_candidates;
-use sacho::{Error, Repository, SectionConfig, SectionPatternConfig};
+use sacho::{Error, FragmentsConfig, Repository, SectionConfig, SectionPatternConfig};
 
 const HELP_LICENSE_NOTICE: &str = "Copyright (C) 2026 Hong Minhee\n\
 Sacho is free software under GNU GPLv3 only and comes with ABSOLUTELY NO WARRANTY.\n\
@@ -856,9 +856,14 @@ fn resolve_interactive_sections(
     }
     let mut sections = Vec::new();
     let mut used_directories = Vec::new();
+    let reserved_directories = [FragmentsConfig::default().next_file];
     for index in selected {
         let candidate = &candidates[index];
-        let suggested = suggest_section_directory(&candidate.id, &used_directories);
+        let suggested = suggest_section_directory_avoiding(
+            &candidate.id,
+            &used_directories,
+            &reserved_directories,
+        );
         let directory = PathBuf::from(prompt(
             &format!("Fragment directory for {}", candidate.id),
             &suggested.display().to_string(),
