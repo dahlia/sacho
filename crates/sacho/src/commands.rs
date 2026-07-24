@@ -986,7 +986,7 @@ pub fn infer_section_pattern(
             .into_iter()
             .filter_map(|path| path.strip_suffix("/**").map(str::to_owned))
             .filter_map(|path| {
-                let (parent, name) = path.rsplit_once('/')?;
+                let (parent, name) = path.rsplit_once('/').unwrap_or(("", &path));
                 (name == stem).then(|| parent.to_owned())
             })
             .collect::<BTreeSet<_>>();
@@ -1005,7 +1005,11 @@ pub fn infer_section_pattern(
     }
     let parent = escape_section_pattern_literal(&parent);
     let prefix = escape_section_pattern_literal(id_prefix.unwrap_or_default());
-    let source = format!("{parent}/{capture_pattern}");
+    let source = if parent.is_empty() {
+        capture_pattern.to_string()
+    } else {
+        format!("{parent}/{capture_pattern}")
+    };
     let id = format!("{prefix}{capture_pattern}");
     let Ok(source) = SectionPattern::from_str(&source) else {
         return Ok(None);
@@ -6995,6 +6999,26 @@ mod tests {
         .expect("one pattern");
 
         assert_eq!(pattern.source.to_string(), "packages/{name}");
+        assert_eq!(pattern.id.to_string(), "@example/{name}");
+        assert_eq!(pattern.directory.to_string(), "{name}");
+        assert_eq!(pattern.paths, None);
+    }
+
+    #[test]
+    fn infers_a_section_pattern_from_selected_root_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("core")).expect("core package");
+        fs::create_dir(temp.path().join("cli")).expect("cli package");
+
+        let pattern = infer_section_pattern(
+            temp.path(),
+            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            Path::new("changes.d"),
+        )
+        .expect("pattern inference")
+        .expect("one pattern");
+
+        assert_eq!(pattern.source.to_string(), "{name}");
         assert_eq!(pattern.id.to_string(), "@example/{name}");
         assert_eq!(pattern.directory.to_string(), "{name}");
         assert_eq!(pattern.paths, None);
