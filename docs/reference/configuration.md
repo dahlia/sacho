@@ -179,6 +179,30 @@ Section ids and normalized directories must be unique. The array order controls
 the rendered section order.
 
 
+`[[section-patterns]]`
+----------------------
+
+~~~~ toml
+[[section-patterns]]
+source = "packages/{name}"
+id = "@acme/{name}"
+directory = "{name}"
+paths = ["packages/{name}/src/**"]
+~~~~
+
+Section patterns derive any number of sections from a regular repository
+layout. `source` captures values from a repository subtree. `id` and
+`directory` reuse those captures for the changelog heading and fragment
+subdirectory. Omit `paths` to attribute the complete source subtree, or set it
+to a list of source-prefixed glob templates. An explicit empty list disables
+section-specific attribution.
+
+See [*Section pattern syntax*](./section-patterns) for the grammar, field
+constraints, ordering, and precedence rules.
+[*Package monorepos*](../guide/package-monorepos) shows complete configurations
+for common layouts.
+
+
 Path rules
 ----------
 

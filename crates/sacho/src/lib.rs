@@ -31,6 +31,9 @@ pub mod released;
 /// Repository discovery and path helpers.
 pub mod repo;
 mod repository_url;
+mod section;
+/// Section pattern parsing and matching types.
+pub mod section_pattern;
 /// Version-control integration types.
 pub mod vcs;
 
@@ -41,3 +44,7 @@ pub use crate::config::{
 };
 pub use crate::error::{ConfigError, Error, FragmentError, MutationCommand, Result};
 pub use crate::repo::Repository;
+pub use crate::section_pattern::{
+    SectionPattern, SectionPatternConfig, SectionPatternConfigError, SectionPatternError,
+    SectionPatternSegment,
+};

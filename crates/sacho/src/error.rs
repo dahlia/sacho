@@ -93,6 +93,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// A section pattern could not resolve a concrete repository section.
+    #[snafu(display("section pattern resolution failed: {message}"))]
+    SectionPattern {
+        /// Explanation of the failed resolution.
+        message: String,
+    },
+
     /// An unpinned reference URL could not be resolved through HTTP redirects.
     #[snafu(display("failed to resolve reference {label:?} from {url:?}: {reason}"))]
     LinkResolutionFailed {
@@ -713,6 +720,23 @@ pub enum ConfigError {
     Parse {
         /// Underlying TOML parser error.
         source: toml::de::Error,
+    },
+
+    /// A section pattern violates its semantic constraints.
+    #[snafu(display("section-patterns[{index}] is invalid: {source}"))]
+    InvalidSectionPattern {
+        /// Index of the invalid pattern.
+        index: usize,
+
+        /// Pattern validation error.
+        source: crate::section_pattern::SectionPatternConfigError,
+    },
+
+    /// A section pattern is repeated exactly.
+    #[snafu(display("section-patterns[{index}] duplicates an earlier pattern"))]
+    DuplicateSectionPattern {
+        /// Index of the duplicate pattern.
+        index: usize,
     },
 
     /// A configured repository path violates the lexical path contract.

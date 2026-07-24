@@ -11,6 +11,7 @@ use crate::error::{ReadFileSnafu, Result};
 use crate::fragment::{Fragment, ReferenceUse, discover_fragments};
 use crate::markdown::format_markdown_with_word_wrap;
 use crate::repo::Repository;
+use crate::section::{SectionResolver, has_sections};
 
 /// Rendered section identifier.
 pub type SectionId = String;
@@ -159,7 +160,7 @@ pub(crate) fn compile_parsed_fragments(
         .filter(|item| item.has_substantive_content)
         .count();
 
-    let section_ids = ordered_sections(repo, &items);
+    let section_ids = ordered_sections(repo, &items)?;
     let mut sections = Vec::new();
     for section_id in section_ids {
         let section_items = items
@@ -236,11 +237,12 @@ fn validate_requested_section(
     let Some(section) = section else {
         return Ok(());
     };
-    if repo
-        .config()
-        .sections
-        .iter()
-        .any(|configured| configured.id == section)
+    if SectionResolver::from_config(repo.config())?
+        .resolve_id(section)
+        .map_err(|error| crate::Error::SectionPattern {
+            message: error.to_string(),
+        })?
+        .is_some()
     {
         return Ok(());
     }
@@ -329,32 +331,21 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn ordered_sections(repo: &Repository, items: &[SortableItem]) -> Vec<Option<SectionId>> {
-    if repo.config().sections.is_empty() {
-        return vec![None];
+fn ordered_sections(repo: &Repository, items: &[SortableItem]) -> Result<Vec<Option<SectionId>>> {
+    if !has_sections(repo.config()) {
+        return Ok(vec![None]);
     }
 
     let present = items
         .iter()
         .filter_map(|item| item.section.clone())
         .collect::<BTreeSet<_>>();
-    let mut ordered = Vec::new();
-    for section in &repo.config().sections {
-        if present.contains(&section.id) {
-            ordered.push(Some(section.id.clone()));
-        }
-    }
-    for section in present {
-        if !repo
-            .config()
-            .sections
-            .iter()
-            .any(|configured| configured.id == section)
-        {
-            ordered.push(Some(section));
-        }
-    }
-    ordered
+    SectionResolver::from_config(repo.config())?
+        .ordered_present(&present)
+        .map(|sections| sections.into_iter().map(Some).collect())
+        .map_err(|error| crate::Error::SectionPattern {
+            message: error.to_string(),
+        })
 }
 
 fn compile_section(
@@ -810,6 +801,49 @@ mod tests {
                 < compiled.markdown.find("### unknown").expect("unknown")
         );
         assert!(!compiled.markdown.contains("### Extra"));
+    }
+
+    #[test]
+    fn compiles_patterned_sections_in_declaration_and_id_order() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "Workspace"
+            directory = "workspace"
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "pkg-{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "tool-{name}"
+            "#,
+        );
+        for (directory, text) in [
+            ("workspace", "Workspace"),
+            ("pkg-z", "Package z"),
+            ("pkg-a", "Package a"),
+            ("tool-a", "Tool a"),
+        ] {
+            fs::create_dir_all(temp.path().join("changes.d").join(directory)).expect("section dir");
+            fs::write(
+                temp.path()
+                    .join("changes.d")
+                    .join(directory)
+                    .join("change.md"),
+                format!(" -  Changed {text}.\n"),
+            )
+            .expect("fragment");
+        }
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let headings = ["### Workspace", "### pkg/a", "### pkg/z", "### tool/a"];
+        let positions = headings.map(|heading| compiled.markdown.find(heading).expect("heading"));
+
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]

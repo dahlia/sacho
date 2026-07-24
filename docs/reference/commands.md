@@ -17,9 +17,11 @@ version-control integration that do not already exist.
 
 During first-time interactive setup with an existing changelog, Sacho offers
 level-three headings found across the changelog as section candidates. For each
-selected candidate, it suggests a fragment directory and source path globs. The
-prompts remain editable, and selecting no candidates leaves `[[sections]]`
-absent.
+selected candidate, it suggests a fragment directory and source path globs. If
+at least two selections map to sibling directories under one unambiguous
+parent, Sacho first offers to replace their repeated `[[sections]]` entries
+with one inferred `[[section-patterns]]` table. The prompts remain editable,
+and selecting no candidates leaves both tables absent.
 
 | Option                            | Meaning                                                          |
 | --------------------------------- | ---------------------------------------------------------------- |

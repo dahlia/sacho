@@ -14,14 +14,15 @@ use sacho::commands::{
     SyncOptions, SyncPlan, add_fragment, apply_format, apply_import_unreleased, apply_merge_driver,
     apply_release, apply_resolve_links, apply_sync, carry, check, commit_message_hook,
     compile_unreleased_with_link_resolution, infer_repository_url, infer_section_paths,
-    init_repository, initialization_root, mercurial_update_hook, plan_format,
-    plan_import_unreleased, plan_release, plan_release_with_link_resolution, plan_resolve_links,
-    plan_sync, reference_transaction_hook, set_next_version, show, suggest_section_directory,
+    infer_section_pattern, init_repository, initialization_root, mercurial_update_hook,
+    plan_format, plan_import_unreleased, plan_release, plan_release_with_link_resolution,
+    plan_resolve_links, plan_sync, reference_transaction_hook, set_next_version, show,
+    suggest_section_directory_avoiding,
 };
 use sacho::link_resolution::LinkResolutionPolicy;
 use sacho::merge::{MergeDriverOptions, MergeDriverResult};
 use sacho::released::discover_section_candidates;
-use sacho::{Error, Repository, SectionConfig};
+use sacho::{Error, FragmentsConfig, Repository, SectionConfig, SectionPatternConfig};
 
 const HELP_LICENSE_NOTICE: &str = "Copyright (C) 2026 Hong Minhee\n\
 Sacho is free software under GNU GPLv3 only and comes with ABSOLUTELY NO WARRANTY.\n\
@@ -743,7 +744,7 @@ fn resolve_init_options(
         let fragment_directory = prompt("Fragment directory", "changes.d")?;
         let materialize = prompt_bool("Materialize unreleased changelog", true)?;
         let root = initialization_root(".");
-        let sections = resolve_interactive_sections(
+        let (sections, section_patterns) = resolve_interactive_sections(
             &root,
             Path::new(&changelog_path),
             Path::new(&fragment_directory),
@@ -768,6 +769,7 @@ fn resolve_init_options(
             append_existing_hook,
             repository_url,
             sections,
+            section_patterns,
         })
     } else {
         Ok(InitOptions {
@@ -779,6 +781,7 @@ fn resolve_init_options(
             append_existing_hook: false,
             repository_url,
             sections: Vec::new(),
+            section_patterns: Vec::new(),
         })
     }
 }
@@ -787,13 +790,13 @@ fn resolve_interactive_sections(
     root: &Path,
     changelog_path: &Path,
     fragment_directory: &Path,
-) -> Result<Vec<SectionConfig>, CliReport> {
+) -> Result<(Vec<SectionConfig>, Vec<SectionPatternConfig>), CliReport> {
     if root.join(Repository::CONFIG_FILE).exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let path = root.join(changelog_path);
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let changelog = std::fs::read_to_string(&path).map_err(|source| Error::ReadFile {
         path: path.clone(),
@@ -805,7 +808,7 @@ fn resolve_interactive_sections(
     );
     let candidates = discover_section_candidates(&changelog, &document_title, "To be released.");
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     println!("Possible changelog sections:");
@@ -836,11 +839,31 @@ fn resolve_interactive_sections(
             Err(error) => eprintln!("{error}"),
         }
     };
+    let selected_ids = selected
+        .iter()
+        .map(|index| candidates[*index].id.clone())
+        .collect::<Vec<_>>();
+    if let Some(pattern) = infer_section_pattern(root, &selected_ids, fragment_directory)?
+        && prompt_bool(
+            &format!(
+                "Use inferred section pattern {} -> {}",
+                pattern.source, pattern.id
+            ),
+            true,
+        )?
+    {
+        return Ok((Vec::new(), vec![pattern]));
+    }
     let mut sections = Vec::new();
     let mut used_directories = Vec::new();
+    let reserved_directories = [FragmentsConfig::default().next_file];
     for index in selected {
         let candidate = &candidates[index];
-        let suggested = suggest_section_directory(&candidate.id, &used_directories);
+        let suggested = suggest_section_directory_avoiding(
+            &candidate.id,
+            &used_directories,
+            &reserved_directories,
+        );
         let directory = PathBuf::from(prompt(
             &format!("Fragment directory for {}", candidate.id),
             &suggested.display().to_string(),
@@ -868,7 +891,7 @@ fn resolve_interactive_sections(
             paths,
         });
     }
-    Ok(sections)
+    Ok((sections, Vec::new()))
 }
 
 fn parse_section_selection(answer: &str, candidate_count: usize) -> Result<Vec<usize>, CliReport> {

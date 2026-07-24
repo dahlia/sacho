@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConfigError, Result};
+use crate::section_pattern::SectionPatternConfig;
 
 /// Parsed Sacho configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,6 +40,10 @@ pub struct Config {
     /// Ordered section configuration.
     #[serde(default)]
     pub sections: Vec<SectionConfig>,
+
+    /// Ordered section pattern configuration.
+    #[serde(default)]
+    pub section_patterns: Vec<SectionPatternConfig>,
 }
 
 impl Config {
@@ -54,18 +59,7 @@ impl Config {
         validate_config_path("changelog.path", &self.changelog.path)?;
         validate_config_path("fragments.directory", &self.fragments.directory)?;
         validate_config_path("fragments.next-file", &self.fragments.next_file)?;
-        if self
-            .fragments
-            .next_file
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            return Err(ConfigError::InvalidPath {
-                key: String::from("fragments.next-file"),
-                path: self.fragments.next_file.clone(),
-                reason: "must not name a Markdown fragment",
-            });
-        }
+        validate_next_file_is_not_markdown(&self.fragments.next_file, &self.fragments.next_file)?;
 
         for (sigil, template) in &self.links {
             if !template.as_str().contains("{n}") {
@@ -107,9 +101,34 @@ impl Config {
             }
             section_directories.push((comparison_path, directory_key));
         }
+        for (index, pattern) in self.section_patterns.iter().enumerate() {
+            pattern
+                .validate()
+                .map_err(|source| ConfigError::InvalidSectionPattern { index, source })?;
+            if self.section_patterns[..index].contains(pattern) {
+                return Err(ConfigError::DuplicateSectionPattern { index });
+            }
+        }
         self.vcs.validate()?;
         Ok(())
     }
+}
+
+pub(crate) fn validate_next_file_is_not_markdown(
+    effective_path: &Path,
+    configured_path: &Path,
+) -> Result<(), ConfigError> {
+    if effective_path
+        .extension()
+        .is_some_and(|extension| extension == "md")
+    {
+        return Err(ConfigError::InvalidPath {
+            key: String::from("fragments.next-file"),
+            path: configured_path.to_path_buf(),
+            reason: "must not name a Markdown fragment",
+        });
+    }
+    Ok(())
 }
 
 fn validate_config_path(key: &str, path: &Path) -> Result<PathBuf, ConfigError> {
@@ -534,6 +553,7 @@ mod tests {
                     vcs: VcsConfig::default(),
                     check: CheckConfig::default(),
                     sections: unique_sections,
+                    section_patterns: Vec::new(),
                 }
             })
     }
@@ -547,6 +567,65 @@ mod tests {
         assert!(!config.link_resolution.enabled);
         assert_eq!(config.vcs.preset, VcsPreset::Git);
         assert!(config.vcs.commands.is_empty());
+    }
+
+    #[test]
+    fn parses_section_patterns_and_preserves_path_defaults() {
+        let config = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "@acme/{name}"
+directory = "{name}"
+
+[[section-patterns]]
+source = "tools/{name}"
+id = "tool/{name}"
+directory = "tool-{name}"
+paths = []
+"#,
+        )
+        .expect("section patterns");
+
+        assert_eq!(config.section_patterns.len(), 2);
+        assert_eq!(config.section_patterns[0].paths, None);
+        assert_eq!(config.section_patterns[1].paths, Some(Vec::new()));
+    }
+
+    #[test]
+    fn rejects_invalid_and_duplicate_section_patterns() {
+        let invalid = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "{other}"
+directory = "{name}"
+"#,
+        )
+        .expect_err("mismatched captures");
+        assert!(matches!(
+            invalid,
+            ConfigError::InvalidSectionPattern { index: 0, .. }
+        ));
+
+        let duplicate = Config::parse(
+            r#"
+[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+directory = "{name}"
+
+[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+directory = "{name}"
+"#,
+        )
+        .expect_err("duplicate pattern");
+        assert!(matches!(
+            duplicate,
+            ConfigError::DuplicateSectionPattern { index: 1 }
+        ));
     }
 
     #[test]
