@@ -3277,6 +3277,11 @@ fn missing_fragment_requirements(
         } else {
             for section in matched_sections {
                 if section.pattern_index.is_some() && !section_paths.contains_key(&section.id) {
+                    resolver
+                        .resolve_directory(&section.directory)
+                        .map_err(|error| Error::SectionPattern {
+                            message: error.to_string(),
+                        })?;
                     repo.validate_pattern_section_directory(&section.directory)?;
                 }
                 section_paths
@@ -15684,6 +15689,33 @@ priority: 0
         let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
 
         assert!(report.violations.is_empty());
+    }
+
+    #[test]
+    fn layer_three_rejects_an_ambiguous_patterned_section_directory() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "{name}"
+            "#,
+        );
+
+        let error =
+            missing_fragment_requirements(&repo, &[PathBuf::from("packages/core/src/lib.rs")])
+                .expect_err("ambiguous patterned section directory");
+
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
     }
 
     #[test]

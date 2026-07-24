@@ -703,6 +703,11 @@ fn grouped_sections(
         .collect::<Result<Vec<_>>>()?;
     for section in &sections {
         if section.pattern_index.is_some() {
+            resolver
+                .resolve_directory(&section.directory)
+                .map_err(|error| Error::SectionPattern {
+                    message: error.to_string(),
+                })?;
             repo.validate_pattern_section_directory(&section.directory)?;
         }
     }
@@ -1664,6 +1669,74 @@ Released on July 7, 2026.
             carried.fragments[0].path,
             PathBuf::from("changes.d/core/carried-from-1.1.5.md")
         );
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_patterned_carry_directory() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "{name}"
+            "#,
+        );
+        let changelog = "\
+## Version 1.1.5
+
+Released on July 7, 2026.
+
+### pkg/core
+
+ -  Added core change.
+";
+
+        let error =
+            carry_release(&repo, changelog, "1.1.5").expect_err("ambiguous carry directory");
+
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_ambiguous_patterned_import_directory() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "{name}"
+            "#,
+        );
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+### pkg/core
+
+ -  Added core support.
+";
+
+        let error =
+            import_unreleased_region(&repo, region).expect_err("ambiguous import directory");
+
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
     }
 
     #[cfg(unix)]
