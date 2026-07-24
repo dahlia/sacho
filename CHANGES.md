@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.3.0
 -------------
 
-To be released.
+Released on July 24, 2026.
 
  -  Added `--no-word-wrap` to `sacho preview` and `sacho show` for publishing
     release notes without Sacho's canonical 80-column wrapping.  [[#3]]
