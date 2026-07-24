@@ -236,7 +236,7 @@ pub fn discover_fragment_candidates(repo: &Repository) -> Result<DiscoveredFragm
                 .strip_prefix(&fragment_dir)
                 .expect("fragment entry remains below fragment directory");
             if resolve_discovered_directory(&resolver, relative)?.is_some()
-                || is_configured_section_dir(repo, &path)
+                || is_configured_section_dir(repo, &resolver, &path)?
             {
                 continue;
             }
@@ -481,16 +481,32 @@ fn collect_markdown_files(
     Ok(())
 }
 
-fn is_configured_section_dir(repo: &Repository, path: &Path) -> bool {
+fn is_configured_section_dir(
+    repo: &Repository,
+    resolver: &SectionResolver<'_>,
+    path: &Path,
+) -> Result<bool> {
     let Ok(identity) = fs::canonicalize(path) else {
-        return false;
+        return Ok(false);
     };
     let fragment_dir = repo.resolve(&repo.config().fragments.directory);
-    repo.config()
+    if repo
+        .config()
         .sections
         .iter()
         .filter_map(|section| fs::canonicalize(fragment_dir.join(&section.directory)).ok())
         .any(|configured| configured == identity)
+    {
+        return Ok(true);
+    }
+    let Ok(fragment_identity) = fs::canonicalize(fragment_dir) else {
+        return Ok(false);
+    };
+    let Ok(relative) = identity.strip_prefix(fragment_identity) else {
+        return Ok(false);
+    };
+    Ok(resolve_discovered_directory(resolver, relative)?
+        .is_some_and(|section| section.pattern_index.is_some()))
 }
 
 fn repo_relative_path(repo: &Repository, path: &Path) -> PathBuf {
@@ -1676,6 +1692,42 @@ mod tests {
 
         assert_eq!(discovered.candidates.len(), 1);
         assert_eq!(discovered.candidates[0].section, Some(String::from("Core")));
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_a_patterned_section_symlink_alias_exactly_once() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "package/{name}"
+            directory = "packages/{name}"
+            "#,
+        )
+        .expect("config");
+        std::fs::create_dir_all(temp.path().join("changes.d/packages/core"))
+            .expect("section directory");
+        std::fs::write(
+            temp.path().join("changes.d/packages/core/change.md"),
+            " -  Fixed patterned alias discovery.\n",
+        )
+        .expect("fragment");
+        symlink("packages/core", temp.path().join("changes.d/alias")).expect("section alias");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo).expect("candidates");
+
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(
+            discovered.candidates[0].section.as_deref(),
+            Some("package/core")
+        );
         assert!(discovered.warnings.is_empty());
     }
 
