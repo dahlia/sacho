@@ -82,9 +82,24 @@ capture rule as `id` and must also be a safe relative path.
 
 | Configuration | Attribution                                           |
 | ------------- | ----------------------------------------------------- |
-| Field omitted | The matched `source` subtree and all descendants      |
+| Field omitted | Only paths strictly below the matched `source`        |
 | Nonempty list | Only descendants matched by one of the rendered globs |
 | `paths = []`  | No changes attributed specifically to the section     |
+
+The omitted form treats `source` as a family of directory subtrees. It does not
+attribute a path at the same depth as the complete source match. For example,
+`packages/README.md` does not create a generated `README.md` section for
+`source = "packages/{name}"`.
+
+To model a family of files instead, list the source-depth path explicitly:
+
+~~~~ toml
+[[section-patterns]]
+source = "plugins/{name}.lua"
+id = "plugin-{name}"
+directory = "plugins/{name}"
+paths = ["plugins/{name}.lua"]
+~~~~
 
 Every `paths` entry must start with the complete `source` pattern. Later
 segments use Sacho's ordinary glob syntax. They may reuse captures established

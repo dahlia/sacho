@@ -15680,6 +15680,42 @@ priority: 0
     }
 
     #[test]
+    fn layer_three_keeps_pattern_family_files_at_repository_level() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [check]
+            paths = ["packages/**"]
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@acme/{name}"
+            directory = "{name}"
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d/core")).expect("fragment directory");
+        fs::write(
+            temp.path().join("changes.d/core/readme.md"),
+            " -  Documented the package family.\n",
+        )
+        .expect("fragment");
+        let vcs = FakeVcs {
+            commits: vec![fake_commit(
+                "a1",
+                &["packages/README.md", "changes.d/core/readme.md"],
+                "Document the package family",
+            )],
+        };
+
+        let report = missing_fragment_violations(&repo, &vcs, "main").expect("layer three");
+
+        assert!(report.violations.is_empty());
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
     fn layer_three_rejects_an_ambiguous_patterned_section_directory() {
         let (_temp, repo) = repo_with_config(
             r#"

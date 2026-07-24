@@ -188,7 +188,7 @@ impl<'a> SectionResolver<'a> {
                 continue;
             };
             let attributed = match &pattern.paths {
-                None => true,
+                None => value.split('/').count() > pattern.source.segments().len(),
                 Some(paths) => {
                     let mut matched = false;
                     for path_pattern in paths {
@@ -505,15 +505,27 @@ mod tests {
                 "example-{name}",
                 Some(&[]),
             ),
+            pattern(
+                "plugins/{name}.lua",
+                "plugin-{name}",
+                "plugin-{name}",
+                Some(&["plugins/{name}.lua"]),
+            ),
+            pattern("scripts/{name}.lua", "script-{name}", "script-{name}", None),
         ];
         let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
 
-        assert_eq!(
+        assert!(
             resolver
                 .resolve_source_path(Path::new("packages/core"))
-                .expect("source")[0]
-                .id,
-            "core"
+                .expect("source")
+                .is_empty()
+        );
+        assert!(
+            resolver
+                .resolve_source_path(Path::new("packages/README.md"))
+                .expect("source")
+                .is_empty()
         );
         assert_eq!(
             resolver
@@ -538,6 +550,19 @@ mod tests {
         assert!(
             resolver
                 .resolve_source_path(Path::new("examples/demo/main.rs"))
+                .expect("source")
+                .is_empty()
+        );
+        assert_eq!(
+            resolver
+                .resolve_source_path(Path::new("plugins/format.lua"))
+                .expect("source")[0]
+                .id,
+            "plugin-format"
+        );
+        assert!(
+            resolver
+                .resolve_source_path(Path::new("scripts/build.lua"))
                 .expect("source")
                 .is_empty()
         );

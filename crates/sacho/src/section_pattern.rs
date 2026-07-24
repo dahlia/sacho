@@ -92,8 +92,9 @@ pub struct SectionPatternConfig {
 
     /// Optional section-attribution glob templates.
     ///
-    /// An absent value attributes the source itself and every descendant.
-    /// An explicitly empty list disables section-specific attribution.
+    /// An absent value attributes strict descendants below the matched source.
+    /// Use an explicit path to attribute a source-depth file. An explicitly
+    /// empty list disables section-specific attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paths: Option<Vec<SectionPattern>>,
 }
