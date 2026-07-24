@@ -277,6 +277,20 @@ impl SectionPattern {
         self.captures_segments(&values)
     }
 
+    pub(crate) fn accepts_path_prefix(&self, values: &[&OsStr]) -> bool {
+        if values.len() > self.segments.len() {
+            return false;
+        }
+        let Some(values) = values
+            .iter()
+            .map(|value| value.to_str())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        self.captures_segments(&values).is_some()
+    }
+
     fn captures_segments(&self, values: &[&str]) -> Option<BTreeMap<String, String>> {
         let mut captures = BTreeMap::new();
         for (segment, value) in self.segments.iter().zip(values.iter().copied()) {
@@ -600,6 +614,23 @@ mod tests {
         assert!(pattern.captures("packages/acme/plugin-").is_none());
         assert!(pattern.captures("packages/acme/plugin/http").is_none());
         assert!(pattern.captures("crates/acme/plugin-http").is_none());
+    }
+
+    #[test]
+    fn identifies_viable_path_prefixes() {
+        let pattern = SectionPattern::from_str("packages/{scope}/plugin-{name}").expect("pattern");
+        let accepts = |segments: &[&str]| {
+            let segments = segments.iter().map(OsStr::new).collect::<Vec<_>>();
+            pattern.accepts_path_prefix(&segments)
+        };
+
+        assert!(accepts(&[]));
+        assert!(accepts(&["packages"]));
+        assert!(accepts(&["packages", "acme"]));
+        assert!(accepts(&["packages", "acme", "plugin-http"]));
+        assert!(!accepts(&["legacy"]));
+        assert!(!accepts(&["packages", "acme", "core"]));
+        assert!(!accepts(&["packages", "acme", "plugin-http", "src"]));
     }
 
     #[test]

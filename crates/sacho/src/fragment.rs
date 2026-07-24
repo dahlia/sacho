@@ -322,6 +322,14 @@ fn collect_pattern_markdown_files(
             continue;
         }
         let child_relative = relative.join(entry.file_name());
+        if !resolver
+            .directory_prefix_is_viable(&child_relative)
+            .map_err(|error| crate::Error::SectionPattern {
+                message: error.to_string(),
+            })?
+        {
+            continue;
+        }
         let child_depth = remaining_depth
             .checked_sub(1)
             .expect("zero remaining depth returned before recursion");
@@ -1472,6 +1480,44 @@ mod tests {
         let discovered = discover_fragment_candidates(&repo).expect("candidates");
 
         assert!(discovered.candidates.is_empty());
+        assert!(discovered.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patterned_discovery_prunes_unrelated_nested_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "Legacy"
+            directory = "legacy"
+
+            [[section-patterns]]
+            source = "packages/{scope}/{name}"
+            id = "@{scope}/{name}"
+            directory = "packages/{scope}/{name}"
+            "#,
+        )
+        .expect("config");
+        let legacy = temp.path().join("changes.d/legacy");
+        let private = legacy.join("private");
+        std::fs::create_dir_all(&private).expect("private directory");
+        std::fs::write(legacy.join("change.md"), " -  Fixed legacy.\n").expect("fragment");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
+            .expect("remove permissions");
+        let repo = Repository::from_root(temp.path()).expect("repo");
+
+        let discovered = discover_fragment_candidates(&repo);
+
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        let discovered = discovered.expect("unrelated directory should be pruned");
+        assert_eq!(discovered.candidates.len(), 1);
+        assert_eq!(discovered.candidates[0].section.as_deref(), Some("Legacy"));
         assert!(discovered.warnings.is_empty());
     }
 

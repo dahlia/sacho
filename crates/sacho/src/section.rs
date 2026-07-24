@@ -168,6 +168,17 @@ impl<'a> SectionResolver<'a> {
             })
     }
 
+    pub(crate) fn directory_prefix_is_viable(
+        &self,
+        directory: &Path,
+    ) -> Result<bool, SectionResolutionError> {
+        let components = path_pattern_components(directory)?;
+        Ok(self
+            .patterns
+            .iter()
+            .any(|pattern| pattern.directory.accepts_path_prefix(&components)))
+    }
+
     pub(crate) fn resolve_source_path(
         &self,
         path: &Path,
