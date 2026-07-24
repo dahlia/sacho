@@ -59,18 +59,7 @@ impl Config {
         validate_config_path("changelog.path", &self.changelog.path)?;
         validate_config_path("fragments.directory", &self.fragments.directory)?;
         validate_config_path("fragments.next-file", &self.fragments.next_file)?;
-        if self
-            .fragments
-            .next_file
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            return Err(ConfigError::InvalidPath {
-                key: String::from("fragments.next-file"),
-                path: self.fragments.next_file.clone(),
-                reason: "must not name a Markdown fragment",
-            });
-        }
+        validate_next_file_is_not_markdown(&self.fragments.next_file, &self.fragments.next_file)?;
 
         for (sigil, template) in &self.links {
             if !template.as_str().contains("{n}") {
@@ -123,6 +112,23 @@ impl Config {
         self.vcs.validate()?;
         Ok(())
     }
+}
+
+pub(crate) fn validate_next_file_is_not_markdown(
+    effective_path: &Path,
+    configured_path: &Path,
+) -> Result<(), ConfigError> {
+    if effective_path
+        .extension()
+        .is_some_and(|extension| extension == "md")
+    {
+        return Err(ConfigError::InvalidPath {
+            key: String::from("fragments.next-file"),
+            path: configured_path.to_path_buf(),
+            reason: "must not name a Markdown fragment",
+        });
+    }
+    Ok(())
 }
 
 fn validate_config_path(key: &str, path: &Path) -> Result<PathBuf, ConfigError> {

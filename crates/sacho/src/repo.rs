@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::config::Config;
+use crate::config::{Config, validate_next_file_is_not_markdown};
 use crate::error::{ConfigError, ConfigSnafu, ReadFileSnafu, RenameFileSnafu, Result};
 use snafu::ResultExt;
 
@@ -466,17 +466,7 @@ pub(crate) fn validate_repository_config_paths_with_cache(
             .join(&config.fragments.next_file),
         validation_cache,
     )?;
-    if next
-        .identity
-        .extension()
-        .is_some_and(|extension| extension == "md")
-    {
-        return Err(ConfigError::InvalidPath {
-            key: String::from("fragments.next-file"),
-            path: config.fragments.next_file.clone(),
-            reason: "must not name a Markdown fragment",
-        });
-    }
+    validate_next_file_is_not_markdown(&next.identity, &config.fragments.next_file)?;
     validate_strict_descendant(
         &next,
         "fragments.directory",
@@ -555,17 +545,7 @@ pub(crate) fn validate_pattern_section_directories(
         root.join(fragment_directory).join(next_file),
         &mut validation_cache,
     )?;
-    if next
-        .identity
-        .extension()
-        .is_some_and(|extension| extension == "md")
-    {
-        return Err(ConfigError::InvalidPath {
-            key: String::from("fragments.next-file"),
-            path: next_file.to_path_buf(),
-            reason: "must not name a Markdown fragment",
-        });
-    }
+    validate_next_file_is_not_markdown(&next.identity, next_file)?;
     validate_strict_descendant(
         &next,
         "fragments.directory",
