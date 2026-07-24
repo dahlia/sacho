@@ -171,18 +171,19 @@ impl SectionPattern {
         &self,
         captures: &BTreeMap<String, String>,
     ) -> Result<String, SectionPatternError> {
-        self.render_with(captures, str::to_owned)
+        self.render_with(captures, str::to_owned, str::to_owned)
     }
 
     /// Renders the pattern as a glob while escaping capture values.
     ///
     /// Literal pattern text retains its glob meaning. Capture values are
     /// escaped so names containing glob metacharacters remain literal.
+    /// Doubled braces parsed as literal text also remain literal.
     pub fn render_glob(
         &self,
         captures: &BTreeMap<String, String>,
     ) -> Result<String, SectionPatternError> {
-        self.render_with(captures, globset::escape)
+        self.render_with(captures, escape_glob_braces, globset::escape)
     }
 
     /// Renders a glob while treating a structural prefix as literal text.
@@ -207,10 +208,15 @@ impl SectionPattern {
                 rendered.push('/');
             }
             if index < prefix.segments.len() {
-                let literal = render_segment(segment, captures, str::to_owned)?;
+                let literal = render_segment(segment, captures, str::to_owned, str::to_owned)?;
                 rendered.push_str(&globset::escape(&literal));
             } else {
-                rendered.push_str(&render_segment(segment, captures, globset::escape)?);
+                rendered.push_str(&render_segment(
+                    segment,
+                    captures,
+                    escape_glob_braces,
+                    globset::escape,
+                )?);
             }
         }
         Ok(rendered)
@@ -219,6 +225,7 @@ impl SectionPattern {
     fn render_with(
         &self,
         captures: &BTreeMap<String, String>,
+        render_literal: impl Fn(&str) -> String,
         render_capture: impl Fn(&str) -> String,
     ) -> Result<String, SectionPatternError> {
         let mut rendered = String::new();
@@ -226,10 +233,12 @@ impl SectionPattern {
             if index != 0 {
                 rendered.push('/');
             }
-            match segment {
-                SectionPatternSegment::Literal(literal) => rendered.push_str(literal),
-                segment => rendered.push_str(&render_segment(segment, captures, &render_capture)?),
-            }
+            rendered.push_str(&render_segment(
+                segment,
+                captures,
+                &render_literal,
+                &render_capture,
+            )?);
         }
         Ok(rendered)
     }
@@ -424,10 +433,11 @@ fn invalid_capture_value(value: &str) -> bool {
 fn render_segment(
     segment: &SectionPatternSegment,
     captures: &BTreeMap<String, String>,
+    render_literal: impl Fn(&str) -> String,
     render_capture: impl Fn(&str) -> String,
 ) -> Result<String, SectionPatternError> {
     match segment {
-        SectionPatternSegment::Literal(literal) => Ok(literal.clone()),
+        SectionPatternSegment::Literal(literal) => Ok(render_literal(literal)),
         SectionPatternSegment::Capture {
             prefix,
             name,
@@ -442,9 +452,18 @@ fn render_segment(
                     value: value.clone(),
                 });
             }
-            Ok(format!("{prefix}{}{suffix}", render_capture(value)))
+            Ok(format!(
+                "{}{}{}",
+                render_literal(prefix),
+                render_capture(value),
+                render_literal(suffix)
+            ))
         }
     }
+}
+
+fn escape_glob_braces(value: &str) -> String {
+    value.replace('{', "[{]").replace('}', "[}]")
 }
 
 fn invalid(pattern: &str, reason: &'static str) -> SectionPatternError {
@@ -599,6 +618,20 @@ mod tests {
     }
 
     #[test]
+    fn rendered_globs_preserve_escaped_literal_braces() {
+        let pattern = SectionPattern::from_str("packages/{name}/{{draft}}-*.rs").expect("pattern");
+        let captures = BTreeMap::from([(String::from("name"), String::from("core"))]);
+
+        let rendered = pattern.render_glob(&captures).expect("rendered glob");
+        let matcher = globset::Glob::new(&rendered)
+            .expect("glob")
+            .compile_matcher();
+
+        assert!(matcher.is_match("packages/core/{draft}-api.rs"));
+        assert!(!matcher.is_match("packages/core/draft-api.rs"));
+    }
+
+    #[test]
     fn literal_prefix_ends_before_the_first_custom_glob_segment() {
         let prefix = SectionPattern::from_str("packages/{name}").expect("prefix");
         let pattern = SectionPattern::from_str("packages/{name}/[st]rc/**").expect("path pattern");
@@ -615,6 +648,27 @@ mod tests {
                 .compile_matcher()
                 .is_match("packages/core/src/lib.rs")
         );
+    }
+
+    #[test]
+    fn rendered_path_globs_preserve_escaped_literal_braces() {
+        let prefix = SectionPattern::from_str("packages/{name}").expect("prefix");
+        let pattern = SectionPattern::from_str("packages/{name}/{{draft}}-{kind}-[st]*.rs")
+            .expect("path pattern");
+        let captures = BTreeMap::from([
+            (String::from("name"), String::from("core")),
+            (String::from("kind"), String::from("api")),
+        ]);
+
+        let rendered = pattern
+            .render_glob_with_literal_prefix(&prefix, &captures)
+            .expect("rendered glob");
+        let matcher = globset::Glob::new(&rendered)
+            .expect("glob")
+            .compile_matcher();
+
+        assert!(matcher.is_match("packages/core/{draft}-api-src.rs"));
+        assert!(!matcher.is_match("packages/core/draft-api-src.rs"));
     }
 
     #[test]
@@ -809,6 +863,30 @@ mod tests {
             let rendered = pattern.render(&captures).expect("render");
 
             prop_assert_eq!(pattern.captures(&rendered), Some(captures));
+        }
+
+        #[test]
+        fn rendered_path_globs_keep_doubled_braces_literal(
+            name in "[A-Za-z0-9_-]{1,8}",
+            literal in "[A-Za-z0-9_-]{1,8}",
+        ) {
+            let prefix = SectionPattern::from_str("packages/{name}").expect("prefix");
+            let pattern = SectionPattern::from_str(
+                &format!("packages/{{name}}/{{{{{literal}}}}}.rs"),
+            )
+            .expect("path pattern");
+            let captures = BTreeMap::from([(String::from("name"), name.clone())]);
+            let rendered = pattern
+                .render_glob_with_literal_prefix(&prefix, &captures)
+                .expect("rendered glob");
+            let matcher = globset::Glob::new(&rendered)
+                .expect("glob")
+                .compile_matcher();
+            let literal_path = format!("packages/{name}/{{{literal}}}.rs");
+            let unbraced_path = format!("packages/{name}/{literal}.rs");
+
+            prop_assert!(matcher.is_match(literal_path));
+            prop_assert!(!matcher.is_match(unbraced_path));
         }
     }
 }
