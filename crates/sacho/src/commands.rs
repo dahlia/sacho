@@ -1174,7 +1174,8 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
         (config.fragments.directory.clone(), None)
     } else {
         let section_id = options.section.as_deref().ok_or(Error::MissingSection)?;
-        let section = SectionResolver::from_config(config)?
+        let resolver = SectionResolver::from_config(config)?;
+        let section = resolver
             .resolve_id(section_id)
             .map_err(|error| Error::SectionPattern {
                 message: error.to_string(),
@@ -1182,6 +1183,13 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
             .ok_or_else(|| Error::UnknownSection {
                 section: section_id.to_owned(),
             })?;
+        if section.pattern_index.is_some() {
+            resolver
+                .resolve_directory(&section.directory)
+                .map_err(|error| Error::SectionPattern {
+                    message: error.to_string(),
+                })?;
+        }
         let patterned_directory = section.pattern_index.map(|_| section.directory.clone());
         (
             config.fragments.directory.join(&section.directory),
@@ -13500,6 +13508,42 @@ links:
             PathBuf::from("changes.d/acme/plugin-http/timeouts.md")
         );
         assert!(temp.path().join(&result.path).is_file());
+    }
+
+    #[test]
+    fn add_rejects_an_ambiguous_patterned_section_directory() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "{name}"
+            "#,
+        );
+
+        let error = add_fragment(
+            &repo,
+            AddOptions {
+                section: Some(String::from("pkg/core")),
+                name: String::from("unsafe"),
+            },
+        )
+        .expect_err("ambiguous patterned section directory");
+
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(
+            !temp.path().join("changes.d/core/unsafe.md").exists(),
+            "add must reject the ambiguous directory before writing"
+        );
     }
 
     #[test]
