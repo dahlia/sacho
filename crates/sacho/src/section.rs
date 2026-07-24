@@ -159,6 +159,14 @@ impl<'a> SectionResolver<'a> {
         one_candidate(&value, candidates)
     }
 
+    pub(crate) fn ensure_unambiguous_directory(&self, directory: &Path) -> Result<()> {
+        self.resolve_directory(directory)
+            .map(|_| ())
+            .map_err(|error| Error::SectionPattern {
+                message: error.to_string(),
+            })
+    }
+
     pub(crate) fn resolve_source_path(
         &self,
         path: &Path,
@@ -669,6 +677,25 @@ mod tests {
         assert!(matches!(
             resolver.resolve_source_path(Path::new("packages/plugin-http/src/lib.rs")),
             Err(SectionResolutionError::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn maps_ambiguous_directory_validation_to_the_public_error() {
+        let patterns = [
+            pattern(
+                "packages/{name}",
+                "package/{name}",
+                "generated/{name}",
+                None,
+            ),
+            pattern("tools/{name}", "tool/{name}", "generated/{name}", None),
+        ];
+        let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
+
+        assert!(matches!(
+            resolver.ensure_unambiguous_directory(Path::new("generated/core")),
+            Err(Error::SectionPattern { message }) if message.contains("ambiguous")
         ));
     }
 

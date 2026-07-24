@@ -703,11 +703,7 @@ fn grouped_sections(
         .collect::<Result<Vec<_>>>()?;
     for section in &sections {
         if section.pattern_index.is_some() {
-            resolver
-                .resolve_directory(&section.directory)
-                .map_err(|error| Error::SectionPattern {
-                    message: error.to_string(),
-                })?;
+            resolver.ensure_unambiguous_directory(&section.directory)?;
             repo.validate_pattern_section_directory(&section.directory)?;
         }
     }
