@@ -1263,12 +1263,24 @@ fn possible_fragment_path(
             .any(|section| relative.parent() == Some(section.as_path()))
         || relative
             .parent()
-            .and_then(Path::to_str)
+            .and_then(section_pattern_path)
             .is_some_and(|parent| {
                 patterns
                     .iter()
-                    .any(|pattern| pattern.captures(parent).is_some())
+                    .any(|pattern| pattern.captures(&parent).is_some())
             })
+}
+
+fn section_pattern_path(path: &Path) -> Option<String> {
+    let mut rendered = String::new();
+    for component in path {
+        let component = component.to_str()?;
+        if !rendered.is_empty() {
+            rendered.push('/');
+        }
+        rendered.push_str(component);
+    }
+    Some(rendered)
 }
 
 fn parse_nul_prefixed_paths(output: &[u8]) -> std::result::Result<Vec<PathBuf>, String> {
@@ -2238,6 +2250,29 @@ mod tests {
             Path::new("changes.d"),
             &[],
             &["packages/{name}".parse().expect("section pattern")],
+        ));
+    }
+
+    #[test]
+    fn section_pattern_paths_use_forward_slashes() {
+        let path = Path::new("packages").join("core");
+
+        assert_eq!(
+            section_pattern_path(&path).as_deref(),
+            Some("packages/core")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn possible_fragment_path_accepts_patterned_windows_directories() {
+        let pattern = "packages/{name}".parse().expect("section pattern");
+
+        assert!(possible_fragment_path(
+            Path::new(r"changes.d\packages\core\feature.md"),
+            Path::new("changes.d"),
+            &[],
+            &[pattern],
         ));
     }
 
