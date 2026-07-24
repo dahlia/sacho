@@ -3119,20 +3119,22 @@ fn changed_fragment_changes(
     repo: &Repository,
     paths: &[ChangedPath],
 ) -> Result<Vec<FragmentChange>> {
+    let resolver = SectionResolver::from_config(repo.config())?;
     paths
         .iter()
         .filter(|path| fragment_content_changed(path))
-        .map(|path| fragment_change_for_path(repo, &path.path))
+        .map(|path| fragment_change_for_path(repo, &resolver, &path.path))
         .filter_map(Result::transpose)
         .collect()
 }
 
 fn surviving_fragment_paths(repo: &Repository, paths: &[ChangedPath]) -> Result<IndexSet<PathBuf>> {
+    let resolver = SectionResolver::from_config(repo.config())?;
     paths
         .iter()
         .filter(|path| path.kind.path_survives())
         .map(|path| {
-            fragment_target_for_path(repo, &path.path)
+            fragment_target_for_path(repo, &resolver, &path.path)
                 .map(|target| target.map(|_| path.path.clone()))
         })
         .filter_map(Result::transpose)
@@ -3161,16 +3163,24 @@ fn final_fragment_paths(repo: &Repository) -> Result<IndexSet<PathBuf>> {
         .collect())
 }
 
-fn fragment_change_for_path(repo: &Repository, path: &Path) -> Result<Option<FragmentChange>> {
+fn fragment_change_for_path(
+    repo: &Repository,
+    resolver: &SectionResolver<'_>,
+    path: &Path,
+) -> Result<Option<FragmentChange>> {
     Ok(
-        fragment_target_for_path(repo, path)?.map(|target| FragmentChange {
+        fragment_target_for_path(repo, resolver, path)?.map(|target| FragmentChange {
             path: path.to_path_buf(),
             target,
         }),
     )
 }
 
-fn fragment_target_for_path(repo: &Repository, path: &Path) -> Result<Option<FragmentTarget>> {
+fn fragment_target_for_path(
+    repo: &Repository,
+    resolver: &SectionResolver<'_>,
+    path: &Path,
+) -> Result<Option<FragmentTarget>> {
     let config = repo.config();
     if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
         return Ok(None);
@@ -3190,7 +3200,6 @@ fn fragment_target_for_path(repo: &Repository, path: &Path) -> Result<Option<Fra
     let Ok(relative) = parent.strip_prefix(&config.fragments.directory) else {
         return Ok(None);
     };
-    let resolver = SectionResolver::from_config(config)?;
     if let Some(section) =
         resolver
             .resolve_directory(relative)
