@@ -59,7 +59,7 @@ pub(crate) enum SectionResolutionError {
 pub(crate) struct SectionResolver<'a> {
     explicit: &'a [SectionConfig],
     patterns: &'a [SectionPatternConfig],
-    explicit_paths: Vec<globset::GlobSet>,
+    explicit_path_matchers: RefCell<BTreeMap<usize, globset::GlobSet>>,
     pattern_path_matchers: RefCell<BTreeMap<String, globset::GlobMatcher>>,
 }
 
@@ -81,14 +81,10 @@ impl<'a> SectionResolver<'a> {
                 .validate()
                 .map_err(|source| SectionResolutionError::InvalidPattern { index, source })?;
         }
-        let explicit_paths = explicit
-            .iter()
-            .map(|section| compile_globs(section.paths.iter().map(String::as_str)))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             explicit,
             patterns,
-            explicit_paths,
+            explicit_path_matchers: RefCell::new(BTreeMap::new()),
             pattern_path_matchers: RefCell::new(BTreeMap::new()),
         })
     }
@@ -167,13 +163,12 @@ impl<'a> SectionResolver<'a> {
         &self,
         path: &Path,
     ) -> Result<Vec<ResolvedSection>, SectionResolutionError> {
-        let mut resolved = self
-            .explicit
-            .iter()
-            .zip(&self.explicit_paths)
-            .filter(|(_, paths)| paths.is_match(path))
-            .map(|(section, _)| explicit_section(section))
-            .collect::<Vec<_>>();
+        let mut resolved = Vec::new();
+        for (index, section) in self.explicit.iter().enumerate() {
+            if self.explicit_paths_are_match(index, section, path)? {
+                resolved.push(explicit_section(section));
+            }
+        }
         if self.patterns.is_empty() {
             return Ok(resolved);
         }
@@ -212,6 +207,26 @@ impl<'a> SectionResolver<'a> {
         Ok(resolved)
     }
 
+    fn explicit_paths_are_match(
+        &self,
+        index: usize,
+        section: &SectionConfig,
+        path: &Path,
+    ) -> Result<bool, SectionResolutionError> {
+        if let Some(matched) = {
+            let matchers = self.explicit_path_matchers.borrow();
+            matchers.get(&index).map(|matcher| matcher.is_match(path))
+        } {
+            return Ok(matched);
+        }
+        let matcher = compile_globs(section.paths.iter().map(String::as_str))?;
+        let matched = matcher.is_match(path);
+        self.explicit_path_matchers
+            .borrow_mut()
+            .insert(index, matcher);
+        Ok(matched)
+    }
+
     fn pattern_path_is_match(
         &self,
         rendered: &str,
@@ -239,6 +254,11 @@ impl<'a> SectionResolver<'a> {
     #[cfg(test)]
     fn cached_pattern_glob_count(&self) -> usize {
         self.pattern_path_matchers.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn cached_explicit_glob_count(&self) -> usize {
+        self.explicit_path_matchers.borrow().len()
     }
 
     pub(crate) fn ordered_present(
@@ -396,6 +416,43 @@ mod tests {
             directory: PathBuf::from(directory),
             paths: paths.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    #[test]
+    fn explicit_globs_are_compiled_only_for_source_attribution() {
+        let explicit = [explicit("core", "core", &["["])];
+        let resolver = SectionResolver::new(&explicit, &[]).expect("resolver");
+
+        assert_eq!(resolver.cached_explicit_glob_count(), 0);
+        assert_eq!(
+            resolver
+                .resolve_id("core")
+                .expect("id")
+                .expect("section")
+                .directory,
+            PathBuf::from("core")
+        );
+        assert_eq!(resolver.cached_explicit_glob_count(), 0);
+        assert!(matches!(
+            resolver.resolve_source_path(Path::new("src/lib.rs")),
+            Err(SectionResolutionError::InvalidGlob { pattern, .. }) if pattern == "["
+        ));
+        assert_eq!(resolver.cached_explicit_glob_count(), 0);
+    }
+
+    #[test]
+    fn explicit_path_matchers_are_cached_by_section() {
+        let explicit = [explicit("core", "core", &["src/**"])];
+        let resolver = SectionResolver::new(&explicit, &[]).expect("resolver");
+
+        resolver
+            .resolve_source_path(Path::new("src/lib.rs"))
+            .expect("first source");
+        resolver
+            .resolve_source_path(Path::new("src/parser.rs"))
+            .expect("same section");
+
+        assert_eq!(resolver.cached_explicit_glob_count(), 1);
     }
 
     #[test]
