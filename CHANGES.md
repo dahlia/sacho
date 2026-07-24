@@ -6,6 +6,10 @@ Version 0.3.1
 
 To be released.
 
+ -  Fixed `sacho import-unreleased` so repositories whose configured section
+    order differs from fragment path order no longer fail with a false stale
+    mutation error.
+
 
 Version 0.3.0
 -------------
