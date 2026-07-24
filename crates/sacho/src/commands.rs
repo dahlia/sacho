@@ -2412,6 +2412,8 @@ pub fn plan_import_unreleased(
         .iter()
         .map(|fragment| fragment.path.clone())
         .collect::<Vec<_>>();
+    let mut fragment_paths_after = written_fragments.clone();
+    fragment_paths_after.sort_by(|left, right| compare_fragment_paths(left, right));
     let mut participants = after_sources
         .iter()
         .map(|source| ReleaseFileChange {
@@ -2440,7 +2442,7 @@ pub fn plan_import_unreleased(
             command: MutationCommand::ImportUnreleased,
             participants,
             fragment_paths_before: Vec::new(),
-            fragment_paths_after: written_fragments,
+            fragment_paths_after,
         },
     })
 }
@@ -8738,6 +8740,86 @@ mod tests {
     }
 
     #[test]
+    fn import_unreleased_applies_when_section_order_differs_from_fragment_path_order() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "@fedify/fedify"
+            directory = "fedify"
+            paths = ["packages/fedify/**"]
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@fedify/{name}"
+            directory = "{name}"
+            paths = ["packages/{name}/**"]
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n### @fedify/fedify\n\n -  Updated the core package.\n\n### @fedify/astro\n\n -  Updated the Astro package.\n",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("import plan");
+        let result = apply_import_unreleased(&repo, plan).expect("apply import");
+
+        assert_eq!(
+            result.written_fragments,
+            vec![
+                PathBuf::from("changes.d/fedify/imported-unreleased.md"),
+                PathBuf::from("changes.d/astro/imported-unreleased.md"),
+            ]
+        );
+        assert!(
+            check(&repo, CheckOptions::default())
+                .expect("check")
+                .is_clean()
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn import_unreleased_applies_for_reverse_configured_section_paths(
+            section_count in 2usize..8,
+        ) {
+            let mut config = String::new();
+            let mut changelog =
+                String::from("Version 2.4.0\n-------------\n\nTo be released.\n");
+            let mut written_fragments = Vec::new();
+            for index in 0..section_count {
+                let id = format!("section-{index}");
+                let directory = format!("section-{}", section_count - index);
+                config.push_str(&format!(
+                    "\n[[sections]]\nid = \"{id}\"\ndirectory = \"{directory}\"\npaths = [\"packages/{directory}/**\"]\n"
+                ));
+                changelog.push_str(&format!(
+                    "\n### {id}\n\n -  Updated generated section {index}.\n"
+                ));
+                written_fragments.push(PathBuf::from(format!(
+                    "changes.d/{directory}/imported-unreleased.md"
+                )));
+            }
+            let (temp, repo) = repo_with_config(&config);
+            fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+            fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+
+            let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+                .expect("import plan");
+            let result = apply_import_unreleased(&repo, plan).expect("apply import");
+
+            prop_assert_eq!(result.written_fragments, written_fragments);
+            prop_assert!(
+                check(&repo, CheckOptions::default())
+                    .expect("check")
+                    .is_clean()
+            );
+        }
+    }
+
+    #[test]
     fn import_unreleased_rejects_existing_fragments_without_writes() {
         let (temp, repo) = repo_with_config("");
         fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
@@ -8760,6 +8842,48 @@ mod tests {
                 .join("changes.d/imported-unreleased.md")
                 .exists()
         );
+    }
+
+    #[test]
+    fn import_unreleased_still_rejects_a_fragment_added_after_planning() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        let changelog =
+            "Version 2.4.0\n-------------\n\nTo be released.\n\n -  Added import support.\n";
+        fs::write(temp.path().join("CHANGES.md"), changelog).expect("changelog");
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("import plan");
+        fs::write(
+            temp.path().join("changes.d/concurrent.md"),
+            " -  Added concurrently.\n",
+        )
+        .expect("concurrent fragment");
+
+        let error = apply_import_unreleased(&repo, plan).expect_err("stale fragment set");
+
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::ImportUnreleased,
+                path,
+            } if path == Path::new("changes.d/concurrent.md")
+        ));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog"),
+            changelog
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("changes.d/concurrent.md"))
+                .expect("concurrent fragment"),
+            " -  Added concurrently.\n"
+        );
+        assert!(
+            !temp
+                .path()
+                .join("changes.d/imported-unreleased.md")
+                .exists()
+        );
+        assert!(!temp.path().join("changes.d/next").exists());
     }
 
     #[test]
