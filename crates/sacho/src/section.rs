@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
@@ -180,15 +181,15 @@ impl<'a> SectionResolver<'a> {
         if self.patterns.is_empty() {
             return Ok(resolved);
         }
-        let value = path_pattern_string(path)?;
+        let components = path_pattern_components(path)?;
 
         let mut patterned = Vec::new();
         for (index, pattern) in self.patterns.iter().enumerate() {
-            let Some(captures) = pattern.source.captures_prefix(&value) else {
+            let Some(captures) = pattern.source.captures_path_prefix(&components) else {
                 continue;
             };
             let attributed = match &pattern.paths {
-                None => value.split('/').count() > pattern.source.segments().len(),
+                None => components.len() > pattern.source.segments().len(),
                 Some(paths) => {
                     let mut matched = false;
                     for path_pattern in paths {
@@ -209,7 +210,7 @@ impl<'a> SectionResolver<'a> {
                 patterned.push(candidate);
             }
         }
-        if let Some(candidate) = one_candidate(&value, patterned)? {
+        if let Some(candidate) = one_candidate(&path_pattern_display(&components), patterned)? {
             resolved.push(candidate);
         }
         Ok(resolved)
@@ -362,29 +363,40 @@ fn compile_globs<'a>(
 }
 
 fn path_pattern_string(path: &Path) -> Result<String, SectionResolutionError> {
-    let mut output = String::new();
-    for component in path.components() {
-        let value = match component {
-            Component::Normal(value) => {
-                value
-                    .to_str()
-                    .ok_or_else(|| SectionResolutionError::NonUtf8Path {
-                        path: path.to_path_buf(),
-                    })?
-            }
-            Component::CurDir => continue,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(SectionResolutionError::NonRelativePath {
+    let components = path_pattern_components(path)?;
+    components
+        .iter()
+        .map(|component| {
+            component
+                .to_str()
+                .ok_or_else(|| SectionResolutionError::NonUtf8Path {
                     path: path.to_path_buf(),
-                });
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
+}
+
+fn path_pattern_components(path: &Path) -> Result<Vec<&OsStr>, SectionResolutionError> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(Ok(value)),
+            Component::CurDir => None,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                Some(Err(SectionResolutionError::NonRelativePath {
+                    path: path.to_path_buf(),
+                }))
             }
-        };
-        if !output.is_empty() {
-            output.push('/');
-        }
-        output.push_str(value);
-    }
-    Ok(output)
+        })
+        .collect()
+}
+
+fn path_pattern_display(components: &[&OsStr]) -> String {
+    components
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -745,19 +757,65 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_non_utf8_paths_when_patterns_need_capture_values() {
+    fn attributes_non_utf8_descendants_from_a_utf8_pattern_prefix() {
         use std::os::unix::ffi::OsStringExt;
 
         let patterns = [pattern("packages/{name}", "{name}", "{name}", None)];
         let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
         let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
-            b'p', b'a', b'c', b'k', b'a', b'g', b'e', b's', b'/', 0xff,
+            b'p', b'a', b'c', b'k', b'a', b'g', b'e', b's', b'/', b'c', b'o', b'r', b'e', b'/',
+            b's', b'r', b'c', b'/', 0xff, b'.', b'r', b's',
         ]));
 
-        assert!(matches!(
-            resolver.resolve_source_path(&path),
-            Err(SectionResolutionError::NonUtf8Path { .. })
-        ));
+        let resolved = resolver.resolve_source_path(&path).expect("source path");
+
+        assert_eq!(
+            resolved,
+            [ResolvedSection {
+                id: String::from("core"),
+                directory: PathBuf::from("core"),
+                pattern_index: Some(0),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn treats_a_non_utf8_pattern_capture_as_a_nonmatch() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let patterns = [pattern("packages/{name}", "{name}", "{name}", None)];
+        let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'p', b'a', b'c', b'k', b'a', b'g', b'e', b's', b'/', 0xff, b'/', b's', b'r', b'c',
+            b'/', b'l', b'i', b'b', b'.', b'r', b's',
+        ]));
+
+        assert!(
+            resolver
+                .resolve_source_path(&path)
+                .expect("source path")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaves_unrelated_non_utf8_paths_at_repository_level() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let patterns = [pattern("packages/{name}", "{name}", "{name}", None)];
+        let resolver = SectionResolver::new(&[], &patterns).expect("resolver");
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'd', b'o', b'c', b's', b'/', 0xff, b'.', b'm', b'd',
+        ]));
+
+        assert!(
+            resolver
+                .resolve_source_path(&path)
+                .expect("source path")
+                .is_empty()
+        );
     }
 
     #[test]

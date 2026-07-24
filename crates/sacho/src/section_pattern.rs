@@ -1,6 +1,7 @@
 //! Section pattern parsing and matching.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::str::FromStr;
 
@@ -262,6 +263,18 @@ impl SectionPattern {
             return None;
         }
         self.captures_segments(&values[..self.segments.len()])
+    }
+
+    pub(crate) fn captures_path_prefix(
+        &self,
+        values: &[&OsStr],
+    ) -> Option<BTreeMap<String, String>> {
+        let values = values
+            .get(..self.segments.len())?
+            .iter()
+            .map(|value| value.to_str())
+            .collect::<Option<Vec<_>>>()?;
+        self.captures_segments(&values)
     }
 
     fn captures_segments(&self, values: &[&str]) -> Option<BTreeMap<String, String>> {

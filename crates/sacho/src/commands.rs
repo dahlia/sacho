@@ -15644,6 +15644,40 @@ priority: 0
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn layer_three_attributes_non_utf8_pattern_descendants() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "@acme/{name}"
+            directory = "{name}"
+            "#,
+        );
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'p', b'a', b'c', b'k', b'a', b'g', b'e', b's', b'/', b'c', b'o', b'r', b'e', b'/',
+            b's', b'r', b'c', b'/', 0xff, b'.', b'r', b's',
+        ]));
+
+        let requirements = missing_fragment_requirements(&repo, std::slice::from_ref(&path))
+            .expect("requirements");
+
+        assert_eq!(
+            requirements.requirements,
+            [MissingFragmentRequirement {
+                target: FragmentTarget::Section(String::from("@acme/core")),
+                paths: vec![path],
+                sectioned_repository: false,
+            }]
+        );
+    }
+
     #[test]
     fn layer_three_attributes_patterned_and_deleted_packages() {
         let (temp, repo) = repo_with_config(
