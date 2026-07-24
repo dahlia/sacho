@@ -602,7 +602,14 @@ fn validate_pattern_section_directory_with_cache(
     }
     validate_path_overlap(next, &section)?;
     for other in sections {
-        validate_path_overlap(other, &section)?;
+        if configured_paths_equal(other, &section) {
+            return Err(ConfigError::ConfigPathOverlap {
+                first_key: other.key.clone(),
+                first_path: other.configured.clone(),
+                second_key: section.key.clone(),
+                second_path: section.configured.clone(),
+            });
+        }
     }
     validate_configured_paths_against_reserved_with_cache(
         std::slice::from_ref(&section),
@@ -1701,6 +1708,74 @@ mod tests {
         .expect("config");
 
         Repository::from_root(temp.path()).expect("nested sections");
+    }
+
+    #[test]
+    fn permits_a_generated_section_nested_below_an_explicit_section() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "packages"
+            directory = "packages"
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "packages/{name}"
+            "#,
+        )
+        .expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repository");
+
+        repo.validate_pattern_section_directory(Path::new("packages/core"))
+            .expect("nested generated section");
+    }
+
+    #[test]
+    fn rejects_a_generated_section_equal_to_an_explicit_section() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "packages/core"
+
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "pkg/{name}"
+            directory = "packages/{name}"
+            "#,
+        )
+        .expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repository");
+
+        let error = repo
+            .validate_pattern_section_directory(Path::new("packages/core"))
+            .expect_err("equal generated section");
+        let message = error.to_string();
+
+        assert!(message.contains("sections[0].directory"), "{message}");
+        assert!(
+            message.contains("resolved section-patterns[].directory"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn permits_nested_but_distinct_generated_section_directories() {
+        let temp = TempDir::new().expect("tempdir");
+
+        validate_pattern_section_directories(
+            temp.path(),
+            Path::new("changes.d"),
+            Path::new("next"),
+            &[PathBuf::from("packages"), PathBuf::from("packages/core")],
+            &temp.path().join(MUTATION_LOCK_FILE),
+        )
+        .expect("nested generated sections");
     }
 
     #[test]
