@@ -11,6 +11,7 @@ use std::cell::Cell;
 
 use crate::config::{Config, validate_next_file_is_not_markdown};
 use crate::error::{ConfigError, ConfigSnafu, ReadFileSnafu, RenameFileSnafu, Result};
+use crate::section::SectionResolver;
 use snafu::ResultExt;
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -270,6 +271,7 @@ impl Repository {
     }
 
     pub(crate) fn validate_pattern_section_directory(&self, directory: &Path) -> Result<PathBuf> {
+        SectionResolver::from_config(&self.config)?.ensure_unambiguous_directory(directory)?;
         let lock_path = self
             .fixed_mutation_lock_path
             .clone()
@@ -1762,6 +1764,33 @@ mod tests {
             message.contains("resolved section-patterns[].directory"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn rejects_a_generated_directory_shared_by_multiple_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("sacho.toml"),
+            r#"
+            [[section-patterns]]
+            source = "packages/{name}"
+            id = "package/{name}"
+            directory = "generated/{name}"
+
+            [[section-patterns]]
+            source = "tools/{name}"
+            id = "tool/{name}"
+            directory = "generated/{name}"
+            "#,
+        )
+        .expect("config");
+        let repo = Repository::from_root(temp.path()).expect("repository");
+
+        let error = repo
+            .validate_pattern_section_directory(Path::new("generated/core"))
+            .expect_err("ambiguous generated directory");
+
+        assert!(error.to_string().contains("ambiguous"), "{error}");
     }
 
     #[test]

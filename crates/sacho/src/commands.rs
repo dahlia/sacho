@@ -1183,9 +1183,6 @@ pub fn add_fragment(repo: &Repository, options: AddOptions) -> Result<AddResult>
             .ok_or_else(|| Error::UnknownSection {
                 section: section_id.to_owned(),
             })?;
-        if section.pattern_index.is_some() {
-            resolver.ensure_unambiguous_directory(&section.directory)?;
-        }
         let patterned_directory = section.pattern_index.map(|_| section.directory.clone());
         (
             config.fragments.directory.join(&section.directory),
@@ -3273,7 +3270,6 @@ fn missing_fragment_requirements(
         } else {
             for section in matched_sections {
                 if section.pattern_index.is_some() && !section_paths.contains_key(&section.id) {
-                    resolver.ensure_unambiguous_directory(&section.directory)?;
                     repo.validate_pattern_section_directory(&section.directory)?;
                 }
                 section_paths
