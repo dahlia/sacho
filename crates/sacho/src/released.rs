@@ -6,12 +6,18 @@ use std::path::{Path, PathBuf};
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
 use comrak::{Arena, Options as ComrakOptions, format_commonmark, parse_document};
+use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::changelog::{ReleasedSection, UnreleasedRegionSpan};
+use crate::config::{ReferenceSigil, UrlTemplate};
 use crate::error::{Error, Result};
-use crate::fragment::{is_complete_reference_label, validate_resolved_link};
-use crate::markdown::format_markdown_with_word_wrap;
+use crate::fragment::{
+    ReferenceUse, comrak_options_with_configured_references, configured_link_marker_prefix,
+    configured_link_references_with_bracket_wrapped, parse_reference_label,
+    render_item_with_configured_markers, replace_configured_link_markers,
+};
+use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_word_wrap};
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolver, has_sections};
 
@@ -62,8 +68,8 @@ pub struct ChangelogSectionCandidate {
 }
 
 #[derive(Debug, Clone)]
-struct TargetSection<'a> {
-    body: &'a str,
+struct TargetSection {
+    body_start: usize,
     start: usize,
     end: usize,
 }
@@ -73,23 +79,38 @@ struct ParsedEntry {
     section: Option<String>,
     item_markdown: String,
     links: BTreeMap<String, String>,
+    markers: Vec<(String, String)>,
+    ordinary_references: Vec<OrdinaryReference>,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedItem {
+    markdown: String,
+    links: BTreeMap<String, String>,
+    markers: Vec<(String, String)>,
+    ordinary_references: Vec<OrdinaryReference>,
+}
+
+#[derive(Debug, Clone)]
+struct OrdinaryReference {
+    marker: String,
+    text: String,
+    url: String,
+    title: String,
+    image: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct FragmentContents {
     items: Vec<String>,
     links: BTreeMap<String, String>,
+    markers: Vec<(String, String)>,
+    ordinary_references: Vec<OrdinaryReference>,
 }
 
 #[derive(Serialize)]
 struct FragmentFrontmatter<'a> {
     links: &'a BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReferenceDefinition {
-    label: String,
-    url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -189,7 +210,7 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
             version: version.to_owned(),
         }
     })?;
-    let entries = parse_entries(repo, target.body)?;
+    let entries = parse_entries(repo, changelog, target.body_start..target.end)?;
     let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
         merge_fragment_entry(&mut grouped, entry)?;
@@ -234,16 +255,29 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
 /// This conservative shape prevents an import from silently dropping hand
 /// edits that fragments cannot represent.
 pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<ImportedUnreleased> {
+    import_unreleased_document_region(repo, region, 0..region.len())
+}
+
+pub(crate) fn import_unreleased_document_region(
+    repo: &Repository,
+    document: &str,
+    region: Range<usize>,
+) -> Result<ImportedUnreleased> {
     let arena = Arena::new();
-    let root = parse_document(&arena, region, &comrak_options());
-    let line_starts = line_starts(region);
-    let references = configured_reference_definitions(repo, region);
+    let options = comrak_options_with_configured_references(&BTreeMap::new(), &repo.config().links);
+    let root = parse_document(&arena, document, &options);
+    let configured_links = released_configured_links(repo, document, root);
+    let marker_prefix = configured_link_marker_prefix(document);
+    let line_starts = line_starts(document);
     let mut version = None;
     let mut saw_heading = false;
     let mut current_section = None;
     let mut entries = Vec::new();
 
-    for child in root.children() {
+    for child in root.children().filter(|child| {
+        sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
+            .is_some_and(|start| region.contains(&start))
+    }) {
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level <= 2 && !saw_heading => {
@@ -289,14 +323,18 @@ pub fn import_unreleased_region(repo: &Repository, region: &str) -> Result<Impor
                     return Err(Error::ReleasedEntryWithoutSection);
                 }
                 for item in child.children() {
-                    let source = slice_item_sourcepos(region, &line_starts, item.data().sourcepos)
-                        .unwrap_or_default();
-                    let (item_markdown, links) =
-                        fold_item_references(source, item, &line_starts, &references)?;
+                    let folded = fold_item_references(
+                        item,
+                        &configured_links,
+                        &marker_prefix,
+                        &repo.config().links,
+                    )?;
                     entries.push(ParsedEntry {
                         section: current_section.clone(),
-                        item_markdown,
-                        links,
+                        item_markdown: folded.markdown,
+                        links: folded.links,
+                        markers: folded.markers,
+                        ordinary_references: folded.ordinary_references,
                     });
                 }
             }
@@ -435,7 +473,7 @@ pub(crate) fn render_released_section(
 
 fn render_target_section(
     source: &str,
-    target: &TargetSection<'_>,
+    target: &TargetSection,
     skip_heading: bool,
     word_wrap: bool,
 ) -> Result<String> {
@@ -568,6 +606,10 @@ fn merge_fragment_entry(
     }
     contents.items.push(entry.item_markdown);
     contents.links.extend(entry.links);
+    contents.markers.extend(entry.markers);
+    contents
+        .ordinary_references
+        .extend(entry.ordinary_references);
     Ok(())
 }
 
@@ -585,18 +627,54 @@ fn fragment_markdown(path: &Path, contents: FragmentContents) -> Result<String> 
         markdown.push_str(serialized.trim_start_matches("---\n").trim_end());
         markdown.push_str("\n---\n");
     }
+    let mut body = String::new();
     for item in contents.items {
-        markdown.push_str(item.trim_end());
-        markdown.push('\n');
+        body.push_str(item.trim_end());
+        body.push('\n');
     }
+    for reference in &contents.ordinary_references {
+        let image_marker = if reference.image { "!" } else { "" };
+        body = body.replace(
+            &reference.marker,
+            &format!("{image_marker}[{}][{}]", reference.text, reference.marker),
+        );
+    }
+    if !contents.ordinary_references.is_empty() {
+        body.push('\n');
+        for reference in &contents.ordinary_references {
+            append_ordinary_reference_definition(&mut body, reference);
+        }
+    }
+    let formatted = format_markdown_with_word_wrap(&body, true)?;
+    markdown.push_str(&replace_configured_link_markers(
+        formatted,
+        &contents.markers,
+    ));
+    markdown.push('\n');
     Ok(markdown)
 }
 
-fn find_target_section<'a>(
-    source: &'a str,
+fn append_ordinary_reference_definition(markdown: &mut String, reference: &OrdinaryReference) {
+    markdown.push('[');
+    markdown.push_str(&reference.marker);
+    markdown.push_str("]: <");
+    markdown.push_str(&escape_angle_bracket_destination(&reference.url));
+    markdown.push('>');
+    if !reference.title.is_empty() {
+        markdown.push_str(" \"");
+        for character in reference.title.chars() {
+            markdown.push_str(&format!("&#{};", u32::from(character)));
+        }
+        markdown.push('"');
+    }
+    markdown.push('\n');
+}
+
+fn find_target_section(
+    source: &str,
     version: &str,
     unreleased_region: Option<UnreleasedRegionSpan>,
-) -> Option<TargetSection<'a>> {
+) -> Option<TargetSection> {
     let lines = source_lines(source);
     let candidates = version_heading_candidates(&lines);
     let target = format!("Version {version}");
@@ -614,7 +692,7 @@ fn find_target_section<'a>(
             .map(|next| next.start)
             .unwrap_or(source.len());
         return Some(TargetSection {
-            body: &source[candidate.body_start..end],
+            body_start: candidate.body_start,
             start: candidate.start,
             end,
         });
@@ -622,15 +700,24 @@ fn find_target_section<'a>(
     None
 }
 
-fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
+fn parse_entries(
+    repo: &Repository,
+    document: &str,
+    body: Range<usize>,
+) -> Result<Vec<ParsedEntry>> {
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &comrak_options());
-    let line_starts = line_starts(body);
+    let options = comrak_options_with_configured_references(&BTreeMap::new(), &repo.config().links);
+    let root = parse_document(&arena, document, &options);
+    let configured_links = released_configured_links(repo, document, root);
+    let marker_prefix = configured_link_marker_prefix(document);
+    let line_starts = line_starts(document);
     let mut entries = Vec::new();
     let mut current_section = None;
-    let references = configured_reference_definitions(repo, body);
 
-    for child in root.children() {
+    for child in root.children().filter(|child| {
+        sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
+            .is_some_and(|start| body.contains(&start))
+    }) {
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
@@ -643,14 +730,18 @@ fn parse_entries(repo: &Repository, body: &str) -> Result<Vec<ParsedEntry>> {
                     return Err(Error::ReleasedEntryWithoutSection);
                 }
                 for item in child.children() {
-                    let source = slice_item_sourcepos(body, &line_starts, item.data().sourcepos)
-                        .unwrap_or_default();
-                    let (item_markdown, links) =
-                        fold_item_references(source, item, &line_starts, &references)?;
+                    let folded = fold_item_references(
+                        item,
+                        &configured_links,
+                        &marker_prefix,
+                        &repo.config().links,
+                    )?;
                     entries.push(ParsedEntry {
                         section: current_section.clone(),
-                        item_markdown,
-                        links,
+                        item_markdown: folded.markdown,
+                        links: folded.links,
+                        markers: folded.markers,
+                        ordinary_references: folded.ordinary_references,
                     });
                 }
             }
@@ -710,130 +801,148 @@ fn grouped_sections(
 }
 
 fn fold_item_references<'a>(
-    source: &str,
     item: &'a AstNode<'a>,
-    line_starts: &[usize],
-    references: &[ReferenceDefinition],
-) -> Result<(String, BTreeMap<String, String>)> {
-    let item_start_offset = item_source_start_offset(line_starts, item.data().sourcepos)
-        .unwrap_or_else(|| {
-            sourcepos_start_offset(line_starts, item.data().sourcepos.start).unwrap_or(0)
-        });
-    let mut replacements = Vec::<(usize, usize, String)>::new();
-    let mut labels = BTreeSet::<String>::new();
+    configured_references: &BTreeMap<Sourcepos, ReferenceUse>,
+    marker_prefix: &str,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> Result<FoldedItem> {
     let mut links = BTreeMap::<String, String>::new();
-    collect_link_replacements(
+    collect_configured_links(item, configured_references, &mut links)?;
+    let options = comrak_options();
+    let ordinary_nodes = ordinary_configured_looking_links(
         item,
-        references,
-        line_starts,
-        item_start_offset,
-        &mut replacements,
-        &mut labels,
-        &mut links,
-    )?;
-
-    replacements.sort_by_key(|(start, _, _)| *start);
-    let mut output = source.to_owned();
-    for (start, end, replacement) in replacements.into_iter().rev() {
-        output.replace_range(start..end, &replacement);
-    }
-
-    for label in labels {
-        if !output.contains(&format!("[{label}]")) {
-            append_reference_label(&mut output, &label);
+        &options,
+        configured_references,
+        marker_prefix,
+        link_templates,
+    );
+    let removed_children = ordinary_nodes
+        .iter()
+        .map(|(node, reference, _)| {
+            let children = node.children().collect::<Vec<_>>();
+            for child in &children {
+                child.detach();
+            }
+            node.data_mut().value = NodeValue::Text(reference.marker.clone().into());
+            children
+        })
+        .collect::<Vec<_>>();
+    let (mut markdown, markers) =
+        render_item_with_configured_markers(item, &options, configured_references, marker_prefix);
+    for ((node, _, value), children) in ordinary_nodes.iter().zip(removed_children) {
+        node.data_mut().value = value.clone();
+        for child in children {
+            node.append(child);
         }
     }
-    Ok((output.trim_end().to_owned(), links))
+    let end = markdown.trim_end().len();
+    markdown.truncate(end);
+    Ok(FoldedItem {
+        markdown,
+        links,
+        markers,
+        ordinary_references: ordinary_nodes
+            .into_iter()
+            .map(|(_, reference, _)| reference)
+            .collect(),
+    })
 }
 
-fn collect_link_replacements<'a>(
+fn ordinary_configured_looking_links<'a>(
+    item: &'a AstNode<'a>,
+    options: &ComrakOptions<'_>,
+    configured_references: &BTreeMap<Sourcepos, ReferenceUse>,
+    marker_prefix: &str,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> Vec<(&'a AstNode<'a>, OrdinaryReference, NodeValue)> {
+    item.descendants()
+        .filter_map(|node| {
+            let data = node.data();
+            let (link, image) = match &data.value {
+                NodeValue::Link(link) => (link, false),
+                NodeValue::Image(link) => (link, true),
+                _ => return None,
+            };
+            let position = data.sourcepos;
+            if configured_references.contains_key(&position)
+                || node
+                    .descendants()
+                    .skip(1)
+                    .any(|child| configured_references.contains_key(&child.data().sourcepos))
+                || node
+                    .ancestors()
+                    .skip(1)
+                    .any(|ancestor| configured_references.contains_key(&ancestor.data().sourcepos))
+            {
+                return None;
+            }
+            let text = plain_text(node);
+            let reference = parse_reference_label(text.trim(), link_templates)
+                .ok()
+                .flatten()?;
+            if reference.label != text.trim() {
+                return None;
+            }
+            let mut rendered_text = String::new();
+            for child in node.children() {
+                format_commonmark(child, options, &mut rendered_text)
+                    .expect("writing CommonMark to a String cannot fail");
+            }
+            Some((
+                node,
+                OrdinaryReference {
+                    marker: format!(
+                        "{marker_prefix}ordinaryx{}x{}x{}x{}",
+                        position.start.line,
+                        position.start.column,
+                        position.end.line,
+                        position.end.column,
+                    ),
+                    text: rendered_text.trim_end().to_owned(),
+                    url: link.url.clone(),
+                    title: link.title.clone(),
+                    image,
+                },
+                data.value.clone(),
+            ))
+        })
+        .collect()
+}
+
+fn collect_configured_links<'a>(
     node: &'a AstNode<'a>,
-    references: &[ReferenceDefinition],
-    line_starts: &[usize],
-    item_start_offset: usize,
-    replacements: &mut Vec<(usize, usize, String)>,
-    labels: &mut BTreeSet<String>,
+    configured_references: &BTreeMap<Sourcepos, ReferenceUse>,
     links: &mut BTreeMap<String, String>,
 ) -> Result<()> {
-    if let NodeValue::Link(link) = &node.data().value
-        && let Some(reference) = references
-            .iter()
-            .find(|reference| reference.url == link.url)
+    if let NodeValue::Link(link) | NodeValue::Image(link) = &node.data().value
+        && let Some(reference) = configured_references.get(&node.data().sourcepos)
     {
-        let label_text = plain_text(node).trim().to_owned();
-        labels.insert(reference.label.clone());
-        if validate_resolved_link(&reference.label, &reference.url).is_ok() {
-            if let Some(existing) = links.get(&reference.label)
-                && existing != &reference.url
+        let label = reference.label.as_str();
+        if crate::fragment::validate_resolved_link(label, &link.url).is_ok() {
+            if let Some(existing) = links.get(label)
+                && existing != &link.url
             {
                 return Err(Error::ConflictingResolvedLinks {
-                    label: reference.label.clone(),
+                    label: label.to_owned(),
                     first: existing.clone(),
-                    second: reference.url.clone(),
+                    second: link.url.clone(),
                 });
             }
-            links.insert(reference.label.clone(), reference.url.clone());
-        }
-        if label_text == reference.label
-            && let Some((start, end)) = sourcepos_offsets(line_starts, node.data().sourcepos)
-        {
-            replacements.push((
-                start.saturating_sub(item_start_offset),
-                end.saturating_sub(item_start_offset),
-                format!("[{}]", reference.label),
-            ));
+            links.insert(label.to_owned(), link.url.clone());
         }
     }
     for child in node.children() {
-        collect_link_replacements(
-            child,
-            references,
-            line_starts,
-            item_start_offset,
-            replacements,
-            labels,
-            links,
-        )?;
+        collect_configured_links(child, configured_references, links)?;
     }
     Ok(())
 }
 
-fn append_reference_label(markdown: &mut String, label: &str) {
-    let trimmed = markdown.trim_end();
-    markdown.truncate(trimmed.len());
-    markdown.push_str("  [[");
-    markdown.push_str(label);
-    markdown.push_str("]]");
-}
-
-fn reference_definitions(source: &str) -> Vec<ReferenceDefinition> {
-    let mut definitions = Vec::new();
-    for line in source.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix('[') else {
-            continue;
-        };
-        let Some((label, url)) = rest.split_once("]:") else {
-            continue;
-        };
-        let url = url.trim();
-        if label.is_empty() || url.is_empty() {
-            continue;
-        }
-        definitions.push(ReferenceDefinition {
-            label: label.to_owned(),
-            url: url.to_owned(),
-        });
-    }
-    definitions.sort_by(|left, right| left.label.cmp(&right.label));
-    definitions
-}
-
-fn configured_reference_definitions(repo: &Repository, source: &str) -> Vec<ReferenceDefinition> {
-    reference_definitions(source)
-        .into_iter()
-        .filter(|reference| is_complete_reference_label(&reference.label, &repo.config().links))
-        .collect()
+fn released_configured_links<'a>(
+    repo: &Repository,
+    source: &str,
+    root: &'a AstNode<'a>,
+) -> BTreeMap<Sourcepos, ReferenceUse> {
+    configured_link_references_with_bracket_wrapped(source, root, &repo.config().links)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1102,29 +1211,6 @@ fn line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
-fn slice_item_sourcepos<'a>(
-    source: &'a str,
-    line_starts: &[usize],
-    sourcepos: Sourcepos,
-) -> Option<&'a str> {
-    let start = item_source_start_offset(line_starts, sourcepos)?;
-    let (_, end) = sourcepos_offsets(line_starts, sourcepos)?;
-    source.get(start..end)
-}
-
-fn item_source_start_offset(line_starts: &[usize], sourcepos: Sourcepos) -> Option<usize> {
-    let start_line = sourcepos.start.line.checked_sub(1)?;
-    line_starts.get(start_line).copied()
-}
-
-fn sourcepos_offsets(line_starts: &[usize], sourcepos: Sourcepos) -> Option<(usize, usize)> {
-    let start = sourcepos_start_offset(line_starts, sourcepos.start)?;
-    let end_line = sourcepos.end.line.checked_sub(1)?;
-    let end_line_start = *line_starts.get(end_line)?;
-    let end = end_line_start + sourcepos.end.column;
-    Some((start, end))
-}
-
 fn sourcepos_start_offset(
     line_starts: &[usize],
     position: comrak::nodes::LineColumn,
@@ -1180,6 +1266,40 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    fn rendered_links(markdown: &str) -> Vec<(String, String, String)> {
+        fn collect<'a>(node: &'a AstNode<'a>, links: &mut Vec<(String, String, String)>) {
+            if let NodeValue::Link(link) = &node.data().value {
+                links.push((plain_text(node), link.url.clone(), link.title.clone()));
+            }
+            for child in node.children() {
+                collect(child, links);
+            }
+        }
+
+        let arena = Arena::new();
+        let root = parse_document(&arena, markdown, &comrak_options());
+        let mut links = Vec::new();
+        collect(root, &mut links);
+        links
+    }
+
+    fn rendered_images(markdown: &str) -> Vec<(String, String, String)> {
+        fn collect<'a>(node: &'a AstNode<'a>, images: &mut Vec<(String, String, String)>) {
+            if let NodeValue::Image(image) = &node.data().value {
+                images.push((plain_text(node), image.url.clone(), image.title.clone()));
+            }
+            for child in node.children() {
+                collect(child, images);
+            }
+        }
+
+        let arena = Arena::new();
+        let root = parse_document(&arena, markdown, &comrak_options());
+        let mut images = Vec::new();
+        collect(root, &mut images);
+        images
     }
 
     #[test]
@@ -1372,7 +1492,9 @@ Released on July 7, 2026.
         assert!(
             carried.fragments[0]
                 .markdown
-                .contains(" -  Fixed carry.  [[#8]]\n")
+                .contains(" -  Fixed carry.  [[#8]]\n"),
+            "{}",
+            carried.fragments[0].markdown
         );
     }
 
@@ -1832,7 +1954,9 @@ Released on July 7, 2026.
         assert!(
             carried.fragments[0]
                 .markdown
-                .contains(" -  Fixed carry.  [[#8]]\n")
+                .contains(" -  Fixed carry.  [[#8]]\n"),
+            "{}",
+            carried.fragments[0].markdown
         );
     }
 
@@ -1916,7 +2040,7 @@ To be released.
     }
 
     #[test]
-    fn rejects_conflicting_reference_definitions_during_decompilation() {
+    fn preserves_configured_shortcuts_without_definitions_during_decompilation() {
         let (_temp, repo) = repo_with_config(
             r##"
             [changelog]
@@ -1932,11 +2056,7 @@ Version 1.1.5
 
 Released today.
 
- -  Fixed the first path.  [[#8](https://example.com/pull/8)]
- -  Fixed the second path.  [[#8](https://example.net/pull/8)]
-
-[#8]: https://example.com/pull/8
-[#8]: https://example.net/pull/8
+ -  Fixed carry.  [[#8]]
 ";
         let region = "\
 Unreleased
@@ -1944,11 +2064,7 @@ Unreleased
 
 To be released.
 
- -  Fixed the first path.  [[#8](https://example.com/pull/8)]
- -  Fixed the second path.  [[#8](https://example.net/pull/8)]
-
-[#8]: https://example.com/pull/8
-[#8]: https://example.net/pull/8
+ -  Fixed import.  [[#8]]
 ";
 
         for result in [
@@ -1958,19 +2074,989 @@ To be released.
                 fragments: imported.fragments,
             }),
         ] {
-            let error = result.expect_err("conflicting definitions");
-            assert!(matches!(
-                error,
-                Error::ConflictingResolvedLinks { ref label, ref first, ref second }
-                    if label == "#8"
-                        && first == "https://example.com/pull/8"
-                        && second == "https://example.net/pull/8"
-            ));
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+
+            assert_eq!(
+                fragment.links,
+                BTreeMap::from([(
+                    String::from("#8"),
+                    String::from("https://example.com/issues/8"),
+                )]),
+                "{}",
+                output.markdown
+            );
+            assert_eq!(
+                fragment.items[0].references,
+                vec![ReferenceUse {
+                    label: String::from("#8"),
+                    sigil: String::from("#"),
+                    number: 8,
+                }],
+                "{}",
+                output.markdown
+            );
         }
     }
 
     #[test]
-    fn rejects_conflicting_reference_definitions_within_one_entry() {
+    fn preserves_configured_full_references_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Fixed [the issue][#8].
+
+[#8]: https://example.com/pull/8
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Fixed [the issue][#8].
+
+[#8]: https://example.com/pull/8
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let carried = result.expect("decompiled release");
+            let source = &carried.fragments[0].markdown;
+            let fragment = crate::fragment::parse_fragment(
+                carried.fragments[0].path.clone(),
+                source,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+
+            assert_eq!(
+                fragment.links,
+                BTreeMap::from([(
+                    String::from("#8"),
+                    String::from("https://example.com/pull/8"),
+                )])
+            );
+            assert_eq!(fragment.items[0].references[0].label, "#8");
+            assert!(
+                fragment.items[0].markdown.contains("[the issue][#8]"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_configured_image_destinations_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Added ![screenshot][#1].
+
+[#1]: https://images.example/screenshot.png
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Added ![screenshot][#1].
+
+[#1]: https://images.example/screenshot.png
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+
+            assert_eq!(
+                fragment.links.get("#1").map(String::as_str),
+                Some("https://images.example/screenshot.png")
+            );
+            assert_eq!(fragment.items[0].references[0].label, "#1");
+            assert!(
+                fragment.items[0].markdown.contains("![screenshot][#1]"),
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_fold_an_ordinary_reference_that_shares_a_configured_destination() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [guide].
+
+[#1]: https://example.com/shared
+[guide]: https://example.com/shared
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [guide].
+
+[#1]: https://example.com/shared
+[guide]: https://example.com/shared
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let carried = result.expect("decompiled release");
+            let markdown = &carried.fragments[0].markdown;
+            let fragment = crate::fragment::parse_fragment(
+                carried.fragments[0].path.clone(),
+                markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+
+            assert!(!markdown.contains("[[#1]]"));
+            assert!(fragment.links.is_empty());
+            assert!(fragment.items[0].references.is_empty());
+            assert!(markdown.contains("[guide]: https://example.com/shared"));
+        }
+    }
+
+    #[test]
+    fn normalizes_carried_entries_with_one_reference_label_namespace() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [guide](https://example.com/first).
+ -  Read the [guide](https://example.com/second).
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [guide](https://example.com/first).
+ -  Read the [guide](https://example.com/second).
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let carried = result.expect("decompiled release");
+            assert_eq!(
+                rendered_links(&carried.fragments[0].markdown),
+                vec![
+                    (
+                        String::from("guide"),
+                        String::from("https://example.com/first"),
+                        String::new(),
+                    ),
+                    (
+                        String::from("guide"),
+                        String::from("https://example.com/second"),
+                        String::new(),
+                    ),
+                ],
+                "{}",
+                carried.fragments[0].markdown
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_pin_ordinary_links_with_configured_looking_text() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read [#1][first].
+ -  Read [#1][second].
+
+[first]: https://example.com/first
+[second]: https://example.com/second
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read [#1][first].
+ -  Read [#1][second].
+
+[first]: https://example.com/first
+[second]: https://example.com/second
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let carried = result.expect("decompiled release");
+            let fragment = &carried.fragments[0];
+            assert!(!fragment.markdown.starts_with("---\n"));
+            assert_eq!(
+                rendered_links(&fragment.markdown)
+                    .into_iter()
+                    .map(|(_, url, _)| url)
+                    .collect::<Vec<_>>(),
+                vec![
+                    String::from("https://example.com/first"),
+                    String::from("https://example.com/second"),
+                ],
+                "{}",
+                fragment.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_ordinary_configured_looking_links_through_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        for (link, definition, expected_url, expected_title) in [
+            (
+                "[#1][migration]",
+                "\n[migration]: https://docs.example/migration\n",
+                "https://docs.example/migration",
+                "",
+            ),
+            (
+                "[#1](https://docs.example/guide \"Guide title\")",
+                "",
+                "https://docs.example/guide",
+                "Guide title",
+            ),
+            (
+                "[[#1](https://docs.example/bracketed \"Bracketed guide\")]",
+                "",
+                "https://docs.example/bracketed",
+                "Bracketed guide",
+            ),
+            (
+                "[[#1](https://docs.example/defined \"Defined guide\")]",
+                "\n[#1]: https://docs.example/defined \"Defined guide\"\n",
+                "https://docs.example/defined",
+                "Defined guide",
+            ),
+        ] {
+            let changelog = format!(
+                "Version 1.1.5\n-------------\n\nReleased today.\n\n -  Read {link}.\n{definition}"
+            );
+            let region = format!(
+                "Unreleased\n----------\n\nTo be released.\n\n -  Read {link}.\n{definition}"
+            );
+
+            for result in [
+                carry_release(&repo, &changelog, "1.1.5"),
+                import_unreleased_region(&repo, &region).map(|imported| CarriedRelease {
+                    version: imported.version.unwrap_or_default(),
+                    fragments: imported.fragments,
+                }),
+            ] {
+                let decompiled = result.expect("decompiled release");
+                let output = &decompiled.fragments[0];
+                let fragment = crate::fragment::parse_fragment(
+                    output.path.clone(),
+                    &output.markdown,
+                    None,
+                    &repo.config().links,
+                )
+                .expect("decompiled fragment");
+                assert!(fragment.links.is_empty(), "{}", output.markdown);
+                assert!(
+                    fragment.items[0].references.is_empty(),
+                    "{}",
+                    output.markdown
+                );
+                let compiled = crate::compile::compile_parsed_fragments(
+                    &repo,
+                    crate::compile::CompileOptions::default(),
+                    crate::compile::VersionLabel::Unreleased,
+                    vec![fragment],
+                )
+                .expect("compiled fragment");
+
+                assert_eq!(
+                    rendered_links(&compiled.markdown),
+                    vec![(
+                        String::from("#1"),
+                        String::from(expected_url),
+                        String::from(expected_title),
+                    )],
+                    "{}",
+                    output.markdown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_bracketed_inline_links_alongside_configured_references() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Read [[#1](https://docs.example/inline)] and fixed [#1].
+
+[#1]: https://example.com/pull/1
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read [[#1](https://docs.example/inline)] and fixed [#1].
+
+[#1]: https://example.com/pull/1
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            assert_eq!(
+                fragment.links,
+                BTreeMap::from([(
+                    String::from("#1"),
+                    String::from("https://example.com/pull/1"),
+                )]),
+                "{}",
+                output.markdown
+            );
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown)
+                    .into_iter()
+                    .map(|(_, url, _)| url)
+                    .collect::<Vec<_>>(),
+                vec![
+                    String::from("https://docs.example/inline"),
+                    String::from("https://example.com/pull/1"),
+                ],
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_ordinary_images_nested_in_configured_links() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Added [![#2](https://images.example/pic.png \"Pic\")][#1].
+
+[#1]: https://example.com/pull/1
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Added [![#2](https://images.example/pic.png \"Pic\")][#1].
+
+[#1]: https://example.com/pull/1
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            assert!(
+                !output.markdown.contains("sachointernalconfiguredlink"),
+                "{}",
+                output.markdown
+            );
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown),
+                vec![(
+                    String::from("#2"),
+                    String::from("https://example.com/pull/1"),
+                    String::new(),
+                )],
+                "{}",
+                output.markdown
+            );
+            assert_eq!(
+                rendered_images(&compiled.markdown),
+                vec![(
+                    String::from("#2"),
+                    String::from("https://images.example/pic.png"),
+                    String::from("Pic"),
+                )],
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_configured_images_nested_in_configured_links() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Added [![screenshot][#1]][#2].
+
+[#1]: https://images.example/screenshot.png
+[#2]: https://docs.example/page
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Added [![screenshot][#1]][#2].
+
+[#1]: https://images.example/screenshot.png
+[#2]: https://docs.example/page
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            assert_eq!(
+                fragment.links,
+                BTreeMap::from([
+                    (
+                        String::from("#1"),
+                        String::from("https://images.example/screenshot.png"),
+                    ),
+                    (
+                        String::from("#2"),
+                        String::from("https://docs.example/page"),
+                    ),
+                ]),
+                "{}",
+                output.markdown
+            );
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown),
+                vec![(
+                    String::from("screenshot"),
+                    String::from("https://docs.example/page"),
+                    String::new(),
+                )],
+                "{}",
+                output.markdown
+            );
+            assert_eq!(
+                rendered_images(&compiled.markdown),
+                vec![(
+                    String::from("screenshot"),
+                    String::from("https://images.example/screenshot.png"),
+                    String::new(),
+                )],
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn marker_prefix_avoids_entity_decoded_text_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let prefix = "sachointernalconfiguredlink0";
+        let source_without_token = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Read [#1][migration].
+
+[migration]: https://docs.example/migration
+";
+        let arena = Arena::new();
+        let root = parse_document(&arena, source_without_token, &comrak_options());
+        let position = root
+            .descendants()
+            .find(|node| {
+                matches!(node.data().value, NodeValue::Link(_)) && plain_text(node) == "#1"
+            })
+            .expect("ordinary link")
+            .data()
+            .sourcepos;
+        let marker = format!(
+            "{prefix}ordinaryx{}x{}x{}x{}",
+            position.start.line, position.start.column, position.end.line, position.end.column,
+        );
+        let encoded_marker = marker.replacen('s', "&#115;", 1);
+        let changelog = source_without_token.replacen(
+            "[#1][migration].",
+            &format!("[#1][migration] and {encoded_marker}."),
+            1,
+        );
+        let region = changelog.replacen(
+            "Version 1.1.5\n-------------\n\nReleased today.",
+            "Unreleased\n----------\n\nTo be released.",
+            1,
+        );
+
+        for result in [
+            carry_release(&repo, &changelog, "1.1.5"),
+            import_unreleased_region(&repo, &region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            assert!(output.markdown.contains(&marker), "{}", output.markdown);
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            assert!(fragment.links.is_empty(), "{}", output.markdown);
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown),
+                vec![(
+                    String::from("#1"),
+                    String::from("https://docs.example/migration"),
+                    String::new(),
+                )],
+                "{}",
+                output.markdown
+            );
+            assert!(compiled.markdown.contains(&marker), "{}", compiled.markdown);
+        }
+    }
+
+    #[test]
+    fn preserves_control_characters_in_ordinary_destinations_through_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        for (entity, character) in [("&#9;", '\t'), ("&#10;", '\n'), ("&#13;", '\r')] {
+            let definition =
+                format!("[migration]: <https://docs.example/a{entity}b> \"Control character\"\n");
+            let changelog = format!(
+                "Version 1.1.5\n-------------\n\nReleased today.\n\n -  Read [#1][migration].\n\n{definition}"
+            );
+            let region = format!(
+                "Unreleased\n----------\n\nTo be released.\n\n -  Read [#1][migration].\n\n{definition}"
+            );
+            let expected_url = format!("https://docs.example/a{character}b");
+
+            for result in [
+                carry_release(&repo, &changelog, "1.1.5"),
+                import_unreleased_region(&repo, &region).map(|imported| CarriedRelease {
+                    version: imported.version.unwrap_or_default(),
+                    fragments: imported.fragments,
+                }),
+            ] {
+                let decompiled = result.expect("decompiled release");
+                let output = &decompiled.fragments[0];
+                let fragment = crate::fragment::parse_fragment(
+                    output.path.clone(),
+                    &output.markdown,
+                    None,
+                    &repo.config().links,
+                )
+                .expect("decompiled fragment");
+                let fragment_markdown = fragment.items[0].markdown.clone();
+                let compiled = crate::compile::compile_parsed_fragments(
+                    &repo,
+                    crate::compile::CompileOptions::default(),
+                    crate::compile::VersionLabel::Unreleased,
+                    vec![fragment],
+                )
+                .expect("compiled fragment");
+
+                assert_eq!(
+                    rendered_links(&compiled.markdown),
+                    vec![(
+                        String::from("#1"),
+                        expected_url.clone(),
+                        String::from("Control character"),
+                    )],
+                    "decompiled:\n{}\nfragment item:\n{}\ncompiled:\n{}",
+                    output.markdown,
+                    fragment_markdown,
+                    compiled.markdown,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_ordinary_configured_looking_images_through_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Added ![#1][screenshot].
+
+[screenshot]: https://images.example/ordinary.png \"Ordinary image\"
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Added ![#1][screenshot].
+
+[screenshot]: https://images.example/ordinary.png \"Ordinary image\"
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            assert!(fragment.links.is_empty(), "{}", output.markdown);
+            assert!(
+                fragment.items[0].references.is_empty(),
+                "{}",
+                output.markdown
+            );
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_images(&compiled.markdown),
+                vec![(
+                    String::from("#1"),
+                    String::from("https://images.example/ordinary.png"),
+                    String::from("Ordinary image"),
+                )],
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_distinct_bracketed_inline_destinations_across_entries() {
+        let (_temp, repo) = repo_with_config(
+            r##"
+            [changelog]
+            materialize = false
+
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released today.
+
+ -  Fixed the first path.  [[#8](https://example.com/pull/8)]
+ -  Fixed the second path.  [[#8](https://example.net/pull/8)]
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Fixed the first path.  [[#8](https://example.com/pull/8)]
+ -  Fixed the second path.  [[#8](https://example.net/pull/8)]
+
+[#8]: https://example.com/pull/8
+[#8]: https://example.net/pull/8
+";
+
+        for result in [
+            carry_release(&repo, changelog, "1.1.5"),
+            import_unreleased_region(&repo, region).map(|imported| CarriedRelease {
+                version: imported.version.unwrap_or_default(),
+                fragments: imported.fragments,
+            }),
+        ] {
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown)
+                    .into_iter()
+                    .map(|(_, url, _)| url)
+                    .collect::<Vec<_>>(),
+                vec![
+                    String::from("https://example.com/pull/8"),
+                    String::from("https://example.net/pull/8"),
+                ],
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_distinct_bracketed_inline_destinations_within_one_entry() {
         let (_temp, repo) = repo_with_config(
             r##"
             [changelog]
@@ -2010,14 +3096,35 @@ To be released.
                 fragments: imported.fragments,
             }),
         ] {
-            let error = result.expect_err("conflicting definitions");
-            assert!(matches!(
-                error,
-                Error::ConflictingResolvedLinks { ref label, ref first, ref second }
-                    if label == "#8"
-                        && first == "https://example.com/pull/8"
-                        && second == "https://example.net/pull/8"
-            ));
+            let decompiled = result.expect("decompiled release");
+            let output = &decompiled.fragments[0];
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compiled fragment");
+
+            assert_eq!(
+                rendered_links(&compiled.markdown)
+                    .into_iter()
+                    .map(|(_, url, _)| url)
+                    .collect::<Vec<_>>(),
+                vec![
+                    String::from("https://example.com/pull/8"),
+                    String::from("https://example.net/pull/8"),
+                ],
+                "{}",
+                output.markdown
+            );
         }
     }
 
@@ -2057,6 +3164,62 @@ To be released.
                 )
                 .expect("decompiled fragment");
                 prop_assert_eq!(fragment.links.get(&label), Some(&url));
+            }
+        }
+
+        #[test]
+        fn ordinary_reference_styles_survive_decompile_and_compile(
+            label in "[a-z]{1,12}",
+            style in 0_u8..3,
+            multiline in any::<bool>(),
+        ) {
+            let (_temp, repo) = repo_with_config(
+                r#"
+                [changelog]
+                materialize = false
+                "#,
+            );
+            let reference = match style {
+                0 => format!("[migration guide][{label}]"),
+                1 => format!("[{label}][]"),
+                _ => format!("[{label}]"),
+            };
+            let url = format!("https://example.com/{label}");
+            let definition = if multiline {
+                format!("[{label}]:\n  <{url}>\n  \"Reference title\"")
+            } else {
+                format!("[{label}]: {url}")
+            };
+            let changelog = format!(
+                "Version 1.1.5\n-------------\n\nReleased today.\n\n -  Read {reference}.\n\n{definition}\n"
+            );
+            let region = format!(
+                "Unreleased\n----------\n\nTo be released.\n\n -  Read {reference}.\n\n{definition}\n"
+            );
+
+            let carried = carry_release(&repo, &changelog, "1.1.5").expect("carry");
+            let imported = import_unreleased_region(&repo, &region).expect("import");
+
+            for output in [&carried.fragments[0], &imported.fragments[0]] {
+                prop_assert!(output.markdown.contains(&url));
+                let fragment = crate::fragment::parse_fragment(
+                    output.path.clone(),
+                    &output.markdown,
+                    None,
+                    &repo.config().links,
+                )
+                .expect("decompiled fragment");
+                let compiled = crate::compile::compile_parsed_fragments(
+                    &repo,
+                    crate::compile::CompileOptions::default(),
+                    crate::compile::VersionLabel::Unreleased,
+                    vec![fragment],
+                )
+                .expect("compiled fragment");
+                prop_assert!(compiled.markdown.contains(&url));
+                if multiline {
+                    prop_assert!(compiled.markdown.contains("Reference title"));
+                }
             }
         }
 
@@ -2110,7 +3273,7 @@ To be released.
     }
 
     #[test]
-    fn appends_reference_label_when_link_text_does_not_identify_reference() {
+    fn does_not_infer_a_configured_label_from_an_ordinary_link_destination() {
         let (_temp, repo) = repo_with_config(
             r##"
             [changelog]
@@ -2136,8 +3299,9 @@ Released on July 7, 2026.
         assert!(
             carried.fragments[0]
                 .markdown
-                .contains(" -  Fixed carry.  [issue](https://example.com/issues/8)  [[#8]]\n")
+                .contains("https://example.com/issues/8")
         );
+        assert!(!carried.fragments[0].markdown.contains("[[#8]]"));
     }
 
     #[test]
@@ -2186,13 +3350,343 @@ To be released.
             assert!(fragment.links.is_empty());
             assert_eq!(
                 fragment.items[0].markdown,
-                "-  Read the [documentation](https://example.com/docs)."
+                "- Read the [documentation](https://example.com/docs)."
             );
         }
     }
 
     #[test]
-    fn appends_unpinned_relative_reference_when_link_text_does_not_identify_it() {
+    fn preserves_ordinary_reference_style_links_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [migration guide][guide].
+
+[guide]: https://example.com/migration
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [migration guide][guide].
+
+[guide]: https://example.com/migration
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for output in [&carried.fragments[0], &imported.fragments[0]] {
+            assert_eq!(
+                output.markdown,
+                " -  Read the [migration guide].\n\n[migration guide]: https://example.com/migration\n"
+            );
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compile decompiled fragment");
+
+            assert!(
+                compiled
+                    .markdown
+                    .contains(" -  Read the [migration guide].")
+            );
+            assert!(
+                compiled
+                    .markdown
+                    .contains("[migration guide]: https://example.com/migration")
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_multiline_reference_definitions_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [migration guide][guide].
+
+[guide]:
+  <https://example.com/migration>
+  \"Migration guide\"
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [migration guide][guide].
+
+[guide]:
+  <https://example.com/migration>
+  \"Migration guide\"
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for output in [&carried.fragments[0], &imported.fragments[0]] {
+            assert!(
+                output.markdown.contains(
+                    "[migration guide]: https://example.com/migration \"Migration guide\""
+                ),
+                "{}",
+                output.markdown
+            );
+        }
+    }
+
+    #[test]
+    fn carry_preserves_definition_from_another_release() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 2.0.0
+-------------
+
+Released on July 8, 2026.
+
+ -  Read the [migration guide][guide].
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+[guide]: https://example.com/migration
+";
+
+        let carried = carry_release(&repo, changelog, "2.0.0").expect("carry");
+
+        assert!(
+            carried.fragments[0]
+                .markdown
+                .contains("[migration guide]: https://example.com/migration"),
+            "{}",
+            carried.fragments[0].markdown
+        );
+    }
+
+    #[test]
+    fn preserves_document_first_definition_over_nested_duplicate() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+[guide]: https://example.com/first
+
+ -  Read the [migration guide][guide].
+
+    [guide]: https://example.com/second
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+[guide]: https://example.com/first
+
+ -  Read the [migration guide][guide].
+
+    [guide]: https://example.com/second
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for output in [&carried.fragments[0], &imported.fragments[0]] {
+            assert!(
+                output
+                    .markdown
+                    .contains("[migration guide]: https://example.com/first"),
+                "{}",
+                output.markdown
+            );
+            assert!(!output.markdown.contains("https://example.com/second"));
+
+            let fragment = crate::fragment::parse_fragment(
+                output.path.clone(),
+                &output.markdown,
+                None,
+                &repo.config().links,
+            )
+            .expect("decompiled fragment");
+            let compiled = crate::compile::compile_parsed_fragments(
+                &repo,
+                crate::compile::CompileOptions::default(),
+                crate::compile::VersionLabel::Unreleased,
+                vec![fragment],
+            )
+            .expect("compile decompiled fragment");
+
+            assert!(
+                compiled
+                    .markdown
+                    .contains("[migration guide]: https://example.com/first")
+            );
+            assert!(!compiled.markdown.contains("https://example.com/second"));
+        }
+    }
+
+    #[test]
+    fn preserves_commonmark_first_reference_definition_during_decompilation() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+ -  Read the [migration guide][FOO].
+
+[foo]: https://example.com/first
+[FOO]: https://example.com/second
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [migration guide][FOO].
+
+[foo]: https://example.com/first
+[FOO]: https://example.com/second
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for output in [&carried.fragments[0], &imported.fragments[0]] {
+            assert!(
+                output
+                    .markdown
+                    .contains("[migration guide]: https://example.com/first")
+            );
+            assert!(!output.markdown.contains("https://example.com/second"));
+        }
+    }
+
+    #[test]
+    fn preserves_reference_definition_only_in_the_section_that_uses_it() {
+        let (_temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        let changelog = "\
+Version 1.1.5
+-------------
+
+Released on July 7, 2026.
+
+### core
+
+ -  Read the [migration guide][guide].
+
+### cli
+
+ -  Added a command.
+
+[guide]: https://example.com/migration
+";
+        let region = "\
+Unreleased
+----------
+
+To be released.
+
+### core
+
+ -  Read the [migration guide][guide].
+
+### cli
+
+ -  Added a command.
+
+[guide]: https://example.com/migration
+";
+
+        let carried = carry_release(&repo, changelog, "1.1.5").expect("carry");
+        let imported = import_unreleased_region(&repo, region).expect("import");
+
+        for fragments in [&carried.fragments, &imported.fragments] {
+            let core = fragments
+                .iter()
+                .find(|fragment| fragment.path.starts_with("changes.d/core"))
+                .expect("core fragment");
+            let cli = fragments
+                .iter()
+                .find(|fragment| fragment.path.starts_with("changes.d/cli"))
+                .expect("cli fragment");
+            assert!(
+                core.markdown
+                    .contains("[migration guide]: https://example.com/migration")
+            );
+            assert!(!cli.markdown.contains("[migration guide]:"));
+        }
+    }
+
+    #[test]
+    fn does_not_infer_an_unpinned_label_from_a_relative_link_destination() {
         let (_temp, repo) = repo_with_config(
             r##"
             [changelog]
@@ -2223,30 +3717,11 @@ Released on July 7, 2026.
         .expect("carried fragment");
 
         assert!(fragment.links.is_empty());
-        assert_eq!(fragment.items[0].references[0].label, "#8");
+        assert!(fragment.items[0].references.is_empty());
         assert!(
             carried.fragments[0]
                 .markdown
-                .contains(" -  Fixed carry.  [issue](/issues/8)  [[#8]]\n")
-        );
-    }
-
-    #[test]
-    fn ignores_empty_reference_definitions() {
-        let definitions = reference_definitions(
-            "\
-[]: https://example.com/issues/8
-[#8]:
-[#9]: https://example.com/issues/9
-",
-        );
-
-        assert_eq!(
-            definitions,
-            vec![ReferenceDefinition {
-                label: String::from("#9"),
-                url: String::from("https://example.com/issues/9"),
-            }]
+                .contains(" -  Fixed carry.  [issue](/issues/8)\n")
         );
     }
 

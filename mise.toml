@@ -4,7 +4,7 @@ min_version = "2026.6.15"
 experimental = true
 
 [tools]
-"aqua:dahlia/hongdown" = "0.5.1"
+"aqua:dahlia/hongdown" = "0.5.3"
 "aqua:koalaman/shellcheck" = "0.11.0"
 "aqua:nushell/nushell" = "0.114.0"
 "aqua:rhysd/actionlint" = "1.7.12"

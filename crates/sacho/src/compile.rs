@@ -3,13 +3,15 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use comrak::nodes::NodeValue;
+use comrak::{Arena, Options as ComrakOptions, parse_document};
 use indexmap::IndexMap;
 use snafu::ResultExt;
 
 use crate::config::{ReferenceSigil, UrlTemplate};
 use crate::error::{ReadFileSnafu, Result};
 use crate::fragment::{Fragment, ReferenceUse, discover_fragments};
-use crate::markdown::format_markdown_with_word_wrap;
+use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_word_wrap};
 use crate::repo::Repository;
 use crate::section::{SectionResolver, has_sections};
 
@@ -445,30 +447,64 @@ fn format_region(
     header.push_str(unreleased_heading);
     header.push('\n');
 
-    let mut markdown = format_markdown_with_word_wrap(&header, word_wrap)?;
+    let mut markdown = header;
     for section in sections {
         markdown.push('\n');
-        let section_markdown =
-            format_markdown_with_word_wrap(section.markdown.trim_end(), word_wrap)?;
-        markdown.push_str(section_markdown.trim_end());
+        markdown.push_str(section.markdown.trim_end());
         markdown.push('\n');
-        if !section.references.is_empty() {
-            markdown.push('\n');
-            append_reference_definitions(&mut markdown, &section.references);
+    }
+    let mut emitted_references = BTreeSet::new();
+    for section in sections {
+        for reference in &section.references {
+            if emitted_references.insert(reference.label.as_str()) {
+                markdown.push('\n');
+                append_reference_definitions(&mut markdown, std::slice::from_ref(reference));
+            }
         }
     }
 
-    Ok(markdown)
+    let formatted = format_markdown_with_word_wrap(&markdown, word_wrap)?;
+    Ok(trim_empty_list_item_trailing_spaces(&formatted))
 }
 
 fn append_reference_definitions(markdown: &mut String, references: &[CompiledReference]) {
     for reference in references {
-        markdown.push('[');
-        markdown.push_str(&reference.label);
-        markdown.push_str("]: ");
-        markdown.push_str(&reference.url);
-        markdown.push('\n');
+        append_reference_definition(markdown, &reference.label, &reference.url);
     }
+}
+
+fn append_reference_definition(markdown: &mut String, label: &str, url: &str) {
+    markdown.push('[');
+    markdown.push_str(label);
+    markdown.push_str("]: <");
+    markdown.push_str(&escape_angle_bracket_destination(url));
+    markdown.push('>');
+    markdown.push('\n');
+}
+
+fn trim_empty_list_item_trailing_spaces(markdown: &str) -> String {
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &ComrakOptions::default());
+    let empty_item_lines = root
+        .descendants()
+        .filter(|node| {
+            matches!(node.data().value, NodeValue::Item(_)) && node.first_child().is_none()
+        })
+        .map(|node| node.data().sourcepos.start.line)
+        .collect::<BTreeSet<_>>();
+    let mut output = String::with_capacity(markdown.len());
+    for (index, line) in markdown.split_inclusive('\n').enumerate() {
+        let (content, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |content| (content, "\n"));
+        if empty_item_lines.contains(&(index + 1)) && content.trim() == "-" {
+            output.push_str(content.trim_end());
+        } else {
+            output.push_str(content);
+        }
+        output.push_str(newline);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -476,6 +512,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use comrak::nodes::{AstNode, NodeValue};
+    use comrak::{Arena, Options as ComrakOptions, parse_document};
     use proptest::prelude::*;
     use tempfile::TempDir;
 
@@ -493,6 +531,53 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    fn rendered_links(markdown: &str) -> Vec<(String, String, String)> {
+        fn collect<'a>(node: &'a AstNode<'a>, links: &mut Vec<(String, String, String)>) {
+            if let NodeValue::Link(link) = &node.data().value {
+                links.push((plain_text(node), link.url.clone(), link.title.clone()));
+            }
+            for child in node.children() {
+                collect(child, links);
+            }
+        }
+
+        fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
+            match &node.data().value {
+                NodeValue::Text(text) => text.to_string(),
+                _ => {
+                    let mut text = String::new();
+                    for child in node.children() {
+                        text.push_str(&plain_text(child));
+                    }
+                    text
+                }
+            }
+        }
+
+        let arena = Arena::new();
+        let root = parse_document(&arena, markdown, &ComrakOptions::default());
+        let mut links = Vec::new();
+        collect(root, &mut links);
+        links
+    }
+
+    fn rendered_code_blocks(markdown: &str) -> Vec<String> {
+        fn collect<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<String>) {
+            if let NodeValue::CodeBlock(block) = &node.data().value {
+                blocks.push(block.literal.clone());
+            }
+            for child in node.children() {
+                collect(child, blocks);
+            }
+        }
+
+        let arena = Arena::new();
+        let root = parse_document(&arena, markdown, &ComrakOptions::default());
+        let mut blocks = Vec::new();
+        collect(root, &mut blocks);
+        blocks
     }
 
     fn model_fragments() -> impl Strategy<Value = Vec<ModelFragment>> {
@@ -634,7 +719,11 @@ mod tests {
 
         assert_eq!(compiled.substantive_item_count, 0);
         assert_eq!(compiled.sections.len(), 1);
-        assert!(compiled.markdown.ends_with("\n\n -\n"));
+        assert!(
+            compiled.markdown.ends_with("\n\n -\n"),
+            "{}",
+            compiled.markdown
+        );
     }
 
     #[test]
@@ -735,7 +824,659 @@ mod tests {
     }
 
     #[test]
-    fn sorts_reference_definitions_by_link_config_order_then_number() {
+    fn normalizes_reference_style_links_in_compiled_markdown() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/reference-link.md"),
+            " -  Added the [migration guide][guide].\n\n[guide]: https://example.com/migration\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("changes.d/upgrade.md"),
+            " -  Improved upgrade diagnostics.\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            compiled.markdown,
+            "Unreleased\n----------\n\nTo be released.\n\n -  Added the [migration guide].\n -  Improved upgrade diagnostics.\n\n[migration guide]: https://example.com/migration\n"
+        );
+    }
+
+    #[test]
+    fn normalizes_escaped_reference_labels_from_the_resolved_ast() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/reference-link.md"),
+            " -  Read [the guide][f\\]oo].\n\n[f\\]oo]: /guide\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled.markdown.contains("[the guide]"),
+            "{}",
+            compiled.markdown
+        );
+        assert!(
+            compiled.markdown.contains("/guide"),
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn formats_ordinary_reference_definitions() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/reference-link.md"),
+            " -  Read the [guide].\n\n[guide]:   https://example.com/guide\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("[guide]: https://example.com/guide")
+        );
+        assert!(!compiled.markdown.contains("[guide]:   "));
+    }
+
+    #[test]
+    fn preserves_destinations_from_angle_bracket_reference_definitions() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/reference-links.md"),
+            " -  Read [space] and [empty].\n\n[space]: <https://example.com/a b> \"A title\"\n[empty]: <>\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("[space]: https://example.com/a%20b \"A title\""),
+            "{}",
+            compiled.markdown
+        );
+        assert!(
+            compiled.markdown.contains("[empty]()"),
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_distinct_targets_for_the_same_reference_label_across_fragments() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/one.md"),
+            " -  Read [guide][shared].\n\n[shared]: https://example.com/first\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("changes.d/two.md"),
+            " -  Read [guide][shared].\n\n[shared]: https://example.com/second\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(compiled.markdown.contains("https://example.com/first"));
+        assert!(compiled.markdown.contains("https://example.com/second"));
+    }
+
+    #[test]
+    fn configured_references_ignore_markdown_definition_overrides() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/fix.md"),
+            " -  Fixed [[#1]].\n\n[#1]: https://evil.example/override\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/issues/1")
+        );
+        assert!(!compiled.markdown.contains("evil.example"));
+    }
+
+    #[test]
+    fn preserves_ordinary_reference_links_with_configured_looking_text() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Read [#1][migration].\n\n[migration]: https://docs.example/migration \"Migration guide\"\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(compiled.markdown.contains("https://docs.example/migration"));
+        assert!(compiled.markdown.contains("Migration guide"));
+        assert!(!compiled.markdown.contains("https://example.com/issues/1"));
+    }
+
+    #[test]
+    fn coordinates_ordinary_reference_labels_across_compiled_sections() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "#,
+        );
+        for (section, url) in [
+            ("core", "https://example.com/core"),
+            ("cli", "https://example.com/cli"),
+        ] {
+            let directory = temp.path().join("changes.d").join(section);
+            fs::create_dir_all(&directory).expect("section dir");
+            fs::write(
+                directory.join("guide.md"),
+                format!(" -  Read the [guide]({url}).\n"),
+            )
+            .expect("fragment");
+        }
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let links = rendered_links(&compiled.markdown);
+
+        assert_eq!(
+            links,
+            vec![
+                (
+                    String::from("guide"),
+                    String::from("https://example.com/core"),
+                    String::new(),
+                ),
+                (
+                    String::from("guide"),
+                    String::from("https://example.com/cli"),
+                    String::new(),
+                ),
+            ],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn reserves_configured_labels_across_compiled_sections() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "##,
+        );
+        for (section, source) in [
+            (
+                "core",
+                " -  Read [#1][migration].\n\n[migration]: https://docs.example/migration\n",
+            ),
+            ("cli", " -  Fixed [[#1]].\n"),
+        ] {
+            let directory = temp.path().join("changes.d").join(section);
+            fs::create_dir_all(&directory).expect("section dir");
+            fs::write(directory.join("change.md"), source).expect("fragment");
+        }
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let links = rendered_links(&compiled.markdown);
+
+        assert_eq!(
+            links,
+            vec![
+                (
+                    String::from("#1"),
+                    String::from("https://docs.example/migration"),
+                    String::new(),
+                ),
+                (
+                    String::from("#1"),
+                    String::from("https://example.com/issues/1"),
+                    String::new(),
+                ),
+            ],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_titles_on_ordinary_links_that_resemble_configured_references() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Read [#1][migration].\n\n[migration]: https://example.com/issues/1 \"Migration guide\"\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("#1"),
+                String::from("https://example.com/issues/1"),
+                String::from("Migration guide"),
+            )],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_link_shaped_code_next_to_a_configured_reference() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Fixed [[#1]] and documented `[\\#1](https://example.com/issues/1)`.\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert!(
+            compiled
+                .markdown
+                .contains("`[\\#1](https://example.com/issues/1)`"),
+            "{}",
+            compiled.markdown
+        );
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/issues/1")
+        );
+    }
+
+    #[test]
+    fn preserves_code_that_matches_a_configured_reference_definition() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Fixed [[#1]].\n\n    ~~~~ markdown\n    [#1]: https://example.com/issues/1\n    ~~~~\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_code_blocks(&compiled.markdown),
+            vec![String::from("[#1]: https://example.com/issues/1\n")],
+            "{}",
+            compiled.markdown
+        );
+        assert_eq!(
+            compiled
+                .markdown
+                .matches("[#1]: https://example.com/issues/1")
+                .count(),
+            2,
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_later_section_code_that_matches_an_earlier_definition() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "##,
+        );
+        for section in ["core", "cli"] {
+            fs::create_dir_all(temp.path().join("changes.d").join(section)).expect("section dir");
+        }
+        fs::write(
+            temp.path().join("changes.d/core/fix.md"),
+            " -  Fixed [[#1]].\n",
+        )
+        .expect("core fragment");
+        fs::write(
+            temp.path().join("changes.d/cli/docs.md"),
+            " -  Documented this example:\n\n    ~~~~ markdown\n    [#1]: https://example.com/issues/1\n    ~~~~\n",
+        )
+        .expect("cli fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_code_blocks(&compiled.markdown),
+            vec![String::from("[#1]: https://example.com/issues/1\n")],
+            "{}",
+            compiled.markdown
+        );
+        assert_eq!(
+            compiled
+                .markdown
+                .matches("[#1]: https://example.com/issues/1")
+                .count(),
+            2,
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn keeps_sectioned_configured_references_in_hongdown_normal_form() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+
+            [[sections]]
+            id = "core"
+            directory = "core"
+
+            [[sections]]
+            id = "cli"
+            directory = "cli"
+            "##,
+        );
+        for section in ["core", "cli"] {
+            fs::create_dir_all(temp.path().join("changes.d").join(section)).expect("section dir");
+        }
+        fs::write(
+            temp.path().join("changes.d/core/fix.md"),
+            " -  Fixed [[#1]].\n",
+        )
+        .expect("core fragment");
+        fs::write(
+            temp.path().join("changes.d/cli/docs.md"),
+            " -  Documented the command.\n",
+        )
+        .expect("cli fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let reformatted =
+            format_markdown_with_word_wrap(&compiled.markdown, true).expect("reformat");
+
+        assert_eq!(compiled.markdown, reformatted);
+    }
+
+    #[test]
+    fn preserves_code_when_a_configured_destination_is_normalized() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}?a=1&amp;b=2"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Fixed [[#1]].\n\n    ~~~~ markdown\n    [#1]: https://example.com/issues/1?a=1&amp;b=2\n    ~~~~\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_code_blocks(&compiled.markdown),
+            vec![String::from(
+                "[#1]: https://example.com/issues/1?a=1&amp;b=2\n"
+            )],
+            "{}",
+            compiled.markdown
+        );
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("#1"),
+                String::from("https://example.com/issues/1?a=1&amp;b=2"),
+                String::new(),
+            )],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_greater_than_signs_in_pinned_destinations() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/fix.md"),
+            "---\nlinks:\n  \"#1\": \"https://example.com/a>1\"\n---\n -  Fixed [[#1]].\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("#1"),
+                String::from("https://example.com/a>1"),
+                String::new(),
+            )],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_hyphen_only_lines_with_trailing_spaces_in_code_blocks() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Documented this example:\n\n    ~~~~ markdown\n    -  \n    ~~~~\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_code_blocks(&compiled.markdown),
+            vec![String::from("-  \n")],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn accepts_ordinary_links_with_unconfigured_reference_like_text() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/docs.md"),
+            " -  Read [#123](https://example.com/issues/123).\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("#123"),
+                String::from("https://example.com/issues/123"),
+                String::new(),
+            )],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_configured_full_reference_labels() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/fix.md"),
+            " -  Fixed [the issue][#1].\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("the issue"),
+                String::from("https://example.com/issues/1"),
+                String::new(),
+            )],
+            "{}",
+            compiled.markdown
+        );
+        assert!(
+            compiled
+                .markdown
+                .contains("[#1]: https://example.com/issues/1"),
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_escaped_brackets_in_configured_full_reference_text() {
+        let (temp, repo) = repo_with_config(
+            r##"
+            [links]
+            "#" = "https://example.com/issues/{n}"
+            "##,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/fix.md"),
+            " -  Fixed [a \\] b][#1].\n",
+        )
+        .expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            vec![(
+                String::from("a ] b"),
+                String::from("https://example.com/issues/1"),
+                String::new(),
+            )],
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn preserves_more_than_ten_control_character_destinations() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let mut fragment = String::from(" -  ");
+        for index in 0..11 {
+            if index > 0 {
+                fragment.push_str(", ");
+            }
+            fragment.push_str(&format!("[link {index}][link {index}]"));
+        }
+        fragment.push_str(".\n\n");
+        for index in 0..11 {
+            fragment.push_str(&format!(
+                "[link {index}]: <https://example.com/{index}&#9;x>\n"
+            ));
+        }
+        fs::write(temp.path().join("changes.d/links.md"), fragment).expect("fragment");
+
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        let expected = (0..11)
+            .map(|index| {
+                (
+                    format!("link {index}"),
+                    format!("https://example.com/{index}\tx"),
+                    String::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered_links(&compiled.markdown),
+            expected,
+            "{}",
+            compiled.markdown
+        );
+    }
+
+    #[test]
+    fn sorts_reference_metadata_by_link_config_order_then_number() {
         let (temp, repo) = repo_with_config(
             r##"
             [links]
@@ -752,14 +1493,19 @@ mod tests {
 
         let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
 
-        let pull_two = compiled.markdown.find("[!2]:").expect("pull 2");
-        let pull_ten = compiled.markdown.find("[!10]:").expect("pull 10");
-        let issue_one = compiled.markdown.find("[#1]:").expect("issue 1");
-        let issue_two = compiled.markdown.find("[#2]:").expect("issue 2");
-        assert!(pull_two < pull_ten);
-        assert!(pull_ten < issue_one);
-        assert!(issue_one < issue_two);
+        assert_eq!(
+            compiled.sections[0]
+                .references
+                .iter()
+                .map(|reference| reference.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["!2", "!10", "#1", "#2"]
+        );
         assert_eq!(compiled.markdown.matches("[#2]:").count(), 1);
+        assert_eq!(
+            compiled.markdown,
+            format_markdown_with_word_wrap(&compiled.markdown, true).expect("reformat")
+        );
     }
 
     #[test]

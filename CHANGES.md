@@ -7,6 +7,17 @@ Version 0.4.0
 To be released.
 
 
+Version 0.3.2
+-------------
+
+Released on July 29, 2026.
+
+ -  Fixed Markdown reference-style links when compiling, carrying, or importing
+    fragments. Sacho now preserves their resolved destinations through the
+    CommonMark AST and lets Hongdown normalize the output, while configured
+    references continue to use their template or pinned destination.
+
+
 Version 0.3.1
 -------------
 

@@ -99,6 +99,19 @@ The corresponding URL template belongs in *sacho.toml*:
 Sacho emits the link definitions in the compiled changelog. `sacho check`
 reports a reference whose sigil has no configured template.
 
+Fragments can also use ordinary Markdown reference-style links. Sacho resolves
+them while parsing each fragment, serializes the resulting CommonMark tree, and
+lets Hongdown normalize the compiled changelog. The normalized link label or
+syntax can therefore differ from the fragment source, but the resolved
+destination is preserved. `sacho carry` and `sacho import-unreleased` use the
+same semantic conversion, including definitions stored elsewhere in the source
+changelog.
+
+Configured references remain tied to their configured URL template. Use a
+frontmatter `links` pin when a particular reference needs a different resolved
+destination; an ordinary Markdown definition does not override the template or
+pin.
+
 For trackers that redirect a shared reference route to a more specific target,
 run `sacho resolve-links`. Sacho follows the redirect chain once and pins the
 final URL without moving the reference out of the entry text:

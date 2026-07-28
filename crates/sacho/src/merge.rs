@@ -13,7 +13,7 @@ use crate::changelog::{
     ChangelogError, find_unreleased_region, marker_region_contents, set_hongdown_separator_before,
     version_heading_spans,
 };
-use crate::commands::{CompileOptions, compile_unreleased};
+use crate::commands::{CompileOptions, compile_unreleased, validate_released_link_targets};
 use crate::config::RegionDetection;
 use crate::error::{Error, Result};
 use crate::released::insertion_title_span;
@@ -117,13 +117,30 @@ pub fn merge_driver(repo: &Repository, options: MergeDriverOptions) -> Result<Me
     let current_parsed = parse_changelog(repo, &current, options.current.clone())?;
     let other_parsed = parse_changelog(repo, &other, options.other.clone())?;
 
-    merge_parsed_changelogs_with_unreleased(
+    let result = merge_parsed_changelogs_with_unreleased(
         ancestor_parsed,
         current_parsed,
         other_parsed,
         compiled_unreleased,
         config.region_detection,
-    )
+    )?;
+    if let MergeDriverResult::Clean { output, .. } = &result {
+        validate_released_link_targets(
+            &current,
+            output,
+            &options.path,
+            config.region_detection,
+            &config.unreleased_heading,
+        )?;
+        validate_released_link_targets(
+            &other,
+            output,
+            &options.path,
+            config.region_detection,
+            &config.unreleased_heading,
+        )?;
+    }
+    Ok(result)
 }
 
 fn read_input(path: &PathBuf) -> Result<String> {
@@ -1244,6 +1261,106 @@ Released on July 1, 2026.
         assert!(output.contains(" -  Fixed merged fragment.\n"));
         assert!(!output.contains("Current stale"));
         assert!(!output.contains("Other stale"));
+    }
+
+    #[test]
+    fn rejects_a_merge_that_retargets_an_existing_released_link() {
+        let (temp, repo) = repo_with_fragment(" -  Fixed merged fragment.\n");
+        let ancestor = "\
+Project changes
+===============
+
+Unreleased
+----------
+
+To be released.
+";
+        let current = format!(
+            "{ancestor}
+
+Version 1.0.0
+-------------
+
+Released previously.
+
+ -  Read the [migration guide].
+
+[migration guide]: https://example.com/1.0-migration
+"
+        );
+        let other = format!(
+            "{ancestor}
+
+Version 2.0.0
+-------------
+
+Released elsewhere.
+
+ -  Read the [migration guide].
+
+[migration guide]: https://example.com/2.0-migration
+"
+        );
+        let (ancestor, current, other) =
+            write_three_inputs(temp.path(), ancestor, &current, &other);
+
+        let error = merge_driver(
+            &repo,
+            MergeDriverOptions {
+                ancestor,
+                current,
+                other,
+                path: PathBuf::from("CHANGES.md"),
+            },
+        )
+        .expect_err("retargeted released link");
+
+        assert!(matches!(
+            error,
+            Error::MaterializedLinkTargetChanged { ref path }
+                if path == std::path::Path::new("CHANGES.md")
+        ));
+    }
+
+    #[test]
+    fn merges_versioned_unreleased_regions_without_treating_them_as_history() {
+        let (temp, repo) = repo_with_fragment(" -  Read [merged](https://example.com/merged).\n");
+        fs::write(temp.path().join("changes.d/next"), "3.0.0\n").expect("next");
+        let ancestor = "\
+Project changes
+===============
+
+Version 3.0.0
+-------------
+
+To be released.
+";
+        let current = ancestor.replace(
+            "To be released.",
+            "To be released.\n\n -  Read [current](https://example.com/current).",
+        );
+        let other = ancestor.replace(
+            "To be released.",
+            "To be released.\n\n -  Read [other](https://example.com/other).",
+        );
+        let (ancestor, current, other) =
+            write_three_inputs(temp.path(), ancestor, &current, &other);
+
+        let result = merge_driver(
+            &repo,
+            MergeDriverOptions {
+                ancestor,
+                current,
+                other,
+                path: PathBuf::from("CHANGES.md"),
+            },
+        )
+        .expect("merge");
+
+        let MergeDriverResult::Clean { output, .. } = result else {
+            panic!("expected clean merge");
+        };
+        assert!(output.contains("[merged]"));
     }
 
     #[test]

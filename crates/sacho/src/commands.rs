@@ -7,6 +7,8 @@ use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use comrak::nodes::NodeValue;
+use comrak::{Arena, Options as ComrakOptions, parse_document};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
@@ -15,7 +17,7 @@ use similar::TextDiff;
 use crate::changelog::{
     BEGIN_MARKER, ChangelogError, END_MARKER, ReleasedSection, find_unreleased_region,
     marker_region_contents, replace_unreleased_region, set_hongdown_separator_before,
-    set_trailing_newline_count,
+    set_trailing_newline_count, version_heading_spans,
 };
 use crate::compile::{
     VersionLabel, compile_parsed_fragments, validate_resolved_link_consistency,
@@ -33,7 +35,7 @@ use crate::link_resolution::{LinkResolutionPolicy, ReferenceUrlResolver, is_http
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
-    carry_release, has_released_sections, import_unreleased_region, insertion_title_span,
+    carry_release, has_released_sections, import_unreleased_document_region, insertion_title_span,
     render_released_section,
 };
 #[cfg(test)]
@@ -1933,7 +1935,7 @@ fn synchronize_materialized_changelog(
     {
         return Ok((source.to_owned(), true));
     }
-    match replace_unreleased_region(
+    let synchronized = match replace_unreleased_region(
         source,
         &compiled.markdown,
         config.region_detection,
@@ -1954,7 +1956,189 @@ fn synchronize_materialized_changelog(
             ))
         }
         Err(source) => Err(changelog_error(changelog_path.to_path_buf(), source)),
+    }?;
+    validate_materialized_link_targets(
+        source,
+        &synchronized.0,
+        config.region_detection,
+        &config.unreleased_heading,
+        changelog_path,
+    )?;
+    Ok(synchronized)
+}
+
+fn validate_materialized_link_targets(
+    before: &str,
+    after: &str,
+    detection: RegionDetection,
+    unreleased_heading: &str,
+    changelog_path: &Path,
+) -> Result<()> {
+    let before_region = find_unreleased_region(before, detection, unreleased_heading)
+        .ok()
+        .map(|region| region.start..region.end);
+    let after_region = find_unreleased_region(after, detection, unreleased_heading)
+        .ok()
+        .map(|region| region.start..region.end);
+    if link_targets_outside_region(before, before_region.as_ref())
+        == link_targets_outside_region(after, after_region.as_ref())
+    {
+        Ok(())
+    } else {
+        Err(Error::MaterializedLinkTargetChanged {
+            path: changelog_path.to_path_buf(),
+        })
     }
+}
+
+fn link_targets_outside_region(
+    source: &str,
+    region: Option<&std::ops::Range<usize>>,
+) -> Vec<MaterializedLinkTarget> {
+    let arena = Arena::new();
+    let mut options = ComrakOptions::default();
+    options.extension.table = true;
+    options.extension.description_lists = true;
+    options.extension.alerts = true;
+    options.extension.footnotes = true;
+    options.extension.tasklist = true;
+    options.extension.math_dollars = true;
+    let root = parse_document(&arena, source, &options);
+    let mut line_starts = vec![0];
+    line_starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    root.descendants()
+        .filter_map(|node| {
+            let data = node.data();
+            let position = data.sourcepos.start;
+            let offset = line_starts
+                .get(position.line.checked_sub(1)?)?
+                .checked_add(position.column.checked_sub(1)?)?;
+            if region.is_some_and(|region| region.contains(&offset)) {
+                return None;
+            }
+            match &data.value {
+                NodeValue::Link(link) => Some((false, link.url.clone(), link.title.clone())),
+                NodeValue::Image(link) => Some((true, link.url.clone(), link.title.clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+type MaterializedLinkTarget = (bool, String, String);
+type ReleasedSectionKey = (String, usize);
+type ReleasedLinkTargets = BTreeMap<ReleasedSectionKey, Vec<MaterializedLinkTarget>>;
+
+pub(crate) fn validate_released_link_targets(
+    before: &str,
+    after: &str,
+    changelog_path: &Path,
+    detection: RegionDetection,
+    unreleased_heading: &str,
+) -> Result<()> {
+    let before_region = find_unreleased_region(before, detection, unreleased_heading)
+        .ok()
+        .map(|region| region.start..region.end);
+    let after_region = find_unreleased_region(after, detection, unreleased_heading)
+        .ok()
+        .map(|region| region.start..region.end);
+    let before_targets = released_link_targets(before, before_region.as_ref());
+    let after_targets = released_link_targets(after, after_region.as_ref());
+    if before_targets
+        .iter()
+        .all(|(section, targets)| after_targets.get(section) == Some(targets))
+    {
+        Ok(())
+    } else {
+        Err(Error::MaterializedLinkTargetChanged {
+            path: changelog_path.to_path_buf(),
+        })
+    }
+}
+
+fn released_link_targets(
+    source: &str,
+    unreleased_region: Option<&std::ops::Range<usize>>,
+) -> ReleasedLinkTargets {
+    let headings = version_heading_spans(source);
+    let mut occurrences = BTreeMap::<String, usize>::new();
+    let sections = headings
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| {
+            let end = headings
+                .get(index + 1)
+                .map_or(source.len(), |next| next.start);
+            let key = (heading.text.starts_with("Version ")
+                && !unreleased_region.is_some_and(|region| region.contains(&heading.start)))
+            .then(|| {
+                let occurrence = occurrences.entry(heading.text.clone()).or_default();
+                let key = (heading.text.clone(), *occurrence);
+                *occurrence += 1;
+                key
+            });
+            (heading.start..end, key)
+        })
+        .collect::<Vec<_>>();
+    let arena = Arena::new();
+    let mut options = ComrakOptions::default();
+    options.extension.table = true;
+    options.extension.description_lists = true;
+    options.extension.alerts = true;
+    options.extension.footnotes = true;
+    options.extension.tasklist = true;
+    options.extension.math_dollars = true;
+    let root = parse_document(&arena, source, &options);
+    let mut line_starts = vec![0];
+    line_starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    let mut targets = BTreeMap::<_, Vec<_>>::new();
+    for node in root.descendants() {
+        let data = node.data();
+        let position = data.sourcepos.start;
+        let Some(offset) = position
+            .line
+            .checked_sub(1)
+            .and_then(|line| line_starts.get(line))
+            .and_then(|start| {
+                position
+                    .column
+                    .checked_sub(1)
+                    .and_then(|column| start.checked_add(column))
+            })
+        else {
+            continue;
+        };
+        if unreleased_region.is_some_and(|region| region.contains(&offset)) {
+            continue;
+        }
+        let Some((_, Some(section))) = sections
+            .get(
+                sections
+                    .partition_point(|(range, _)| range.start <= offset)
+                    .saturating_sub(1),
+            )
+            .filter(|(range, _)| range.contains(&offset))
+        else {
+            continue;
+        };
+        let target = match &data.value {
+            NodeValue::Link(link) => (false, link.url.clone(), link.title.clone()),
+            NodeValue::Image(link) => (true, link.url.clone(), link.title.clone()),
+            _ => continue,
+        };
+        targets.entry(section.clone()).or_default().push(target);
+    }
+    targets
 }
 
 /// Applies a previously planned synchronization.
@@ -2167,6 +2351,13 @@ fn plan_release_with_resolved_fragments(
             &repo.config().changelog.title,
         )
     };
+    validate_released_link_targets(
+        &old_changelog,
+        &new_changelog,
+        &changelog_path,
+        repo.config().changelog.region_detection,
+        &repo.config().changelog.unreleased_heading,
+    )?;
     let next_after = next
         .as_deref()
         .filter(|next| !next.is_empty())
@@ -2352,7 +2543,8 @@ pub fn plan_import_unreleased(
         &repo.config().changelog.unreleased_heading,
     )
     .map_err(|source| changelog_error(changelog_path.clone(), source))?;
-    let mut imported = import_unreleased_region(repo, &changelog[region.start..region.end])?;
+    let mut imported =
+        import_unreleased_document_region(repo, changelog, region.start..region.end)?;
     for fragment in &mut imported.fragments {
         fragment.markdown = format_fragment_source(&fragment.markdown)
             .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
@@ -9048,6 +9240,42 @@ mod tests {
     }
 
     #[test]
+    fn import_unreleased_preserves_definition_from_released_history() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragment directory");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "\
+Unreleased
+----------
+
+To be released.
+
+ -  Read the [migration guide][guide].
+
+Version 1.0.0
+-------------
+
+Released on July 1, 2026.
+
+[guide]: https://example.com/migration
+",
+        )
+        .expect("changelog");
+
+        let plan = plan_import_unreleased(&repo, ImportUnreleasedOptions { force: true })
+            .expect("import plan");
+        apply_import_unreleased(&repo, plan).expect("import");
+
+        let fragment = fs::read_to_string(temp.path().join("changes.d/imported-unreleased.md"))
+            .expect("imported fragment");
+        assert!(
+            fragment.contains("[migration guide]: https://example.com/migration"),
+            "{fragment}"
+        );
+    }
+
+    #[test]
     fn carry_overwrites_a_malformed_existing_target_before_parsing() {
         let (temp, repo) = repo_with_config(
             r#"
@@ -9988,6 +10216,161 @@ links:
             server.finish(),
             vec!["HEAD /issues/3 HTTP/1.1", "HEAD /pull/3 HTTP/1.1"]
         );
+    }
+
+    #[test]
+    fn materialized_release_resolves_links_in_a_versioned_unreleased_region() {
+        let server = TestHttpServer::spawn(vec![
+            http_response("302 Found", Some("/pull/3")),
+            http_response("200 OK", None),
+        ]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "0.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/release.md"),
+            " -  Fixed release links.  [[#3]]\n",
+        )
+        .expect("fragment");
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!("Changelog\n=========\n\n{}", compiled.markdown),
+        )
+        .expect("changelog");
+
+        let plan = plan_release_with_link_resolution(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect("release plan");
+
+        assert!(
+            plan.released_markdown
+                .contains(&format!("[#3]: {}/pull/3", server.base))
+        );
+        assert_eq!(
+            server.finish(),
+            vec!["HEAD /issues/3 HTTP/1.1", "HEAD /pull/3 HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn resolving_release_rejects_retargeting_older_links() {
+        let server = TestHttpServer::spawn(vec![
+            http_response("302 Found", Some("/pull/3")),
+            http_response("200 OK", None),
+        ]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(temp.path().join("changes.d/next"), "0.2.0\n").expect("next");
+        fs::write(
+            temp.path().join("changes.d/release.md"),
+            " -  Fixed release links.  [[#3]]\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!(
+                "\
+Changelog
+=========
+
+Version 0.1.0
+-------------
+
+Released previously.
+
+ -  Fixed old links.  [[#3]]
+
+[#3]: {}/issues/3
+",
+                server.base
+            ),
+        )
+        .expect("changelog");
+
+        let error = plan_release_with_link_resolution(
+            &repo,
+            ReleaseOptions {
+                version: None,
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect_err("retargeted older link");
+
+        assert!(matches!(
+            error,
+            Error::MaterializedLinkTargetChanged { ref path }
+                if path == Path::new("CHANGES.md")
+        ));
+        assert_eq!(
+            server.finish(),
+            vec!["HEAD /issues/3 HTTP/1.1", "HEAD /pull/3 HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn fragments_only_release_rejects_retargeting_older_links() {
+        let (temp, repo) = repo_with_config(
+            r#"
+            [changelog]
+            materialize = false
+            "#,
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/release.md"),
+            " -  Read the [migration guide](https://example.com/2.0-migration).\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "\
+Changelog
+=========
+
+Version 1.0.0
+-------------
+
+Released previously.
+
+ -  Read the [migration guide].
+
+[migration guide]: https://example.com/1.0-migration
+",
+        )
+        .expect("changelog");
+
+        let error = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some(String::from("2.0.0")),
+                date: release_date(),
+                next: None,
+                allow_empty: false,
+            },
+        )
+        .expect_err("retargeted older link");
+
+        assert!(matches!(
+            error,
+            Error::MaterializedLinkTargetChanged { ref path }
+                if path == Path::new("CHANGES.md")
+        ));
     }
 
     #[test]
@@ -13036,6 +13419,43 @@ links:
             fs::read_to_string(temp.path().join("CHANGES.md"))
                 .expect("read")
                 .contains(" -  Fixed sync.\n")
+        );
+    }
+
+    #[test]
+    fn sync_rejects_retargeting_links_outside_the_unreleased_region() {
+        let (temp, repo) = repo_with_config("");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/sync.md"),
+            " -  Read the [migration guide](https://example.com/2.0-migration).\n",
+        )
+        .expect("fragment");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            "\
+Unreleased
+----------
+
+To be released.
+
+Version 1.0.0
+-------------
+
+Released previously.
+
+ -  Read the [migration guide].
+
+[migration guide]: https://example.com/1.0-migration
+",
+        )
+        .expect("changelog");
+
+        let error =
+            plan_sync(&repo, SyncOptions { force: true }).expect_err("retargeted released link");
+
+        assert!(
+            matches!(error, Error::MaterializedLinkTargetChanged { ref path } if path == Path::new("CHANGES.md"))
         );
     }
 
