@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.3.2
 -------------
 
-To be released.
+Released on July 29, 2026.
 
  -  Fixed Markdown reference-style links when compiling, carrying, or importing
     fragments. Sacho now preserves their resolved destinations through the
