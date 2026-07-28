@@ -681,10 +681,11 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hongdown"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd47c8ee0162782a43e21820ecc7f1fe43072247ac63332e4ee63ff1714c834"
+checksum = "65a2013bec2b4ae22a6b73974c312937aa22d1a7c31dc6ddab6281507ef657c4"
 dependencies = [
+ "caseless",
  "clap",
  "comrak 0.49.0",
  "dirs",

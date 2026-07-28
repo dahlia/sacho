@@ -21,6 +21,24 @@ pub(crate) fn format_markdown_with_word_wrap(source: &str, word_wrap: bool) -> R
     })
 }
 
+pub(crate) fn escape_angle_bracket_destination(destination: &str) -> String {
+    let mut escaped = String::with_capacity(destination.len());
+    for character in destination.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '\t' => escaped.push_str("&#9;"),
+            '\n' => escaped.push_str("&#10;"),
+            '\r' => escaped.push_str("&#13;"),
+            '\\' | '<' | '>' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn hongdown_options(word_wrap: bool) -> Options {
     Options {
         line_width: word_wrap.then(|| LineWidth::new(80).expect("80 is a valid line width")),
@@ -38,11 +56,57 @@ fn hongdown_options(word_wrap: bool) -> Options {
 
 #[cfg(test)]
 mod tests {
+    use comrak::nodes::NodeValue;
+    use comrak::{Arena, Options as ComrakOptions, parse_document};
     use proptest::prelude::*;
 
     use super::*;
 
+    #[test]
+    fn escapes_destination_control_characters_as_numeric_references() {
+        for (character, entity) in [('\t', "&#9;"), ('\n', "&#10;"), ('\r', "&#13;")] {
+            let destination = format!("https://example.com/a{character}b");
+            let escaped = escape_angle_bracket_destination(&destination);
+            let source = format!("[target]: <{escaped}>\n\n[target]\n");
+            let arena = Arena::new();
+            let root = parse_document(&arena, &source, &ComrakOptions::default());
+            let parsed = root.descendants().find_map(|node| {
+                if let NodeValue::Link(link) = &node.data().value {
+                    Some(link.url.clone())
+                } else {
+                    None
+                }
+            });
+
+            assert!(escaped.contains(entity), "{escaped:?}");
+            assert_eq!(parsed.as_deref(), Some(destination.as_str()));
+        }
+    }
+
     proptest! {
+        #[test]
+        fn escaped_angle_bracket_destinations_round_trip(
+            suffix in prop::collection::vec(0x21_u8..=0x7e, 0..40),
+        ) {
+            let suffix = String::from_utf8(suffix).expect("printable ASCII is UTF-8");
+            let destination = format!("https://example.com/{suffix}");
+            let source = format!(
+                "[target]: <{}>\n\n[target]\n",
+                escape_angle_bracket_destination(&destination),
+            );
+            let arena = Arena::new();
+            let root = parse_document(&arena, &source, &ComrakOptions::default());
+            let parsed = root.descendants().find_map(|node| {
+                if let NodeValue::Link(link) = &node.data().value {
+                    Some(link.url.clone())
+                } else {
+                    None
+                }
+            });
+
+            prop_assert_eq!(parsed.as_deref(), Some(destination.as_str()));
+        }
+
         #[test]
         fn no_word_wrap_is_independent_of_soft_break_position(
             words in prop::collection::vec("[a-z]{1,12}", 2..24),

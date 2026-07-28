@@ -370,6 +370,16 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// Synchronization would change a link outside the materialized region.
+    #[snafu(display(
+        "refusing to synchronize {} because it would change a link target outside the unreleased region",
+        path.display()
+    ))]
+    MaterializedLinkTargetChanged {
+        /// Changelog whose existing link meaning would change.
+        path: PathBuf,
+    },
+
     /// A synchronization plan no longer matches the changelog it was built from.
     #[snafu(display(
         "refusing to apply stale synchronization plan because {} changed after planning; run `sacho sync` again",

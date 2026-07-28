@@ -3,9 +3,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use comrak::nodes::{AstNode, ListType, NodeValue, Sourcepos};
-use comrak::{Arena, Options as ComrakOptions, parse_document};
+use comrak::options::BrokenLinkReference;
+use comrak::{
+    Arena, Options as ComrakOptions, ResolvedReference, format_commonmark, parse_document,
+};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use snafu::ResultExt;
@@ -16,6 +20,7 @@ use crate::error::{
     UnknownReferenceSnafu, redact_url_credentials,
 };
 use crate::link_resolution::validate_http_url;
+use crate::markdown::escape_angle_bracket_destination;
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolutionError, SectionResolver, has_sections};
 
@@ -382,17 +387,34 @@ pub fn parse_fragment(
         .map(|key| FragmentWarning::UnknownFrontmatterKey { key })
         .collect::<Vec<_>>();
 
+    let options = comrak_options_with_configured_references(&frontmatter.links, link_templates);
     let arena = Arena::new();
-    let root = parse_document(&arena, body, &comrak_options());
-    let list = validate_fragment_shape(root, body_line_offset)?;
-
-    let line_starts = line_starts(body);
+    let root = parse_document(&arena, body, &options);
+    let original_list = validate_fragment_shape(root, body_line_offset)?;
+    let configured_links = configured_link_references(body, original_list, link_templates);
+    let configured_references = configured_links
+        .values()
+        .map(|reference| (reference.label.clone(), reference.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let authoritative_body = authoritative_reference_source(
+        body,
+        configured_references.values(),
+        &frontmatter.links,
+        link_templates,
+    );
+    let (list, configured_links) = if let Some(body) = authoritative_body.as_deref() {
+        let root = parse_document(&arena, body, &options);
+        (
+            root.first_child()
+                .expect("authoritative definitions leave the fragment list intact"),
+            shift_configured_links(configured_links, configured_references.len() + 1),
+        )
+    } else {
+        (original_list, configured_links)
+    };
     let mut items = Vec::new();
     for (ordinal, item) in list.children().enumerate() {
-        let markdown = slice_sourcepos(body, &line_starts, item.data().sourcepos)
-            .unwrap_or_default()
-            .trim_end()
-            .to_owned();
+        let markdown = render_item_with_configured_shortcuts(item, &options, &configured_links);
         let first_block = item.first_child();
         let sort_text = first_block
             .map(plain_text)
@@ -401,7 +423,7 @@ pub fn parse_fragment(
             .to_owned();
         let substantive_content = has_substantive_content(item);
         let mut references = Vec::new();
-        collect_references(item, link_templates, &mut references)?;
+        collect_references(item, &configured_links, link_templates, &mut references)?;
         references.sort();
         references.dedup();
         items.push(FragmentItem {
@@ -616,6 +638,460 @@ fn comrak_options() -> ComrakOptions<'static> {
     options
 }
 
+pub(crate) fn comrak_options_with_configured_references(
+    links: &BTreeMap<String, String>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> ComrakOptions<'static> {
+    let links = links.clone();
+    let link_templates = link_templates.clone();
+    let mut options = comrak_options();
+    options.parse.broken_link_callback =
+        Some(Arc::new(move |reference: BrokenLinkReference<'_>| {
+            let configured = parse_reference_label(reference.original, &link_templates).ok()??;
+            Some(ResolvedReference {
+                url: configured_reference_url(&configured, &links, &link_templates),
+                title: String::new(),
+            })
+        }));
+    options
+}
+
+fn configured_reference_marker_prefix(source: &str) -> String {
+    (0_u64..)
+        .map(|nonce| format!("https://sacho.invalid/configured-reference/{nonce}/"))
+        .find(|prefix| !source.contains(prefix))
+        .expect("an absent configured-reference marker prefix")
+}
+
+fn configured_reference_url(
+    reference: &ReferenceUse,
+    links: &BTreeMap<String, String>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> String {
+    links.get(&reference.label).cloned().unwrap_or_else(|| {
+        link_templates
+            .iter()
+            .find(|(sigil, _)| sigil.as_str() == reference.sigil)
+            .map(|(_, template)| {
+                template
+                    .as_str()
+                    .replace("{n}", &reference.number.to_string())
+            })
+            .expect("a parsed configured reference has a matching template")
+    })
+}
+
+pub(crate) fn configured_link_references<'a>(
+    source: &str,
+    root: &'a AstNode<'a>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> BTreeMap<Sourcepos, ReferenceUse> {
+    configured_link_references_impl(source, root, link_templates, false)
+}
+
+pub(crate) fn configured_link_references_with_bracket_wrapped<'a>(
+    source: &str,
+    root: &'a AstNode<'a>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> BTreeMap<Sourcepos, ReferenceUse> {
+    configured_link_references_impl(source, root, link_templates, true)
+}
+
+fn configured_link_references_impl<'a>(
+    source: &str,
+    root: &'a AstNode<'a>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+    include_bracket_wrapped: bool,
+) -> BTreeMap<Sourcepos, ReferenceUse> {
+    let line_starts = line_starts(source);
+    let bracket_wrapped_targets = if include_bracket_wrapped {
+        bracket_wrapped_reference_targets(source, root, link_templates)
+    } else {
+        BTreeMap::new()
+    };
+    root.descendants()
+        .filter(|node| matches!(node.data().value, NodeValue::Link(_) | NodeValue::Image(_)))
+        .filter_map(|node| {
+            let position = node.data().sourcepos;
+            let link_source = slice_sourcepos(source, &line_starts, position)?;
+            let reference = configured_reference_from_link_source(link_source, link_templates)
+                .or_else(|| {
+                    let reference = include_bracket_wrapped
+                        .then(|| bracket_wrapped_reference(node, link_templates))
+                        .flatten()?;
+                    let data = node.data();
+                    let link = match &data.value {
+                        NodeValue::Link(link) | NodeValue::Image(link) => link,
+                        _ => return None,
+                    };
+                    bracket_wrapped_targets
+                        .get(&reference.label)
+                        .is_some_and(|(url, title)| {
+                            link.url == *url && link.title.is_empty() && title.is_empty()
+                        })
+                        .then_some(reference)
+                })?;
+            Some((position, reference))
+        })
+        .collect()
+}
+
+fn bracket_wrapped_reference_targets<'a>(
+    source: &str,
+    root: &'a AstNode<'a>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> BTreeMap<String, (String, String)> {
+    let candidates = root
+        .descendants()
+        .filter_map(|node| bracket_wrapped_reference(node, link_templates))
+        .map(|reference| (reference.label.clone(), reference))
+        .collect::<BTreeMap<_, _>>();
+    if candidates.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let marker_prefix = configured_link_marker_prefix(source);
+    let mut probes = String::new();
+    let mut labels_by_marker = BTreeMap::new();
+    for (index, label) in candidates.keys().enumerate() {
+        let marker = format!("{marker_prefix}referenceprobe{index}x");
+        probes.push_str(&format!("[{marker}][{label}] "));
+        labels_by_marker.insert(marker, label.clone());
+    }
+    probes.push_str("\n\n");
+    probes.push_str(source);
+
+    let arena = Arena::new();
+    let root = parse_document(&arena, &probes, &comrak_options());
+    root.descendants()
+        .filter_map(|node| {
+            let data = node.data();
+            let (NodeValue::Link(link) | NodeValue::Image(link)) = &data.value else {
+                return None;
+            };
+            let label = labels_by_marker.get(&plain_text(node))?;
+            Some((label.clone(), (link.url.clone(), link.title.clone())))
+        })
+        .collect()
+}
+
+fn bracket_wrapped_reference<'a>(
+    node: &'a AstNode<'a>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> Option<ReferenceUse> {
+    let previous_is_open = node.previous_sibling().is_some_and(
+        |sibling| matches!(&sibling.data().value, NodeValue::Text(text) if text.ends_with('[')),
+    );
+    let next_is_close = node.next_sibling().is_some_and(
+        |sibling| matches!(&sibling.data().value, NodeValue::Text(text) if text.starts_with(']')),
+    );
+    if !previous_is_open || !next_is_close {
+        return None;
+    }
+    let label = plain_text(node);
+    parse_reference_label(label.trim(), link_templates)
+        .ok()
+        .flatten()
+        .filter(|reference| reference.label == label.trim())
+}
+
+fn configured_reference_from_link_source(
+    source: &str,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> Option<ReferenceUse> {
+    let marker_prefix = configured_reference_marker_prefix(source);
+    let captured = Arc::new(Mutex::new(BTreeMap::<String, ReferenceUse>::new()));
+    let callback_captured = Arc::clone(&captured);
+    let callback_templates = link_templates.clone();
+    let callback_prefix = marker_prefix.clone();
+    let mut options = comrak_options();
+    options.parse.broken_link_callback =
+        Some(Arc::new(move |reference: BrokenLinkReference<'_>| {
+            let configured =
+                parse_reference_label(reference.original, &callback_templates).ok()??;
+            let mut captured = callback_captured
+                .lock()
+                .expect("configured-reference capture lock");
+            let marker = format!("{callback_prefix}{}", captured.len());
+            captured.insert(marker.clone(), configured);
+            Some(ResolvedReference {
+                url: marker,
+                title: String::new(),
+            })
+        }));
+
+    let arena = Arena::new();
+    let root = parse_document(&arena, source, &options);
+    let paragraph = root.first_child()?;
+    let node = paragraph.first_child()?;
+    if node.next_sibling().is_some() {
+        return None;
+    }
+    let marker = match &node.data().value {
+        NodeValue::Link(link) | NodeValue::Image(link) if link.url.starts_with(&marker_prefix) => {
+            link.url.clone()
+        }
+        _ => return None,
+    };
+    captured
+        .lock()
+        .expect("configured-reference capture lock")
+        .get(&marker)
+        .cloned()
+}
+
+fn shift_configured_links(
+    links: BTreeMap<Sourcepos, ReferenceUse>,
+    line_delta: usize,
+) -> BTreeMap<Sourcepos, ReferenceUse> {
+    links
+        .into_iter()
+        .filter_map(|(position, reference)| {
+            shift_sourceposition(position, line_delta as isize)
+                .map(|position| (position, reference))
+        })
+        .collect()
+}
+
+fn shift_sourceposition(position: Sourcepos, line_delta: isize) -> Option<Sourcepos> {
+    Some(Sourcepos {
+        start: comrak::nodes::LineColumn {
+            line: position.start.line.checked_add_signed(line_delta)?,
+            column: position.start.column,
+        },
+        end: comrak::nodes::LineColumn {
+            line: position.end.line.checked_add_signed(line_delta)?,
+            column: position.end.column,
+        },
+    })
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn slice_sourcepos<'a>(
+    source: &'a str,
+    line_starts: &[usize],
+    sourcepos: Sourcepos,
+) -> Option<&'a str> {
+    let start_line = sourcepos.start.line.checked_sub(1)?;
+    let end_line = sourcepos.end.line.checked_sub(1)?;
+    let start = *line_starts.get(start_line)? + sourcepos.start.column.checked_sub(1)?;
+    let end_line_start = *line_starts.get(end_line)?;
+    let end = (end_line_start + sourcepos.end.column).min(source.len());
+    source.get(start..end)
+}
+
+fn authoritative_reference_source<'a>(
+    body: &str,
+    references: impl Iterator<Item = &'a ReferenceUse>,
+    links: &BTreeMap<String, String>,
+    link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
+) -> Option<String> {
+    let references = references.collect::<Vec<_>>();
+    if references.is_empty() {
+        None
+    } else {
+        Some(reference_source(
+            body,
+            references.into_iter(),
+            |reference| configured_reference_url(reference, links, link_templates),
+        ))
+    }
+}
+
+fn reference_source<'a, U>(
+    body: &str,
+    references: impl Iterator<Item = &'a ReferenceUse>,
+    url: impl Fn(&ReferenceUse) -> U,
+) -> String
+where
+    U: AsRef<str>,
+{
+    let mut definitions = String::new();
+    for reference in references {
+        definitions.push('[');
+        definitions.push_str(&reference.label);
+        definitions.push_str("]: <");
+        definitions.push_str(&escape_angle_bracket_destination(url(reference).as_ref()));
+        definitions.push_str(">\n");
+    }
+    definitions.push('\n');
+    definitions.push_str(body);
+    definitions
+}
+
+pub(crate) fn render_item_with_configured_shortcuts<'a>(
+    item: &'a AstNode<'a>,
+    options: &ComrakOptions<'_>,
+    configured_links: &BTreeMap<Sourcepos, ReferenceUse>,
+) -> String {
+    let original = render_item_commonmark(item, options);
+    let marker_prefix = configured_link_marker_prefix(&original);
+    let (markdown, markers) =
+        render_item_with_configured_markers(item, options, configured_links, &marker_prefix);
+    replace_configured_link_markers(markdown, &markers)
+}
+
+pub(crate) fn render_item_commonmark<'a>(
+    item: &'a AstNode<'a>,
+    options: &ComrakOptions<'_>,
+) -> String {
+    let affected_links = item
+        .descendants()
+        .filter_map(|node| {
+            let data = node.data();
+            let url = match &data.value {
+                NodeValue::Link(link) | NodeValue::Image(link) => &link.url,
+                _ => return None,
+            };
+            url.chars()
+                .any(|character| matches!(character, '\t' | '\n' | '\r'))
+                .then(|| (node, url.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut markdown = String::new();
+    format_commonmark(item, options, &mut markdown)
+        .expect("writing CommonMark to a String cannot fail");
+    if !affected_links.is_empty() {
+        let marker_prefix = configured_link_marker_prefix(&markdown);
+        let markers = affected_links
+            .iter()
+            .enumerate()
+            .map(|(index, (node, url))| {
+                let marker = format!("{marker_prefix}destination{index}x");
+                match &mut node.data_mut().value {
+                    NodeValue::Link(link) | NodeValue::Image(link) => {
+                        link.url.clone_from(&marker);
+                    }
+                    _ => unreachable!("only links and images were collected"),
+                }
+                (node, marker, url)
+            })
+            .collect::<Vec<_>>();
+        markdown.clear();
+        format_commonmark(item, options, &mut markdown)
+            .expect("writing CommonMark to a String cannot fail");
+        for (node, marker, url) in markers {
+            match &mut node.data_mut().value {
+                NodeValue::Link(link) | NodeValue::Image(link) => {
+                    link.url.clone_from(url);
+                }
+                _ => unreachable!("only links and images were collected"),
+            }
+            markdown = markdown.replace(
+                &marker,
+                &format!("<{}>", escape_angle_bracket_destination(url)),
+            );
+        }
+    }
+    markdown.trim_end().to_owned()
+}
+
+pub(crate) fn render_item_with_configured_markers<'a>(
+    item: &'a AstNode<'a>,
+    options: &ComrakOptions<'_>,
+    configured_links: &BTreeMap<Sourcepos, ReferenceUse>,
+    marker_prefix: &str,
+) -> (String, Vec<(String, String)>) {
+    let configured_nodes = item
+        .descendants()
+        .filter_map(|node| {
+            configured_links
+                .get(&node.data().sourcepos)
+                .map(|reference| (node, reference.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut rendered_nodes = Vec::with_capacity(configured_nodes.len());
+    for (node, reference) in configured_nodes.into_iter().rev() {
+        let data = node.data();
+        let is_image = matches!(data.value, NodeValue::Image(_));
+        if !is_image && !matches!(data.value, NodeValue::Link(_)) {
+            continue;
+        }
+        let sourcepos = data.sourcepos;
+        let value = data.value.clone();
+        drop(data);
+
+        let plain_display = plain_text(node);
+        let display = if plain_display == reference.label {
+            plain_display
+        } else {
+            render_link_text(node, options)
+        };
+        let image_marker = if is_image { "!" } else { "" };
+        let shortcut = if display == reference.label {
+            format!("{image_marker}[{}]", reference.label)
+        } else {
+            format!("{image_marker}[{display}][{}]", reference.label)
+        };
+        let marker = format!(
+            "{marker_prefix}{}x{}x{}x{}",
+            sourcepos.start.line, sourcepos.start.column, sourcepos.end.line, sourcepos.end.column,
+        );
+        let children = node.children().collect::<Vec<_>>();
+        for child in &children {
+            child.detach();
+        }
+        node.data_mut().value = NodeValue::Text(marker.clone().into());
+        rendered_nodes.push((node, marker, shortcut, value, children));
+    }
+    let markdown = render_item_commonmark(item, options);
+    rendered_nodes.reverse();
+    for (node, _, _, value, children) in &rendered_nodes {
+        node.data_mut().value = value.clone();
+        for child in children {
+            node.append(*child);
+        }
+    }
+    let markers = rendered_nodes
+        .into_iter()
+        .map(|(_, marker, shortcut, _, _)| (marker, shortcut))
+        .collect();
+    (markdown, markers)
+}
+
+pub(crate) fn configured_link_marker_prefix(source: &str) -> String {
+    let arena = Arena::new();
+    let options = comrak_options();
+    let root = parse_document(&arena, source, &options);
+    let mut decoded = String::new();
+    format_commonmark(root, &options, &mut decoded)
+        .expect("writing CommonMark to a String cannot fail");
+    (0_u64..)
+        .map(|nonce| format!("sachointernalconfiguredlink{nonce}"))
+        .find(|prefix| !source.contains(prefix) && !decoded.contains(prefix))
+        .expect("an absent configured-link marker prefix")
+}
+
+pub(crate) fn replace_configured_link_markers(
+    mut markdown: String,
+    markers: &[(String, String)],
+) -> String {
+    for (marker, shortcut) in markers {
+        markdown = markdown.replace(&format!(r"\[{marker}"), &format!("[{marker}"));
+        markdown = markdown.replace(&format!(r"{marker}\]"), &format!("{marker}]"));
+        markdown = markdown.replace(marker, shortcut);
+    }
+    markdown.trim_end().to_owned()
+}
+
+fn render_link_text<'a>(node: &'a AstNode<'a>, options: &ComrakOptions<'_>) -> String {
+    let mut markdown = String::new();
+    for child in node.children() {
+        format_commonmark(child, options, &mut markdown)
+            .expect("writing CommonMark to a String cannot fail");
+    }
+    markdown.trim_end().to_owned()
+}
+
 fn validate_fragment_shape<'a>(
     root: &'a AstNode<'a>,
     line_offset: usize,
@@ -732,16 +1208,28 @@ fn html_has_substantive_content(source: &str) -> bool {
 
 fn collect_references<'a>(
     node: &'a AstNode<'a>,
+    configured_links: &BTreeMap<Sourcepos, ReferenceUse>,
     link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
     references: &mut Vec<ReferenceUse>,
 ) -> std::result::Result<(), FragmentError> {
     let data = node.data();
-    if let NodeValue::Text(text) = &data.value {
-        scan_reference_labels(text, link_templates, references)?;
+    match &data.value {
+        NodeValue::Text(text) => scan_reference_labels(text, link_templates, references)?,
+        NodeValue::Link(_) | NodeValue::Image(_) => {
+            drop(data);
+            if let Some(reference) = configured_links.get(&node.data().sourcepos) {
+                references.push(reference.clone());
+            }
+            for child in node.children() {
+                collect_references(child, configured_links, link_templates, references)?;
+            }
+            return Ok(());
+        }
+        _ => {}
     }
     drop(data);
     for child in node.children() {
-        collect_references(child, link_templates, references)?;
+        collect_references(child, configured_links, link_templates, references)?;
     }
     Ok(())
 }
@@ -764,7 +1252,7 @@ fn scan_reference_labels(
     Ok(())
 }
 
-fn parse_reference_label(
+pub(crate) fn parse_reference_label(
     label: &str,
     link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
 ) -> std::result::Result<Option<ReferenceUse>, FragmentError> {
@@ -813,30 +1301,6 @@ fn looks_like_reference_label(label: &str) -> bool {
             .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
         && !number.is_empty()
         && number.chars().all(|character| character.is_ascii_digit())
-}
-
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (index, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
-}
-
-fn slice_sourcepos<'a>(
-    source: &'a str,
-    line_starts: &[usize],
-    sourcepos: Sourcepos,
-) -> Option<&'a str> {
-    let start_line = sourcepos.start.line.checked_sub(1)?;
-    let end_line = sourcepos.end.line.checked_sub(1)?;
-    let start = *line_starts.get(start_line)? + sourcepos.start.column.checked_sub(1)?;
-    let end_line_start = *line_starts.get(end_line)?;
-    let mut end = end_line_start + sourcepos.end.column;
-    end = end.min(source.len());
-    source.get(start..end)
 }
 
 #[cfg(test)]
@@ -905,6 +1369,88 @@ mod tests {
             )])
         );
         assert!(fragment.warnings.is_empty());
+    }
+
+    #[test]
+    fn recognizes_pinned_configured_full_reference_labels() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Fixed [the issue][#1].\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(
+            fragment.items[0].references,
+            vec![ReferenceUse {
+                label: String::from("#1"),
+                sigil: String::from("#"),
+                number: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn recognizes_pinned_configured_reference_style_images() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Added ![a screenshot][#1].\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(
+            fragment.items[0].references,
+            vec![ReferenceUse {
+                label: String::from("#1"),
+                sigil: String::from("#"),
+                number: 1,
+            }]
+        );
+        assert_eq!(fragment.items[0].markdown, "- Added ![a screenshot][#1].");
+    }
+
+    #[test]
+    fn preserves_bracket_wrapped_ordinary_inline_links() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            " -  Read [[#1](https://docs.example/guide)].\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert!(fragment.items[0].references.is_empty());
+        assert_eq!(
+            fragment.items[0].markdown,
+            "- Read \\[[\\#1](https://docs.example/guide)\\]."
+        );
+    }
+
+    #[test]
+    fn preserves_an_ordinary_link_containing_a_configured_image() {
+        let fragment = parse_fragment(
+            "change.md".into(),
+            "---\nlinks:\n  \"#1\": https://images.example/screenshot.png\n---\n -  Read [![screenshot][#1]](https://docs.example/guide).\n",
+            None,
+            &links(),
+        )
+        .expect("fragment");
+
+        assert_eq!(
+            fragment.items[0].references,
+            vec![ReferenceUse {
+                label: String::from("#1"),
+                sigil: String::from("#"),
+                number: 1,
+            }]
+        );
+        assert_eq!(
+            fragment.items[0].markdown,
+            "- Read [![screenshot][#1]](https://docs.example/guide)."
+        );
     }
 
     #[test]
@@ -1079,7 +1625,7 @@ mod tests {
         )
         .expect("fragment");
 
-        assert_eq!(fragment.items[0].markdown, "-  Added thing.");
+        assert_eq!(fragment.items[0].markdown, "- Added thing.");
         assert_eq!(fragment.items[0].sort_text, "Added thing.");
     }
 

@@ -17,7 +17,7 @@ caseless = "0.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
 comrak = "0.53.0"
 globset = "0.4.18"
-hongdown = "0.5.1"
+hongdown = "0.5.3"
 indexmap = { version = "2.12.1", features = ["serde"] }
 jiff = "0.2.32"
 miette = { version = "7.6.0", features = ["fancy"] }
