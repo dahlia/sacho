@@ -1157,6 +1157,43 @@ fn sync_resolve_links_pins_fragments_without_materialization() {
 }
 
 #[test]
+fn sync_resolve_links_force_applies_a_hand_edited_changelog() {
+    let (base, request) = one_request_http_server();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        format!("[links]\n\"#\" = \"{base}/issues/{{n}}\"\n"),
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    let path = temp.path().join("changes.d/change.md");
+    std::fs::write(&path, " -  Fixed sync links.  [[#1]]\n").expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["sync", "--resolve-links", "--force"])
+        .assert()
+        .success()
+        .stdout("changes.d/change.md\nCHANGES.md\n");
+
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("fragment")
+            .contains(&format!("{base}/issues/1"))
+    );
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains(&format!("[#1]: {base}/issues/1")));
+    assert!(!changelog.contains("Hand-edited note."));
+    assert_eq!(request.join().expect("server"), "HEAD /issues/1 HTTP/1.1");
+}
+
+#[test]
 fn release_resolve_links_uses_the_resolving_plan() {
     let (base, requests) = redirecting_http_server();
     let temp = tempfile::TempDir::new().expect("tempdir");
