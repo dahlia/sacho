@@ -6,6 +6,12 @@ Version 0.4.0
 
 To be released.
 
+ -  Added optional fragment arguments to `sacho resolve-links`, so only the
+    named files are resolved.  [[#5], [#6]]
+
+[#5]: https://github.com/dahlia/sacho/issues/5
+[#6]: https://github.com/dahlia/sacho/pull/6
+
 
 Version 0.3.2
 -------------

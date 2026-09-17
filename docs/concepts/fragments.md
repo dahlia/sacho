@@ -128,3 +128,7 @@ links:
 Pins travel with their fragments and take precedence over the repository URL
 template. Each pin key must be a configured reference label used by that
 fragment. Delete a pin to request that reference again.
+
+Pass fragment paths to `sacho resolve-links` to resolve only those files, which
+avoids requesting references from unrelated fragments. Running it without
+arguments resolves every fragment.

@@ -28,7 +28,7 @@ use crate::config::{
 };
 use crate::error::{Error, MutationCommand, Result};
 use crate::fragment::{
-    DiscoveryWarning, Fragment, FragmentWarning, compare_fragment_paths,
+    DiscoveryWarning, Fragment, FragmentCandidate, FragmentWarning, compare_fragment_paths,
     discover_fragment_candidates, parse_fragment,
 };
 use crate::link_resolution::{LinkResolutionPolicy, ReferenceUrlResolver, is_http_reference_url};
@@ -320,10 +320,13 @@ pub struct ResolveLinksPlan {
 }
 
 /// Options for resolving and pinning reference links.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolveLinksOptions {
     /// Apply materialized synchronization even when it may discard hand edits.
     pub force: bool,
+
+    /// Fragment paths to resolve. An empty list resolves every fragment.
+    pub selection: Vec<PathBuf>,
 }
 
 /// Result of resolving and pinning reference links.
@@ -1545,7 +1548,7 @@ pub fn compile_unreleased_with_link_resolution(
     if !policy.is_enabled(repo.config()) {
         return compile_unreleased(repo, options);
     }
-    let snapshots = prepare_resolved_fragments(repo, options.section.as_deref())?;
+    let snapshots = prepare_resolved_fragments(repo, options.section.as_deref(), &[])?;
     let version_label = current_version_label(repo)?;
     compile_parsed_fragments(
         repo,
@@ -1573,7 +1576,7 @@ fn plan_resolve_links_with_snapshot_hook(
     options: ResolveLinksOptions,
     after_next_snapshot: impl FnOnce(),
 ) -> Result<ResolveLinksPlan> {
-    let snapshots = prepare_resolved_fragments(repo, None)?;
+    let snapshots = prepare_resolved_fragments(repo, None, &options.selection)?;
     let changed_fragments = snapshots
         .iter()
         .filter(|snapshot| snapshot.before != snapshot.after)
@@ -1696,15 +1699,20 @@ fn current_version_label(repo: &Repository) -> Result<VersionLabel> {
 fn prepare_resolved_fragments(
     repo: &Repository,
     resolve_section: Option<&str>,
+    requested: &[PathBuf],
 ) -> Result<Vec<ResolvedFragmentSnapshot>> {
     let discovered = discover_fragment_candidates(repo)?;
+    let selection = selected_fragment_paths(requested, &discovered.candidates)?;
     let mut parsed = Vec::with_capacity(discovered.candidates.len());
     let mut targets = BTreeMap::<String, (String, u64)>::new();
     let mut resolved = BTreeMap::<String, String>::new();
 
     for candidate in discovered.candidates {
-        let should_resolve =
-            resolve_section.is_none_or(|section| candidate.section.as_deref() == Some(section));
+        let should_resolve = resolve_section
+            .is_none_or(|section| candidate.section.as_deref() == Some(section))
+            && selection
+                .as_ref()
+                .is_none_or(|selection| selection.contains(&candidate.relative_path));
         let source = fs::read_to_string(&candidate.path).map_err(|source| Error::ReadFile {
             path: candidate.path.clone(),
             source,
@@ -1813,6 +1821,67 @@ fn prepare_resolved_fragments(
             },
         )
         .collect()
+}
+
+fn selected_fragment_paths(
+    requested: &[PathBuf],
+    candidates: &[FragmentCandidate],
+) -> Result<Option<BTreeSet<PathBuf>>> {
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    let mut by_identity = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    for candidate in candidates {
+        by_identity
+            .entry(filesystem_path_identity(&candidate.path)?)
+            .or_default()
+            .push(candidate.relative_path.clone());
+    }
+    let mut resolved = Vec::with_capacity(requested.len());
+    for path in requested {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(Error::UnknownFragment { path: path.clone() });
+            }
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Err(Error::UnknownFragment { path: path.clone() });
+            }
+            Err(source) => {
+                return Err(Error::ReadFile {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+        resolved.push((filesystem_path_identity(path)?, path.clone()));
+    }
+    match_fragment_selection(&by_identity, &resolved)
+}
+
+fn match_fragment_selection(
+    candidates: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    requested: &[(PathBuf, PathBuf)],
+) -> Result<Option<BTreeSet<PathBuf>>> {
+    let mut selected = BTreeSet::new();
+    for (identity, original) in requested {
+        match candidates.get(identity).map(Vec::as_slice) {
+            Some([relative]) => {
+                selected.insert(relative.clone());
+            }
+            Some(_) => {
+                return Err(Error::AmbiguousFragment {
+                    path: original.clone(),
+                });
+            }
+            None => {
+                return Err(Error::UnknownFragment {
+                    path: original.clone(),
+                });
+            }
+        }
+    }
+    Ok(Some(selected))
 }
 
 fn source_with_resolved_links(source: &str, links: &BTreeMap<String, String>) -> Result<String> {
@@ -2188,7 +2257,7 @@ pub fn plan_release_with_link_resolution(
     repo: &Repository,
     options: ReleaseOptions,
 ) -> Result<ReleasePlan> {
-    let resolved = prepare_resolved_fragments(repo, None)?;
+    let resolved = prepare_resolved_fragments(repo, None, &[])?;
     plan_release_with_resolved_fragments(repo, options, Some(resolved))
 }
 
@@ -6741,7 +6810,8 @@ fn quote_git_attr_path(path: &str) -> String {
     }
 }
 
-fn shell_quote(argument: &str) -> String {
+/// Quotes a single argument for a POSIX shell command line.
+pub fn shell_quote(argument: &str) -> String {
     if !argument.is_empty()
         && argument
             .chars()
@@ -10393,7 +10463,7 @@ Released previously.
         )
         .expect("fragment");
         fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n").expect("changelog");
-        let resolved = prepare_resolved_fragments(&repo, None).expect("resolved snapshots");
+        let resolved = prepare_resolved_fragments(&repo, None, &[]).expect("resolved snapshots");
         fs::write(
             &fragment,
             "---\nlinks:\n  '#3': https://example.com/pull/3\n---\n -  After.  [[#3]]\n",
@@ -13805,6 +13875,356 @@ Released previously.
         ));
     }
 
+    fn resolve_links_selection(paths: Vec<PathBuf>) -> ResolveLinksOptions {
+        ResolveLinksOptions {
+            selection: paths,
+            ..ResolveLinksOptions::default()
+        }
+    }
+
+    #[test]
+    fn resolve_links_selection_resolves_only_named_fragments() {
+        let server = TestHttpServer::spawn(vec![http_response("200 OK", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        let first_before = " -  Fixed the first path.  [[#1]]\n";
+        fs::write(&first, first_before).expect("first fragment");
+        fs::write(&second, " -  Fixed the second path.  [[#2]]\n").expect("second fragment");
+
+        let plan =
+            plan_resolve_links(&repo, resolve_links_selection(vec![second.clone()])).expect("plan");
+        assert_eq!(
+            plan.changed_fragments,
+            vec![PathBuf::from("changes.d/second.md")]
+        );
+
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        assert_eq!(fs::read_to_string(&first).expect("first"), first_before);
+        assert!(
+            fs::read_to_string(&second)
+                .expect("second")
+                .contains(&format!("{}/issues/2", server.base))
+        );
+        assert_eq!(server.finish(), vec!["HEAD /issues/2 HTTP/1.1"]);
+    }
+
+    #[test]
+    fn resolve_links_selection_reuses_a_pin_from_an_unselected_fragment() {
+        let (temp, repo) = repo_with_config(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        fs::write(&first, " -  First.  [[#1]]\n").expect("first fragment");
+        fs::write(
+            &second,
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Second.  [[#1]]\n",
+        )
+        .expect("second fragment");
+
+        let plan =
+            plan_resolve_links(&repo, resolve_links_selection(vec![first.clone()])).expect("plan");
+        assert_eq!(
+            plan.changed_fragments,
+            vec![PathBuf::from("changes.d/first.md")]
+        );
+
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        assert!(
+            fs::read_to_string(&first)
+                .expect("first")
+                .contains("https://example.com/pull/1")
+        );
+    }
+
+    #[test]
+    fn resolve_links_selection_rejects_paths_that_do_not_match_one_fragment() {
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/actual.md"),
+            " -  Fixed.  [[#1]]\n",
+        )
+        .expect("fragment");
+
+        let missing = temp.path().join("changes.d/missing.md");
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![missing.clone()]))
+            .expect_err("unknown fragment");
+        assert!(matches!(error, Error::UnknownFragment { ref path } if path == &missing));
+
+        let through_missing = temp.path().join("changes.d/missing/../actual.md");
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![through_missing]))
+            .expect_err("missing path component");
+        assert!(matches!(error, Error::UnknownFragment { .. }));
+
+        let directory = temp.path().join("changes.d");
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![directory]))
+            .expect_err("directory argument");
+        assert!(matches!(error, Error::UnknownFragment { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_links_selection_rejects_ambiguous_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config("[changelog]\nmaterialize = false\n");
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let target = temp.path().join("changes.d/target.md");
+        fs::write(&target, " -  Fixed.  [[#1]]\n").expect("fragment");
+        let alias = temp.path().join("changes.d/alias.md");
+        symlink("target.md", &alias).expect("fragment alias");
+
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![target.clone()]))
+            .expect_err("ambiguous target");
+        assert!(matches!(error, Error::AmbiguousFragment { ref path } if path == &target));
+
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![alias.clone()]))
+            .expect_err("ambiguous alias");
+        assert!(matches!(error, Error::AmbiguousFragment { ref path } if path == &alias));
+
+        let dangling = temp.path().join("changes.d/dangling.md");
+        symlink("missing.md", &dangling).expect("dangling alias");
+        let error = plan_resolve_links(&repo, resolve_links_selection(vec![dangling]))
+            .expect_err("dangling alias");
+        assert!(matches!(error, Error::UnknownFragment { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_links_selection_accepts_an_external_alias_to_a_fragment() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, repo) = repo_with_config(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        fs::write(
+            temp.path().join("changes.d/target.md"),
+            "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Fixed.  [[#1]]\n",
+        )
+        .expect("fragment");
+        let external = temp.path().join("external.md");
+        symlink("changes.d/target.md", &external).expect("external alias");
+
+        let plan = plan_resolve_links(&repo, resolve_links_selection(vec![external]))
+            .expect("external alias resolves to a fragment");
+
+        assert!(plan.changed_fragments.is_empty());
+    }
+
+    #[test]
+    fn resolve_links_selection_normalizes_a_fully_pinned_fragment() {
+        let (temp, repo) = repo_with_config(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let path = temp.path().join("changes.d/change.md");
+        fs::write(
+            &path,
+            "---\nlinks:\n  \"#1\": https://example.com/pull/1\n---\n -  Fixed.  [[#1]]\n",
+        )
+        .expect("fragment");
+
+        let plan =
+            plan_resolve_links(&repo, resolve_links_selection(vec![path.clone()])).expect("plan");
+        assert_eq!(
+            plan.changed_fragments,
+            vec![PathBuf::from("changes.d/change.md")]
+        );
+
+        apply_resolve_links(&repo, plan).expect("apply");
+        let normalized = fs::read_to_string(&path).expect("fragment");
+        assert!(normalized.contains("'#1': https://example.com/pull/1"));
+
+        let plan = plan_resolve_links(&repo, resolve_links_selection(vec![path])).expect("plan");
+        assert!(plan.changed_fragments.is_empty());
+    }
+
+    #[test]
+    fn resolve_links_selection_renders_shared_labels_without_rewriting_unselected_sources() {
+        let server = TestHttpServer::spawn(vec![
+            http_response("302 Found", Some("/pull/1")),
+            http_response("200 OK", None),
+        ]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        fs::write(&first, " -  Fixed the first path.  [[#1]]\n").expect("first fragment");
+        let second_before = " -  Fixed the second path.  [[#1]]\n";
+        fs::write(&second, second_before).expect("second fragment");
+        let compiled = compile_unreleased(&repo, CompileOptions::default()).expect("compile");
+        fs::write(
+            temp.path().join("CHANGES.md"),
+            format!("Changelog\n=========\n\n{}", compiled.markdown),
+        )
+        .expect("changelog");
+
+        let plan =
+            plan_resolve_links(&repo, resolve_links_selection(vec![first.clone()])).expect("plan");
+        apply_resolve_links(&repo, plan).expect("apply");
+
+        assert_eq!(fs::read_to_string(&second).expect("second"), second_before);
+        let changelog = fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+        assert!(changelog.contains(&format!("[#1]: {}/pull/1", server.base)));
+        assert_eq!(
+            server.finish(),
+            vec!["HEAD /issues/1 HTTP/1.1", "HEAD /pull/1 HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn resolve_links_selection_rejects_mixed_arguments_before_network_access() {
+        let (temp, repo) = repo_with_config(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+        );
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let first_before = " -  Fixed the first path.  [[#1]]\n";
+        fs::write(&first, first_before).expect("first fragment");
+        let missing = temp.path().join("changes.d/missing.md");
+
+        for paths in [
+            vec![first.clone(), missing.clone()],
+            vec![missing.clone(), first.clone()],
+        ] {
+            let error = plan_resolve_links(&repo, resolve_links_selection(paths))
+                .expect_err("mixed arguments");
+            assert!(matches!(error, Error::UnknownFragment { ref path } if path == &missing));
+            assert_eq!(fs::read_to_string(&first).expect("first"), first_before);
+        }
+    }
+
+    #[test]
+    fn resolve_links_selection_plan_rejects_a_concurrent_edit_to_an_unselected_fragment() {
+        let server = TestHttpServer::spawn(vec![http_response("200 OK", None)]);
+        let (temp, repo) = repo_with_config(&format!(
+            "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{}/issues/{{n}}\"\n",
+            server.base
+        ));
+        fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+        let first = temp.path().join("changes.d/first.md");
+        let second = temp.path().join("changes.d/second.md");
+        let first_before = " -  Fixed the first path.  [[#1]]\n";
+        fs::write(&first, first_before).expect("first fragment");
+        fs::write(&second, " -  Second fragment.\n").expect("second fragment");
+
+        let plan =
+            plan_resolve_links(&repo, resolve_links_selection(vec![first.clone()])).expect("plan");
+        let concurrent = " -  Second fragment edited concurrently.\n";
+        fs::write(&second, concurrent).expect("concurrent edit");
+
+        let error = apply_resolve_links(&repo, plan).expect_err("stale plan");
+
+        assert!(matches!(
+            error,
+            Error::StaleMutationPlan {
+                command: MutationCommand::ResolveLinks,
+                ref path,
+            } if path == Path::new("changes.d/second.md")
+        ));
+        assert_eq!(fs::read_to_string(&first).expect("first"), first_before);
+        assert_eq!(fs::read_to_string(&second).expect("second"), concurrent);
+        server.finish();
+    }
+
+    proptest! {
+        #[test]
+        fn match_fragment_selection_returns_the_requested_candidates(
+            names in prop::collection::btree_set("[a-z][a-z0-9]{0,6}", 0..8),
+        ) {
+            let candidates = names
+                .iter()
+                .map(|name| (PathBuf::from(name), vec![PathBuf::from(name)]))
+                .collect::<BTreeMap<_, _>>();
+            let requested = names
+                .iter()
+                .map(|name| (PathBuf::from(name), PathBuf::from(name)))
+                .collect::<Vec<_>>();
+
+            let selected = match_fragment_selection(&candidates, &requested)
+                .expect("selection")
+                .expect("selection present");
+            let expected = names.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+
+            prop_assert_eq!(selected, expected);
+        }
+
+        #[test]
+        fn match_fragment_selection_ignores_reordered_and_duplicate_requests(
+            names in prop::collection::btree_set("[a-z][a-z0-9]{0,6}", 1..8),
+        ) {
+            let candidates = names
+                .iter()
+                .map(|name| (PathBuf::from(name), vec![PathBuf::from(name)]))
+                .collect::<BTreeMap<_, _>>();
+            let mut requested = names
+                .iter()
+                .map(|name| (PathBuf::from(name), PathBuf::from(name)))
+                .collect::<Vec<_>>();
+            requested.extend(requested.clone());
+            requested.reverse();
+
+            let selected = match_fragment_selection(&candidates, &requested)
+                .expect("selection")
+                .expect("selection present");
+            let expected = names.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+
+            prop_assert_eq!(selected, expected);
+        }
+
+        #[test]
+        fn match_fragment_selection_rejects_unknown_identities(
+            names in prop::collection::btree_set("[a-z][a-z0-9]{0,6}", 0..8),
+            unknown in "[A-Z][A-Z0-9]{0,6}",
+        ) {
+            let candidates = names
+                .iter()
+                .map(|name| (PathBuf::from(name), vec![PathBuf::from(name)]))
+                .collect::<BTreeMap<_, _>>();
+            let requested = vec![(PathBuf::from(&unknown), PathBuf::from(&unknown))];
+
+            let error = match_fragment_selection(&candidates, &requested)
+                .expect_err("unknown identity");
+            let unknown = matches!(error, Error::UnknownFragment { .. });
+
+            prop_assert!(unknown);
+        }
+
+        #[test]
+        fn match_fragment_selection_rejects_ambiguous_identities(
+            name in "[a-z][a-z0-9]{0,6}",
+        ) {
+            let identity = PathBuf::from(&name);
+            let candidates = BTreeMap::from([(
+                identity.clone(),
+                vec![
+                    PathBuf::from(format!("{name}-a.md")),
+                    PathBuf::from(format!("{name}-b.md")),
+                ],
+            )]);
+            let requested = vec![(identity, PathBuf::from(format!("{name}.md")))];
+
+            let error = match_fragment_selection(&candidates, &requested)
+                .expect_err("ambiguous identity");
+            let ambiguous = matches!(error, Error::AmbiguousFragment { .. });
+
+            prop_assert!(ambiguous);
+        }
+    }
+
     #[test]
     fn resolved_sync_rejects_next_file_changed_after_version_snapshot() {
         let (temp, repo) = repo_with_config(
@@ -13830,7 +14250,10 @@ Released previously.
 
         let plan = plan_resolve_links_with_snapshot_hook(
             &repo,
-            ResolveLinksOptions { force: true },
+            ResolveLinksOptions {
+                force: true,
+                ..ResolveLinksOptions::default()
+            },
             || fs::write(&next, "0.3.0\n").expect("concurrent next"),
         )
         .expect("plan");

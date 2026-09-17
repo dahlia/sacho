@@ -104,7 +104,7 @@ change in a noninteractive process.
 ---------------------
 
 ~~~~ text
-sacho resolve-links
+sacho resolve-links [FRAGMENT]...
 ~~~~
 
 Follows redirects for every unpinned fragment reference and records each final
@@ -112,6 +112,14 @@ URL in that fragment's frontmatter. Existing pins are not requested again.
 When materialization is enabled, the changelog is synchronized in the same
 failure-safe operation. A network or validation failure leaves every file
 unchanged.
+
+One or more `FRAGMENT` arguments restrict the command to those fragment files,
+interpreted like any other path (relative to the working directory, or
+absolute). Without arguments it resolves every fragment. Selection limits which
+fragments are fetched and rewritten; Sacho still parses and validates every
+fragment, so an unselected fragment with an invalid shape or a conflicting pin
+still fails the command. A path that does not match exactly one discovered
+fragment is an error.
 
 
 `sacho preview`
