@@ -16,7 +16,7 @@ use sacho::commands::{
     compile_unreleased_with_link_resolution, infer_repository_url, infer_section_paths,
     infer_section_pattern, init_repository, initialization_root, mercurial_update_hook,
     plan_format, plan_import_unreleased, plan_release, plan_release_with_link_resolution,
-    plan_resolve_links, plan_sync, reference_transaction_hook, set_next_version, show,
+    plan_resolve_links, plan_sync, reference_transaction_hook, set_next_version, shell_quote, show,
     suggest_section_directory_avoiding,
 };
 use sacho::link_resolution::LinkResolutionPolicy;
@@ -125,7 +125,14 @@ enum Command {
     Fmt,
 
     /// Resolve and pin unpinned reference links.
-    ResolveLinks,
+    ResolveLinks {
+        /// Fragment files to resolve. Resolves every fragment when omitted.
+        #[arg(
+            value_name = "FRAGMENT",
+            help = "Fragment files to resolve; resolves every fragment when omitted"
+        )]
+        fragments: Vec<PathBuf>,
+    },
 
     /// Print the compiled unreleased region.
     Preview {
@@ -333,8 +340,8 @@ impl Cli {
                     let prepared = plan_format(&repo, FormatOptions)?;
                     if !confirm_sync_plan(
                         &prepared.sync,
+                        sync_force_command(LinkResolutionPolicy::Configured),
                         Some("sacho check --fix"),
-                        LinkResolutionPolicy::Configured,
                     )? {
                         return Ok(ExitCode::from(2));
                     }
@@ -356,8 +363,8 @@ impl Cli {
                 let plan = plan_format(&repo, FormatOptions)?;
                 if !confirm_sync_plan(
                     &plan.sync,
+                    sync_force_command(LinkResolutionPolicy::Configured),
                     Some("sacho fmt"),
-                    LinkResolutionPolicy::Configured,
                 )? {
                     return Ok(ExitCode::from(2));
                 }
@@ -365,13 +372,22 @@ impl Cli {
                 print_mutation_cleanup_warnings("sacho fmt", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
-            Command::ResolveLinks => {
+            Command::ResolveLinks { fragments } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let plan = plan_resolve_links(&repo, ResolveLinksOptions::default())?;
+                let rerun = resolve_links_recovery_command(&fragments).unwrap_or_else(|| {
+                    String::from("sacho resolve-links with the same fragment arguments")
+                });
+                let plan = plan_resolve_links(
+                    &repo,
+                    ResolveLinksOptions {
+                        selection: fragments,
+                        ..ResolveLinksOptions::default()
+                    },
+                )?;
                 if !confirm_sync_plan(
                     &plan.sync,
-                    Some("sacho resolve-links"),
-                    LinkResolutionPolicy::Configured,
+                    "sacho sync --no-resolve-links --force",
+                    Some(&rerun),
                 )? {
                     return Ok(ExitCode::from(2));
                 }
@@ -429,15 +445,21 @@ impl Cli {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
                 let policy = link_resolution_policy(resolve_links, no_resolve_links);
                 if policy.is_enabled(repo.config()) {
-                    let plan = plan_resolve_links(&repo, ResolveLinksOptions { force })?;
-                    if !confirm_sync_plan(&plan.sync, None, policy)? {
+                    let plan = plan_resolve_links(
+                        &repo,
+                        ResolveLinksOptions {
+                            force,
+                            ..ResolveLinksOptions::default()
+                        },
+                    )?;
+                    if !confirm_sync_plan(&plan.sync, sync_force_command(policy), None)? {
                         return Ok(ExitCode::from(2));
                     }
                     let result = apply_resolve_links(&repo, plan)?;
                     print_resolve_links_result(&repo, "sacho sync", result);
                 } else {
                     let plan = plan_sync(&repo, SyncOptions { force })?;
-                    if !confirm_sync_plan(&plan, None, policy)? {
+                    if !confirm_sync_plan(&plan, sync_force_command(policy), None)? {
                         return Ok(ExitCode::from(2));
                     }
                     apply_sync(&repo, plan)?;
@@ -614,8 +636,8 @@ fn print_check_report(report: CheckReport, show_skipped: bool) -> ExitCode {
 
 fn confirm_sync_plan(
     plan: &SyncPlan,
-    formatting_command: Option<&str>,
-    link_policy: LinkResolutionPolicy,
+    force_command: &str,
+    rerun_command: Option<&str>,
 ) -> Result<bool, CliReport> {
     let SyncPlan::NeedsConfirmation { diff, .. } = plan else {
         return Ok(true);
@@ -632,13 +654,12 @@ fn confirm_sync_plan(
         eprintln!(
             "the synchronization shown above replaces the materialized unreleased region and may discard hand edits"
         );
-        let sync_command = sync_force_command(link_policy);
-        if let Some(command) = formatting_command {
+        if let Some(command) = rerun_command {
             eprintln!(
-                "run `{sync_command}`, then rerun `{command}` to apply all fixes non-interactively"
+                "run `{force_command}`, then rerun `{command}` to apply all fixes non-interactively"
             );
         } else {
-            eprintln!("rerun with `{sync_command}` to apply it non-interactively");
+            eprintln!("rerun with `{force_command}` to apply it non-interactively");
         }
         return Ok(false);
     }
@@ -656,6 +677,18 @@ fn sync_force_command(policy: LinkResolutionPolicy) -> &'static str {
         LinkResolutionPolicy::Never => "sacho sync --no-resolve-links --force",
         LinkResolutionPolicy::Configured => "sacho sync --force",
     }
+}
+
+fn resolve_links_recovery_command(selection: &[PathBuf]) -> Option<String> {
+    if selection.is_empty() {
+        return Some(String::from("sacho resolve-links"));
+    }
+    let mut command = String::from("sacho resolve-links --");
+    for path in selection {
+        command.push(' ');
+        command.push_str(&shell_quote(path.to_str()?));
+    }
+    Some(command)
 }
 
 fn link_resolution_policy(resolve_links: bool, no_resolve_links: bool) -> LinkResolutionPolicy {
@@ -1265,5 +1298,32 @@ mod tests {
             .manual_actions_required
             .push(String::from("configure merge driver"));
         assert!(!init_result_has_no_actions(&result));
+    }
+
+    #[test]
+    fn resolve_links_recovery_command_quotes_and_terminates_the_selection() {
+        assert_eq!(
+            resolve_links_recovery_command(&[]).as_deref(),
+            Some("sacho resolve-links")
+        );
+        assert_eq!(
+            resolve_links_recovery_command(&[PathBuf::from("-fix.md")]).as_deref(),
+            Some("sacho resolve-links -- -fix.md")
+        );
+        assert_eq!(
+            resolve_links_recovery_command(&[PathBuf::from("a b.md")]).as_deref(),
+            Some("sacho resolve-links -- 'a b.md'")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_links_recovery_command_refuses_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(OsStr::from_bytes(b"changes.d/\xff.md"));
+
+        assert_eq!(resolve_links_recovery_command(&[path]), None);
     }
 }

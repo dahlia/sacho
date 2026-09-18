@@ -1157,6 +1157,43 @@ fn sync_resolve_links_pins_fragments_without_materialization() {
 }
 
 #[test]
+fn sync_resolve_links_force_applies_a_hand_edited_changelog() {
+    let (base, request) = one_request_http_server();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        format!("[links]\n\"#\" = \"{base}/issues/{{n}}\"\n"),
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    let path = temp.path().join("changes.d/change.md");
+    std::fs::write(&path, " -  Fixed sync links.  [[#1]]\n").expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["sync", "--resolve-links", "--force"])
+        .assert()
+        .success()
+        .stdout("changes.d/change.md\nCHANGES.md\n");
+
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("fragment")
+            .contains(&format!("{base}/issues/1"))
+    );
+    let changelog = std::fs::read_to_string(temp.path().join("CHANGES.md")).expect("changelog");
+    assert!(changelog.contains(&format!("[#1]: {base}/issues/1")));
+    assert!(!changelog.contains("Hand-edited note."));
+    assert_eq!(request.join().expect("server"), "HEAD /issues/1 HTTP/1.1");
+}
+
+#[test]
 fn release_resolve_links_uses_the_resolving_plan() {
     let (base, requests) = redirecting_http_server();
     let temp = tempfile::TempDir::new().expect("tempdir");
@@ -1259,6 +1296,121 @@ fn resolve_links_command_reports_the_materialized_changelog() {
 }
 
 #[test]
+fn resolve_links_command_resolves_only_the_selected_fragment() {
+    let (base, request) = one_request_http_server();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        format!("[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"{base}/issues/{{n}}\"\n"),
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    let first = temp.path().join("changes.d/first.md");
+    let second = temp.path().join("changes.d/second.md");
+    let first_before = " -  Fixed the first path.  [[#1]]\n";
+    std::fs::write(&first, first_before).expect("first fragment");
+    std::fs::write(&second, " -  Fixed the second path.  [[#2]]\n").expect("second fragment");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["resolve-links", "changes.d/second.md"])
+        .assert()
+        .success()
+        .stdout("changes.d/second.md\n");
+
+    assert_eq!(
+        std::fs::read_to_string(&first).expect("first fragment"),
+        first_before
+    );
+    assert!(
+        std::fs::read_to_string(&second)
+            .expect("second fragment")
+            .contains(&format!("{base}/issues/2"))
+    );
+    assert_eq!(request.join().expect("server"), "HEAD /issues/2 HTTP/1.1");
+}
+
+#[test]
+fn resolve_links_command_rejects_an_unknown_fragment() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["resolve-links", "changes.d/missing.md"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown fragment"))
+        .stderr(predicate::str::contains("changes.d/missing.md"));
+}
+
+#[test]
+fn resolve_links_command_accepts_an_absolute_fragment_path() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n\n[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    let fragment = temp.path().join("changes.d/change.md");
+    std::fs::write(
+        &fragment,
+        "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Fixed.  [[#1]]\n",
+    )
+    .expect("fragment");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["resolve-links"])
+        .arg(&fragment)
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn resolve_links_command_recovery_preserves_the_selection() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[links]\n\"#\" = \"http://127.0.0.1:1/issues/{n}\"\n",
+    )
+    .expect("config");
+    std::fs::create_dir_all(temp.path().join("changes.d")).expect("fragments dir");
+    std::fs::write(
+        temp.path().join("changes.d/name with space.md"),
+        "---\nlinks:\n  '#1': https://example.com/pull/1\n---\n -  Fixed.  [[#1]]\n",
+    )
+    .expect("fragment");
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Unreleased\n----------\n\nTo be released.\n\nHand-edited note.\n",
+    )
+    .expect("changelog");
+
+    Command::cargo_bin("sacho")
+        .expect("binary")
+        .current_dir(temp.path())
+        .args(["resolve-links", "changes.d/name with space.md"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "sacho sync --no-resolve-links --force",
+        ))
+        .stderr(predicate::str::contains("sacho resolve-links --"))
+        .stderr(predicate::str::contains("'changes.d/name with space.md'"));
+}
+
+#[test]
 fn preview_rejects_unknown_section() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(temp.path().join("sacho.toml"), "").expect("config");
@@ -1315,7 +1467,8 @@ fn resolve_links_help_describes_persistent_resolution() {
         .success()
         .stdout(predicate::str::contains(
             "Resolve and pin unpinned reference links",
-        ));
+        ))
+        .stdout(predicate::str::contains("Fragment files to resolve"));
 }
 
 #[test]

@@ -277,6 +277,23 @@ pub enum Error {
         section: String,
     },
 
+    /// A requested fragment path does not match any discovered fragment.
+    #[snafu(display("unknown fragment {}", path.display()))]
+    UnknownFragment {
+        /// Fragment path supplied by the caller.
+        path: PathBuf,
+    },
+
+    /// A requested fragment path identifies more than one discovered fragment.
+    #[snafu(display(
+        "ambiguous fragment path {}: it identifies more than one discovered fragment",
+        path.display()
+    ))]
+    AmbiguousFragment {
+        /// Fragment path supplied by the caller.
+        path: PathBuf,
+    },
+
     /// A section was required but omitted by the caller.
     #[snafu(display("section is required because this repository configures sections"))]
     MissingSection,
