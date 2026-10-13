@@ -119,7 +119,7 @@ pub fn replace_unreleased_region(
 
 /// Finds all version-like headings outside code blocks.
 pub(crate) fn version_heading_spans(source: &str) -> Vec<VersionHeadingSpan> {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     heading_candidates(&lines)
         .candidates
         .into_iter()
@@ -191,7 +191,7 @@ fn find_heading_region(
     source: &str,
     unreleased_heading: &str,
 ) -> std::result::Result<UnreleasedRegionSpan, ChangelogError> {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     let scan = heading_candidates(&lines);
     for (index, candidate) in scan.candidates.iter().enumerate() {
         let Some(date_line) = next_non_empty_line(&lines, candidate.after_line) else {
@@ -223,7 +223,7 @@ fn find_heading_region(
 fn find_marker_region(source: &str) -> std::result::Result<UnreleasedRegionSpan, ChangelogError> {
     let mut begin = None;
     let mut end = None;
-    for line in source_lines(source) {
+    for line in source_lines_without_introductions(source) {
         match line.text {
             BEGIN_MARKER => {
                 if begin.is_some() {
@@ -301,6 +301,19 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
         start = end;
     }
     lines
+}
+
+fn source_lines_without_introductions(source: &str) -> Vec<SourceLine<'_>> {
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
+    source_lines(source)
+        .into_iter()
+        .map(|mut line| {
+            if introductions.contains(line.start) {
+                line.text = "";
+            }
+            line
+        })
+        .collect()
 }
 
 fn heading_candidates(lines: &[SourceLine<'_>]) -> HeadingScan {

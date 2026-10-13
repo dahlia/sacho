@@ -345,6 +345,10 @@ pub struct ResolveLinksResult {
 /// Options for planning a release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseOptions {
+    /// Inline Markdown appended to the release date paragraph.
+    pub note: Option<String>,
+    /// Markdown blocks inserted before the released change items.
+    pub intro: Option<String>,
     /// Explicit version to release.
     pub version: Option<String>,
     /// Calendar date to record for the release.
@@ -1932,6 +1936,7 @@ pub fn show(repo: &Repository, options: ShowOptions) -> Result<ReleasedSection> 
         unreleased_region,
         options.skip_heading,
         options.word_wrap,
+        &config.title,
     )?
     .ok_or(Error::ReleasedVersionNotFound {
         version: options.version,
@@ -2257,6 +2262,7 @@ pub fn plan_release_with_link_resolution(
     repo: &Repository,
     options: ReleaseOptions,
 ) -> Result<ReleasePlan> {
+    crate::release_context::validate(options.note.as_deref(), options.intro.as_deref())?;
     let resolved = prepare_resolved_fragments(repo, None, &[])?;
     plan_release_with_resolved_fragments(repo, options, Some(resolved))
 }
@@ -2266,6 +2272,7 @@ fn plan_release_with_resolved_fragments(
     options: ReleaseOptions,
     resolved: Option<Vec<ResolvedFragmentSnapshot>>,
 ) -> Result<ReleasePlan> {
+    crate::release_context::validate(options.note.as_deref(), options.intro.as_deref())?;
     let _lock = acquire_mutation_lock(repo)?;
 
     let changelog_path = repo.config().changelog.path.clone();
@@ -2381,45 +2388,86 @@ fn plan_release_with_resolved_fragments(
     if compiled.substantive_item_count == 0 && !options.allow_empty && !is_initial_release {
         return Err(Error::EmptyRelease);
     }
-    let released_markdown = released_markdown(&compiled.markdown, &version, date, repo);
+    let baseline_markdown = released_markdown(&compiled.markdown, &version, date, repo);
+    let note = crate::release_context::note_text(options.note.as_deref());
+    let intro = crate::release_context::intro_text(options.intro.as_deref());
+    let raw_markdown = assemble_release_context(&baseline_markdown, note, intro)?;
+    let released_markdown = if note.is_some() || intro.is_some() {
+        format_markdown(&raw_markdown)?
+    } else {
+        baseline_markdown.clone()
+    };
     let next = options
         .next
         .map(|next| next.trim().to_owned())
         .filter(|next| !next.is_empty());
-    let new_changelog = if repo.config().changelog.materialize {
-        let next_unreleased = next
-            .as_deref()
-            .map(|next| empty_unreleased_markdown(repo, next));
-        if unreleased_region.is_some() {
-            replace_region_for_release(
+    let insert = |released_markdown: &str| -> Result<String> {
+        Ok(if repo.config().changelog.materialize {
+            let next_unreleased = next
+                .as_deref()
+                .map(|next| empty_unreleased_markdown(repo, next));
+            if unreleased_region.is_some() {
+                replace_region_for_release(
+                    &old_changelog,
+                    next_unreleased.as_deref(),
+                    released_markdown,
+                    repo.config().changelog.region_detection,
+                    &repo.config().changelog.unreleased_heading,
+                    &repo.config().changelog.title,
+                )
+                .map_err(|source| changelog_error(changelog_path.clone(), source))?
+            } else {
+                let released = insert_released_section(
+                    &old_changelog,
+                    released_markdown,
+                    &repo.config().changelog.title,
+                );
+                match next_unreleased {
+                    Some(unreleased) => insert_unreleased_region(
+                        &released,
+                        &unreleased,
+                        &repo.config().changelog.title,
+                    ),
+                    None => released,
+                }
+            }
+        } else {
+            insert_released_section(
                 &old_changelog,
-                next_unreleased.as_deref(),
-                &released_markdown,
-                repo.config().changelog.region_detection,
-                &repo.config().changelog.unreleased_heading,
+                released_markdown,
                 &repo.config().changelog.title,
             )
-            .map_err(|source| changelog_error(changelog_path.clone(), source))?
-        } else {
-            let released = insert_released_section(
-                &old_changelog,
-                &released_markdown,
-                &repo.config().changelog.title,
-            );
-            match next_unreleased {
-                Some(unreleased) => {
-                    insert_unreleased_region(&released, &unreleased, &repo.config().changelog.title)
-                }
-                None => released,
-            }
-        }
-    } else {
-        insert_released_section(
-            &old_changelog,
-            &released_markdown,
-            &repo.config().changelog.title,
-        )
+        })
     };
+    let new_changelog = insert(&released_markdown)?;
+    if note.is_some() || intro.is_some() {
+        let baseline = insert(&baseline_markdown)?;
+        let raw = insert(&raw_markdown)?;
+        crate::release_context::validate_meaning(
+            &baseline,
+            crate::released::release_range(&baseline, &version, &repo.config().changelog.title)?,
+            &raw,
+            crate::released::release_range(&raw, &version, &repo.config().changelog.title)?,
+            &new_changelog,
+            crate::released::release_range(
+                &new_changelog,
+                &version,
+                &repo.config().changelog.title,
+            )?,
+            intro,
+        )
+        .map_err(|error| match error {
+            Error::InvalidReleaseContext { option, message }
+                if option == "release introduction" =>
+            {
+                Error::InvalidReleaseContext {
+                    option: "--intro-file".to_owned(),
+                    message,
+                }
+            }
+            error => error,
+        })?;
+    }
     validate_released_link_targets(
         &old_changelog,
         &new_changelog,
@@ -5490,6 +5538,48 @@ fn released_markdown(
     markdown.push('\n');
     markdown = markdown.replacen(unreleased_date, &released_date, 1);
     markdown
+}
+
+fn assemble_release_context(
+    baseline: &str,
+    note: Option<&str>,
+    intro: Option<&str>,
+) -> Result<String> {
+    if note.is_none() && intro.is_none() {
+        return Ok(baseline.to_owned());
+    }
+    let arena = Arena::new();
+    let root = parse_document(&arena, baseline, &crate::release_context::options());
+    let date = root
+        .children()
+        .find(|node| matches!(node.data().value, NodeValue::Paragraph))
+        .ok_or_else(|| Error::InvalidReleaseContext {
+            option: "release date".to_owned(),
+            message: "missing date paragraph".to_owned(),
+        })?;
+    let end_line = date.data().sourcepos.end.line;
+    let offset: usize = baseline
+        .split_inclusive('\n')
+        .take(end_line)
+        .map(str::len)
+        .sum();
+    let prefix = baseline[..offset].trim_end_matches(['\n', '\r']);
+    let mut result = prefix.to_owned();
+    if let Some(note) = note {
+        result.push_str("  ");
+        result.push_str(note);
+    }
+    result.push_str("\n\n");
+    if let Some(intro) = intro {
+        result.push_str(crate::release_context::INTRO_BEGIN);
+        result.push_str("\n\n");
+        result.push_str(intro.trim_end_matches(['\n', '\r']));
+        result.push_str("\n\n");
+        result.push_str(crate::release_context::INTRO_END);
+        result.push_str("\n\n");
+    }
+    result.push_str(baseline[offset..].trim_start_matches(['\n', '\r']));
+    Ok(result)
 }
 
 fn empty_unreleased_markdown(repo: &Repository, next: &str) -> String {
@@ -9904,6 +9994,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -9945,6 +10037,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -9990,6 +10084,8 @@ links:
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10024,6 +10120,8 @@ links:
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -10060,6 +10158,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.1.0")),
@@ -10094,6 +10194,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.0.0")),
                 date: release_date(),
                 next: None,
@@ -10128,6 +10230,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.0.0")),
                 date: release_date(),
                 next: None,
@@ -10161,6 +10265,8 @@ links:
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.1.0")),
                 date: release_date(),
                 next: None,
@@ -10186,6 +10292,8 @@ links:
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10224,6 +10332,8 @@ links:
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10262,6 +10372,8 @@ links:
         let plan = plan_release_with_link_resolution(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10315,6 +10427,8 @@ links:
         let plan = plan_release_with_link_resolution(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10374,6 +10488,8 @@ Released previously.
         let error = plan_release_with_link_resolution(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10428,6 +10544,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("2.0.0")),
                 date: release_date(),
                 next: None,
@@ -10473,6 +10591,8 @@ Released previously.
         let error = plan_release_with_resolved_fragments(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10502,6 +10622,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10526,6 +10648,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10556,6 +10680,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -10595,6 +10721,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10621,6 +10749,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -10663,6 +10793,8 @@ Released previously.
             let plan = plan_release(
                 &repo,
                 ReleaseOptions {
+                    note: None,
+                    intro: None,
                     version: Some(String::from("1.2.0")),
                     date: release_date(),
                     next: None,
@@ -10700,6 +10832,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10736,6 +10870,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("  ")),
@@ -10776,6 +10912,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10818,6 +10956,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -10859,6 +10999,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -10900,6 +11042,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -10943,6 +11087,8 @@ Released previously.
             let plan = plan_release(
                 &repo,
                 ReleaseOptions {
+                    note: None,
+                    intro: None,
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
@@ -10982,6 +11128,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11028,6 +11176,8 @@ Released previously.
             let plan = plan_release(
                 &repo,
                 ReleaseOptions {
+                    note: None,
+                    intro: None,
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
@@ -11065,6 +11215,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11112,6 +11264,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11168,6 +11322,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11224,6 +11380,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11278,6 +11436,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11331,6 +11491,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11376,6 +11538,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11415,6 +11579,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11462,6 +11628,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11509,6 +11677,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11553,6 +11723,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11599,6 +11771,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11642,6 +11816,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11689,6 +11865,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -11739,6 +11917,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11786,6 +11966,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11832,6 +12014,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11885,6 +12069,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -11928,6 +12114,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -11980,6 +12168,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12030,6 +12220,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12066,6 +12258,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12107,6 +12301,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12160,6 +12356,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12231,6 +12429,8 @@ Released previously.
         let mut plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12270,6 +12470,8 @@ Released previously.
         let mut plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12314,6 +12516,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12352,6 +12556,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12390,6 +12596,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: Some(String::from("1.3.0")),
@@ -12457,6 +12665,8 @@ Released previously.
         assert_mutation_locked(plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -12811,6 +13021,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -12937,6 +13149,8 @@ Released previously.
             let plan = plan_release(
                 &repo,
                 ReleaseOptions {
+                    note: None,
+                    intro: None,
                     version: None,
                     date: release_date(),
                     next: Some(String::from("1.3.0")),
@@ -12972,6 +13186,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -13010,6 +13226,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -13043,6 +13261,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -13073,6 +13293,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -13114,6 +13336,8 @@ Released previously.
         let plan = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.0")),
                 date: release_date(),
                 next: None,
@@ -13142,6 +13366,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: Some(String::from("1.2.1")),
                 date: release_date(),
                 next: None,
@@ -13168,6 +13394,8 @@ Released previously.
         let error = plan_release(
             &repo,
             ReleaseOptions {
+                note: None,
+                intro: None,
                 version: None,
                 date: release_date(),
                 next: None,
@@ -13252,6 +13480,8 @@ Released previously.
             let error = plan_release(
                 &repo,
                 ReleaseOptions {
+                    note: None,
+                    intro: None,
                     version: Some(String::from("1.2.0")),
                     date,
                     next: None,

@@ -26,6 +26,7 @@ pub mod link_resolution;
 pub mod markdown;
 /// Changelog merge driver types.
 pub mod merge;
+mod release_context;
 /// Released changelog parsing types.
 pub mod released;
 /// Repository discovery and path helpers.

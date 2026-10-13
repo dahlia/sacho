@@ -178,6 +178,7 @@ Resolved fragment pins and changelog output are committed atomically.
 
 ~~~~ text
 sacho release [--date <DATE>] [--next <NEXT>] [--allow-empty]
+              [--note <TEXT>] [--intro-file <PATH>]
               [--resolve-links | --no-resolve-links] [VERSION]
 ~~~~
 
@@ -186,14 +187,16 @@ fragments. Without `--next`, it also removes the next-version file and closes
 the materialized unreleased region. With `--next`, it opens the following cycle
 in the same operation.
 
-| Argument or option   | Meaning                                                                |
-| -------------------- | ---------------------------------------------------------------------- |
-| `VERSION`            | Version to release. Defaults to the next-version file.                 |
-| `--date <DATE>`      | Release date in `YYYY-MM-DD` form. Defaults to the current local date. |
-| `--next <NEXT>`      | Open this next version immediately after the release.                  |
-| `--allow-empty`      | Allow a release without substantive changelog items.                   |
-| `--resolve-links`    | Resolve unpinned links before compiling the release.                   |
-| `--no-resolve-links` | Disable configured link resolution for this release.                   |
+| Argument or option    | Meaning                                                                |
+| --------------------- | ---------------------------------------------------------------------- |
+| `VERSION`             | Version to release. Defaults to the next-version file.                 |
+| `--date <DATE>`       | Release date in `YYYY-MM-DD` form. Defaults to the current local date. |
+| `--next <NEXT>`       | Open this next version immediately after the release.                  |
+| `--allow-empty`       | Allow a release without substantive changelog items.                   |
+| `--note <TEXT>`       | Append inline Markdown to the release date paragraph.                  |
+| `--intro-file <PATH>` | Insert UTF-8 Markdown before change items; `-` reads standard input.   |
+| `--resolve-links`     | Resolve unpinned links before compiling the release.                   |
+| `--no-resolve-links`  | Disable configured link resolution for this release.                   |
 
 When both `VERSION` and the next-version file contain values, they must agree.
 The first release may have no fragments when the changelog has no released
@@ -202,6 +205,23 @@ fragments contain no substantive changelog items unless `--allow-empty` is
 passed. Empty list items, whitespace, and complete HTML comments do not make a
 release nonempty; scaffold-only fragments still require the explicit option,
 even for the first release.
+
+`--note` accepts one paragraph without embedded line breaks and preserves the
+supplied punctuation. Use `--note=TEXT` for text beginning with a hyphen.
+`--intro-file` accepts Markdown blocks, with top-level headings restricted to
+level three or deeper. Relative paths use the process's working directory;
+`./-` reads a file named `-`. Each option accepts one value and cannot be
+repeated. Whitespace-only values are ignored.
+
+Hongdown formats the new release section after both additions. Reserved Sacho
+boundary comments and definitions that change existing content are errors,
+reported before repository files are changed. Notes and introductions do not
+satisfy the substantive-item requirement. See
+[Making releases](../guide/releases.md) for examples.
+
+`show` includes both additions and hides the stored introduction boundary
+comments. `carry` excludes the introduction, including its lists and
+section-like headings, and carries only the change items.
 
 The default release output is suitable for committing and tagging as a
 released-only changelog. Run `sacho next <version>` after the tag to open the

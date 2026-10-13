@@ -18,6 +18,7 @@ use crate::fragment::{
     render_item_with_configured_markers, replace_configured_link_markers,
 };
 use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_word_wrap};
+use crate::release_context::line_starts;
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolver, has_sections};
 
@@ -127,8 +128,9 @@ struct SectionCandidateRegion {
 ///
 /// Candidates from a region containing `unreleased_heading` are ordered before
 /// candidates found only in released history. Within each group, candidates
-/// retain their first-appearance order. Callers must still ask a person which
-/// headings represent stable repository sections because change categories
+/// retain their first-appearance order. Release introduction blocks are excluded.
+/// Callers must still ask a person which headings represent stable repository
+/// sections because change categories
 /// such as `Added` have the same Markdown shape.
 pub fn discover_section_candidates(
     changelog: &str,
@@ -137,11 +139,17 @@ pub fn discover_section_candidates(
 ) -> Vec<ChangelogSectionCandidate> {
     let arena = Arena::new();
     let root = parse_document(&arena, changelog, &comrak_options());
+    let starts = line_starts(changelog);
+    let mut introductions = crate::release_context::IntroductionMask::new(changelog);
     let mut regions = Vec::<SectionCandidateRegion>::new();
     let mut current = None;
     let mut first_heading = true;
 
     for child in root.children() {
+        let offset = crate::release_context::node_offset(&starts, child);
+        if introductions.contains(offset) {
+            continue;
+        }
         match &child.data().value {
             NodeValue::Heading(heading) => {
                 let text = plain_text(child).trim().to_owned();
@@ -205,11 +213,11 @@ pub fn discover_section_candidates(
 
 /// Parses a released version section and returns deterministic carry fragments.
 pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Result<CarriedRelease> {
-    let target = find_target_section(changelog, version, None).ok_or_else(|| {
-        Error::ReleasedVersionNotFound {
-            version: version.to_owned(),
-        }
-    })?;
+    let target =
+        find_target_section_with_title(changelog, version, None, &repo.config().changelog.title)
+            .ok_or_else(|| Error::ReleasedVersionNotFound {
+                version: version.to_owned(),
+            })?;
     let entries = parse_entries(repo, changelog, target.body_start..target.end)?;
     let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
@@ -433,7 +441,7 @@ pub fn has_released_sections(
     unreleased_region: Option<UnreleasedRegionSpan>,
     document_title: &str,
 ) -> bool {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     let document_title_start =
         matching_document_title(&lines, document_title).map(|heading| heading.start);
     version_heading_candidates(&lines)
@@ -460,8 +468,11 @@ pub(crate) fn render_released_section(
     unreleased_region: Option<UnreleasedRegionSpan>,
     skip_heading: bool,
     word_wrap: bool,
+    document_title: &str,
 ) -> Result<Option<ReleasedSection>> {
-    let Some(target) = find_target_section(source, version, unreleased_region) else {
+    let Some(target) =
+        find_target_section_with_title(source, version, unreleased_region, document_title)
+    else {
         return Ok(None);
     };
     let markdown = render_target_section(source, &target, skip_heading, word_wrap)?;
@@ -482,12 +493,15 @@ fn render_target_section(
     let document = parse_document(&arena, source, &options);
     let section = arena.alloc(NodeValue::Document.into());
     let line_starts = line_starts(source);
+    let intro =
+        crate::release_context::introduction(&line_starts, document, target.start..target.end)?;
     let mut nodes = document
         .children()
         .filter(|node| {
             sourcepos_start_offset(&line_starts, node.data().sourcepos.start)
                 .is_some_and(|start| (target.start..target.end).contains(&start))
         })
+        .filter(|node| !(intro.is_some() && crate::release_context::marker(node).is_some()))
         .collect::<Vec<_>>();
     if skip_heading
         && nodes
@@ -670,12 +684,43 @@ fn append_ordinary_reference_definition(markdown: &mut String, reference: &Ordin
     markdown.push('\n');
 }
 
+pub(crate) fn release_range(
+    source: &str,
+    version: &str,
+    document_title: &str,
+) -> Result<Range<usize>> {
+    find_target_section_with_title(source, version, None, document_title)
+        .map(|target| target.start..target.end)
+        .ok_or_else(|| Error::ReleasedVersionNotFound {
+            version: version.to_owned(),
+        })
+}
+
+fn find_target_section_with_title(
+    source: &str,
+    version: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+    document_title: &str,
+) -> Option<TargetSection> {
+    let offset = insertion_title_span(source, document_title).map_or(0, |span| span.end);
+    let region = unreleased_region.map(|span| UnreleasedRegionSpan {
+        start: span.start.saturating_sub(offset),
+        end: span.end.saturating_sub(offset),
+    });
+    let target = find_target_section(&source[offset..], version, region)?;
+    Some(TargetSection {
+        start: offset + target.start,
+        body_start: offset + target.body_start,
+        end: offset + target.end,
+    })
+}
+
 fn find_target_section(
     source: &str,
     version: &str,
     unreleased_region: Option<UnreleasedRegionSpan>,
 ) -> Option<TargetSection> {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     let candidates = version_heading_candidates(&lines);
     let target = format!("Version {version}");
     for (index, candidate) in candidates.iter().enumerate() {
@@ -713,11 +758,17 @@ fn parse_entries(
     let line_starts = line_starts(document);
     let mut entries = Vec::new();
     let mut current_section = None;
+    let intro = crate::release_context::introduction(&line_starts, root, body.clone())?;
 
     for child in root.children().filter(|child| {
         sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
             .is_some_and(|start| body.contains(&start))
     }) {
+        if intro.as_ref().is_some_and(|span| {
+            span.contains(&crate::release_context::node_offset(&line_starts, child))
+        }) {
+            continue;
+        }
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
@@ -971,6 +1022,19 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
     lines
 }
 
+fn source_lines_without_introductions(source: &str) -> Vec<SourceLine<'_>> {
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
+    source_lines(source)
+        .into_iter()
+        .map(|mut line| {
+            if introductions.contains(line.start) {
+                line.text = "";
+            }
+            line
+        })
+        .collect()
+}
+
 fn version_heading_candidates<'a>(lines: &'a [SourceLine<'a>]) -> Vec<VersionHeading<'a>> {
     let mut headings = Vec::new();
     let mut code_fence = None;
@@ -1201,16 +1265,6 @@ fn strip_atx_closing_sequence(text: &str) -> &str {
     }
 }
 
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (index, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
-}
-
 fn sourcepos_start_offset(
     line_starts: &[usize],
     position: comrak::nodes::LineColumn,
@@ -1242,13 +1296,8 @@ fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
 }
 
 fn comrak_options() -> ComrakOptions<'static> {
-    let mut options = ComrakOptions::default();
-    options.extension.table = true;
-    options.extension.description_lists = true;
-    options.extension.alerts = true;
-    options.extension.footnotes = true;
-    options.extension.tasklist = true;
-    options.extension.math_dollars = true;
+    let mut options = crate::release_context::options();
+    options.parse.leave_footnote_definitions = false;
     options
 }
 
@@ -1375,6 +1424,28 @@ Released on July 1, 2026.
                 },
             ]
         );
+    }
+
+    #[test]
+    fn section_candidates_exclude_release_introductions() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let changelog = "# Project changes\n\n## Unreleased\n\n### core\n\n -  New change.\n\n## Version 1.0.0\n\nReleased on July 1, 2026.\n\n<!-- sacho:release-intro:begin -->\n\n### Details\n\nTo be released.\n\n### cli\n\nIntroduction text.\n\n<!-- sacho:release-intro:end -->\n\n### cli\n\n -  Released change.\n\n## Version 0.9.0\n\nReleased on June 1, 2026.\n\n<!-- sacho:release-intro:begin -->\n\n### core\n\nAnother introduction.\n\n<!-- sacho:release-intro:end -->\n\n### cli\n\n -  Older change.\n".replace('\n', ending);
+            assert_eq!(
+                discover_section_candidates(&changelog, "Project changes", "To be released."),
+                vec![
+                    ChangelogSectionCandidate {
+                        id: "core".into(),
+                        occurrences: 1,
+                        appears_in_unreleased: true,
+                    },
+                    ChangelogSectionCandidate {
+                        id: "cli".into(),
+                        occurrences: 2,
+                        appears_in_unreleased: false,
+                    },
+                ]
+            );
+        }
     }
 
     #[test]
@@ -3129,6 +3200,26 @@ To be released.
     }
 
     proptest! {
+        #[test]
+        fn introduction_headings_do_not_change_section_candidates(
+            headings in prop::collection::vec("[a-zλ]{1,20}", 1..12),
+            ending in prop::sample::select(vec!["\n", "\r", "\r\n"]),
+        ) {
+            let before = "# Project changes\n\n## Version 1.0.0\n\nReleased today.\n\n";
+            let after = "### core\n\n -  Core change.\n\n### cli\n\n -  CLI change.\n";
+            let original = format!("{before}{after}").replace('\n', ending);
+            let headings = headings.iter().map(|text| format!("### {text}\n\n")).collect::<String>();
+            let with_intro = format!(
+                "{before}{}\n\n{headings}To be released.\n\n{}\n\n{after}",
+                crate::release_context::INTRO_BEGIN,
+                crate::release_context::INTRO_END,
+            ).replace('\n', ending);
+            prop_assert_eq!(
+                discover_section_candidates(&with_intro, "Project changes", "To be released."),
+                discover_section_candidates(&original, "Project changes", "To be released."),
+            );
+        }
+
         #[test]
         fn decompiled_reference_pins_preserve_generated_destinations(
             number in 1_u64..=u32::MAX.into(),

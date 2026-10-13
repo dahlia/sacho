@@ -3861,3 +3861,604 @@ fn release_command_creates_a_missing_changelog_from_the_relative_repository_root
     assert!(temp.path().join("CHANGES.md").is_file());
     assert!(!temp.path().join("changes.d/release.md").exists());
 }
+
+#[test]
+fn release_context_is_shown_but_not_carried() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .unwrap();
+    std::fs::create_dir(temp.path().join("changes.d")).unwrap();
+    std::fs::write(temp.path().join("changes.d/change.md"), " -  Added API.\n").unwrap();
+    Command::cargo_bin("sacho").unwrap().current_dir(temp.path())
+        .args(["release", "1.0.0", "--date=2026-10-13", "--note=Initial release.", "--intro-file=-"])
+        .write_stdin("### Version 9.0\n\nRead [guide].\n\n -  Back up first.\n\n[guide]: https://example.com/guide\n")
+        .assert().success();
+    let source = std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+    assert!(source.contains("Released on October 13, 2026.  Initial release."));
+    assert!(source.contains("<!-- sacho:release-intro:begin -->"));
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "1.0.0", "--skip-heading", "--no-word-wrap"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initial release."))
+        .stdout(predicate::str::contains("Back up first."))
+        .stdout(predicate::str::contains("Added API."))
+        .stdout(predicate::str::contains("https://example.com/guide"))
+        .stdout(predicate::str::contains("sacho:release-intro").not());
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["carry", "1.0.0"])
+        .assert()
+        .success();
+    let fragment =
+        std::fs::read_to_string(temp.path().join("changes.d/carried-from-1.0.0.md")).unwrap();
+    assert!(fragment.contains("Added API."));
+    assert!(!fragment.contains("Back up first."));
+    assert!(!fragment.contains("Initial release."));
+}
+
+fn context_test_repo() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .unwrap();
+    std::fs::create_dir(temp.path().join("changes.d")).unwrap();
+    std::fs::write(temp.path().join("changes.d/change.md"), " -  Added API.\n").unwrap();
+    temp
+}
+
+#[test]
+fn release_context_errors_preserve_repository_and_identify_input() {
+    for input in [
+        "# Heading\n",
+        "```\nunterminated",
+        "text <!-- sacho:release-intro:end -->",
+    ] {
+        for stdin in [true, false] {
+            let temp = context_test_repo();
+            std::fs::write(temp.path().join("intro.md"), input).unwrap();
+            let path = if stdin { "-" } else { "intro.md" };
+            let mut command = Command::cargo_bin("sacho").unwrap();
+            command.current_dir(temp.path()).args([
+                "release",
+                "1.0.0",
+                "--date=2026-10-13",
+                "--intro-file",
+                path,
+            ]);
+            if stdin {
+                command.write_stdin(input);
+            }
+            command
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(if stdin {
+                    "<stdin>"
+                } else {
+                    "intro.md"
+                }));
+            assert!(!temp.path().join("CHANGES.md").exists());
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("changes.d/change.md")).unwrap(),
+                " -  Added API.\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn release_context_rejects_definition_changes_in_history_and_preamble() {
+    for history in [
+        "Read [guide].",
+        "Read [guide].\n\n[guide]: https://example.com/old",
+        "Read[^x].\n\n[^x]: Original.",
+    ] {
+        for preamble in [true, false] {
+            let temp = context_test_repo();
+            let old = if preamble {
+                format!("Changelog\n=========\n\n{history}\n")
+            } else {
+                format!(
+                    "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n\n{history}\n"
+                )
+            };
+            std::fs::write(temp.path().join("CHANGES.md"), &old).unwrap();
+            Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .args(["release", "1.0.0", "--date=2026-10-13", "--intro-file=-"])
+                .write_stdin(
+                    "Read [guide].[^x]\n\n[guide]: https://example.com/new\n\n[^x]: Changed.\n",
+                )
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("<stdin>"));
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap(),
+                old
+            );
+            assert!(temp.path().join("changes.d/change.md").exists());
+        }
+    }
+}
+
+#[test]
+fn release_context_reads_dash_file_relative_to_current_subdirectory() {
+    let temp = context_test_repo();
+    let sub = temp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("-"), "Read this message.\r\n").unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(&sub)
+        .args([
+            "release",
+            "1.0.0",
+            "--date=2026-10-13",
+            "--intro-file=./-",
+            "--note=-x",
+        ])
+        .assert()
+        .success();
+    let output = std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+    assert!(output.contains("Read this message."));
+    assert!(output.contains("2026.  -x"));
+}
+
+#[test]
+fn release_context_argument_and_utf8_errors_do_not_write() {
+    for args in [
+        vec!["--note", "--intro-file", "intro.md"],
+        vec!["--note=-x", "--note=y"],
+        vec!["--intro-file=a", "--intro-file=b"],
+        vec!["--note", "-x"],
+        vec!["--intro-file=missing"],
+        vec!["--intro-file=invalid"],
+    ] {
+        let temp = context_test_repo();
+        std::fs::write(temp.path().join("invalid"), [0xff]).unwrap();
+        Command::cargo_bin("sacho")
+            .unwrap()
+            .current_dir(temp.path())
+            .args(["release", "1.0.0", "--date=2026-10-13"])
+            .args(args)
+            .assert()
+            .failure();
+        assert!(!temp.path().join("CHANGES.md").exists());
+        assert!(temp.path().join("changes.d/change.md").exists());
+    }
+    let temp = context_test_repo();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["release", "1.0.0", "--date=2026-10-13", "--intro-file=-"])
+        .write_stdin(vec![0xff])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<stdin>"));
+}
+
+#[test]
+fn release_context_survives_sections_region_modes_next_and_fmt() {
+    for materialize in [false, true] {
+        for detection in ["heading", "marker"] {
+            let temp = tempfile::TempDir::new().unwrap();
+            std::fs::write(temp.path().join("sacho.toml"), format!("[changelog]\nmaterialize = {materialize}\nregion-detection = '{detection}'\nunreleased-heading = 'Waiting for publication.'\n\n[[sections]]\nid = 'core'\ndirectory = 'core'\n")).unwrap();
+            std::fs::create_dir_all(temp.path().join("changes.d/core")).unwrap();
+            std::fs::write(
+                temp.path().join("changes.d/core/change.md"),
+                " -  Added API.\n",
+            )
+            .unwrap();
+            std::fs::write(temp.path().join("changes.d/next"), "1.0.0\n").unwrap();
+            let preview = Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .arg("preview")
+                .output()
+                .unwrap();
+            assert!(preview.status.success());
+            let preview = String::from_utf8(preview.stdout).unwrap();
+            let region = if detection == "marker" {
+                format!(
+                    "<!-- sacho:unreleased:begin -->\n\n{preview}\n<!-- sacho:unreleased:end -->\n"
+                )
+            } else {
+                preview
+            };
+            std::fs::write(
+                temp.path().join("CHANGES.md"),
+                format!("Changelog\n=========\n\n{region}"),
+            )
+            .unwrap();
+            if materialize {
+                Command::cargo_bin("sacho")
+                    .unwrap()
+                    .current_dir(temp.path())
+                    .args(["sync", "--force"])
+                    .assert()
+                    .success();
+            }
+            Command::cargo_bin("sacho").unwrap().current_dir(temp.path())
+                .args(["release", "--date=2026-10-13", "--next=1.1.0", "--note=Initial release.", "--intro-file=-", "--no-resolve-links"])
+                .write_stdin("### Unknown section\n\nIntro[^intro] with [guide].\n\n -  Instruction.\n\n```markdown\n<!-- sacho:unreleased:begin -->\n# Version 8.0\n<!-- sacho:unreleased:end -->\n```\n\n[^intro]: Intro footnote.\n\n[guide]: https://example.com/guide\n")
+                .assert().success();
+            Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .args(["fmt"])
+                .assert()
+                .success();
+            Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .args(["check"])
+                .assert()
+                .success();
+            Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .args(["show", "1.0.0"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Intro footnote."))
+                .stdout(predicate::str::contains("Instruction."))
+                .stdout(predicate::str::contains("Added API."));
+            Command::cargo_bin("sacho")
+                .unwrap()
+                .current_dir(temp.path())
+                .args(["carry", "1.0.0"])
+                .assert()
+                .success();
+            let fragment =
+                std::fs::read_to_string(temp.path().join("changes.d/core/carried-from-1.0.0.md"))
+                    .unwrap();
+            assert!(fragment.contains("Added API."));
+            assert!(!fragment.contains("Instruction."));
+            let next = std::fs::read_to_string(temp.path().join("changes.d/next")).unwrap();
+            assert_eq!(next, "1.1.0\n");
+        }
+    }
+}
+
+#[test]
+fn release_context_keeps_empty_release_policy_and_whitespace_behavior() {
+    for allow_empty in [false, true] {
+        let temp = context_test_repo();
+        std::fs::remove_file(temp.path().join("changes.d/change.md")).unwrap();
+        let old = "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n";
+        std::fs::write(temp.path().join("CHANGES.md"), old).unwrap();
+        let mut command = Command::cargo_bin("sacho").unwrap();
+        command.current_dir(temp.path()).args([
+            "release",
+            "1.0.0",
+            "--date=2026-10-13",
+            "--note=Initial release.",
+        ]);
+        if allow_empty {
+            command.arg("--allow-empty");
+            command.assert().success();
+        } else {
+            command.assert().failure();
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap(),
+                old
+            );
+        }
+    }
+    for (note, intro) in [("", ""), ("  ", " \r\n ")] {
+        let temp = context_test_repo();
+        Command::cargo_bin("sacho")
+            .unwrap()
+            .current_dir(temp.path())
+            .args([
+                "release",
+                "1.0.0",
+                "--date=2026-10-13",
+                "--note",
+                note,
+                "--intro-file=-",
+            ])
+            .write_stdin(intro)
+            .assert()
+            .success();
+        let output = std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+        assert!(!output.contains("sacho:release-intro"));
+        assert!(output.contains("Released on October 13, 2026.\n\n -  Added API."));
+    }
+}
+
+#[test]
+fn release_context_damaged_old_boundaries_do_not_block_other_versions() {
+    let temp = context_test_repo();
+    let old = "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n\n<!-- sacho:release-intro:begin -->\n\nDamaged old introduction.\n";
+    std::fs::write(temp.path().join("CHANGES.md"), old).unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "release",
+            "1.0.0",
+            "--date=2026-10-13",
+            "--note=New release.",
+        ])
+        .assert()
+        .success();
+    let output = std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+    assert!(output.ends_with(&old["Changelog\n=========\n\n".len()..]));
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "1.0.0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("New release."));
+    for command in ["show", "carry"] {
+        Command::cargo_bin("sacho")
+            .unwrap()
+            .current_dir(temp.path())
+            .args([command, "0.9"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("boundary"));
+    }
+}
+
+#[test]
+fn release_context_absolute_file_and_initial_release() {
+    let temp = context_test_repo();
+    std::fs::remove_file(temp.path().join("changes.d/change.md")).unwrap();
+    let input = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(input.path(), "Read *this* message.\n").unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "release",
+            "1.0.0",
+            "--date=2026-10-13",
+            "--note=Initial release.",
+            "--intro-file",
+        ])
+        .arg(input.path())
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "1.0.0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initial release."))
+        .stdout(predicate::str::contains("Read *this* message."));
+}
+
+#[test]
+fn release_context_conflicts_with_compiled_links_and_accepts_identical_definitions() {
+    for same in [true, false] {
+        let temp = context_test_repo();
+        std::fs::write(
+            temp.path().join("changes.d/change.md"),
+            " -  Read [guide].\n\n[guide]: https://example.com/old\n",
+        )
+        .unwrap();
+        let target = if same { "old" } else { "new" };
+        let mut command = Command::cargo_bin("sacho").unwrap();
+        command
+            .current_dir(temp.path())
+            .args(["release", "1.0.0", "--date=2026-10-13", "--intro-file=-"])
+            .write_stdin(format!(
+                "Intro [guide].\n\n[guide]: https://example.com/{target}\n"
+            ));
+        if same {
+            command.assert().success();
+        } else {
+            command.assert().failure();
+            assert!(temp.path().join("changes.d/change.md").exists());
+        }
+    }
+}
+
+#[test]
+fn release_context_rejects_case_folded_footnote_conflicts() {
+    let temp = context_test_repo();
+    let old = "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n\nOld[^x].\n\n[^x]: Old footnote.\n";
+    std::fs::write(temp.path().join("CHANGES.md"), old).unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["release", "1.0", "--date=2026-10-13", "--intro-file=-"])
+        .write_stdin("Intro[^X].\n\n[^X]: New footnote.\n")
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap(),
+        old
+    );
+}
+
+#[test]
+fn release_context_html_fence_examples_do_not_swallow_other_releases() {
+    let temp = context_test_repo();
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n\n -  Old change.\n",
+    )
+    .unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["release", "1.0", "--date=2026-10-13", "--intro-file=-"])
+        .write_stdin("<!--\n```\n-->\n")
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "0.9"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Old change."));
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "1.0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Old change.").not());
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["carry", "1.0"])
+        .assert()
+        .success();
+    let fragment =
+        std::fs::read_to_string(temp.path().join("changes.d/carried-from-1.0.md")).unwrap();
+    assert!(!fragment.contains("Old change."));
+}
+
+#[test]
+fn release_context_version_shaped_document_title_is_not_the_release() {
+    let temp = context_test_repo();
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\ntitle = 'Version 1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("CHANGES.md"),
+        "# Version 1.0\n\nPreamble.\n",
+    )
+    .unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "release",
+            "1.0",
+            "--date=2026-10-13",
+            "--note=Initial release.",
+        ])
+        .assert()
+        .success();
+    let source = std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+    assert!(source.starts_with("# Version 1.0\n"));
+    assert!(source.contains("Preamble."));
+    assert!(source.contains("Released on October 13, 2026.  Initial release."));
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["show", "1.0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initial release."));
+}
+
+#[test]
+fn release_context_rejects_footnotes_with_different_task_or_math_payloads() {
+    for (old, new) in [("- [ ] Back up.", "- [x] Back up."), ("$a$", "$b$")] {
+        let temp = context_test_repo();
+        let history = format!(
+            "Changelog\n=========\n\nVersion 0.9\n-----------\n\nReleased before.\n\nOld[^x].\n\n[^x]: {old}\n"
+        );
+        std::fs::write(temp.path().join("CHANGES.md"), &history).unwrap();
+        Command::cargo_bin("sacho")
+            .unwrap()
+            .current_dir(temp.path())
+            .args(["release", "1.0", "--date=2026-10-13", "--intro-file=-"])
+            .write_stdin(format!("Intro[^x].\n\n[^x]: {new}\n"))
+            .assert()
+            .failure();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("CHANGES.md")).unwrap(),
+            history
+        );
+    }
+}
+
+#[test]
+fn release_context_preserves_markers_directly_after_html() {
+    let temp = context_test_repo();
+    std::fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = true\nregion-detection = 'marker'\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("CHANGES.md"), "Changelog\n=========\n\n<p align=\"center\">Project changes</p>\n<!-- sacho:unreleased:begin -->\n\n<!-- sacho:unreleased:end -->\n").unwrap();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["sync", "--force"])
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            "release",
+            "1.0",
+            "--date=2026-10-13",
+            "--note=Initial release.",
+            "--intro-file=-",
+        ])
+        .write_stdin(
+            "```markdown\n<!-- sacho:unreleased:begin -->\n<!-- sacho:unreleased:end -->\n```\n",
+        )
+        .assert()
+        .success();
+    Command::cargo_bin("sacho")
+        .unwrap()
+        .current_dir(temp.path())
+        .arg("check")
+        .assert()
+        .success();
+}
+
+#[test]
+fn release_context_diagnostics_do_not_blame_intro_for_other_inputs() {
+    for note_error in [false, true] {
+        let temp = context_test_repo();
+        std::fs::write(temp.path().join("intro.md"), "Read this.\n").unwrap();
+        if !note_error {
+            std::fs::write(
+                temp.path().join("sacho.toml"),
+                "[changelog]\nmaterialize = true\n",
+            )
+            .unwrap();
+        }
+        let mut command = Command::cargo_bin("sacho").unwrap();
+        command.current_dir(temp.path()).args([
+            "release",
+            "1.0",
+            "--date=2026-10-13",
+            "--intro-file=intro.md",
+        ]);
+        if note_error {
+            command.arg("--note=first\nsecond");
+        }
+        command
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("sacho::release_intro").not())
+            .stderr(predicate::str::contains("--intro-file intro.md:").not())
+            .stderr(predicate::str::contains(if note_error {
+                "invalid --note"
+            } else {
+                "CHANGES.md"
+            }));
+    }
+}

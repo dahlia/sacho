@@ -221,6 +221,20 @@ enum Command {
         )]
         date: Option<String>,
 
+        /// Inline Markdown appended to the release date paragraph.
+        #[arg(
+            long,
+            help = "Append an inline note to the date paragraph (use --note=TEXT for hyphen-leading text)"
+        )]
+        note: Option<String>,
+
+        /// Markdown introduction file, or `-` for standard input.
+        #[arg(
+            long,
+            help = "Insert Markdown from a file before change items; - reads stdin"
+        )]
+        intro_file: Option<PathBuf>,
+
         /// Next unreleased version to write after release.
         #[arg(long, help = "Next unreleased version to write after release")]
         next: Option<String>,
@@ -469,14 +483,50 @@ impl Cli {
             Command::Release {
                 version,
                 date,
+                note,
+                intro_file,
                 next,
                 allow_empty,
                 resolve_links,
                 no_resolve_links,
             } => {
-                let repo = Repository::open_existing(".").map_err(CliReport::from)?;
+                let cwd = std::env::current_dir().map_err(|source| Error::ReadFile {
+                    path: ".".into(),
+                    source,
+                })?;
+                let repo = Repository::open_existing(cwd).map_err(CliReport::from)?;
                 let date = resolve_release_date(date)?;
+                let intro = intro_file
+                    .as_ref()
+                    .map(|path| {
+                        if path.as_os_str() == "-" {
+                            let mut text = String::new();
+                            io::stdin().read_to_string(&mut text).map_err(|source| {
+                                Error::ReadFile {
+                                    path: "<stdin>".into(),
+                                    source,
+                                }
+                            })?;
+                            Ok(text)
+                        } else {
+                            std::fs::read_to_string(path).map_err(|source| Error::ReadFile {
+                                path: path.clone(),
+                                source,
+                            })
+                        }
+                    })
+                    .transpose()
+                    .map_err(|source| {
+                        release_intro_report(
+                            source,
+                            intro_file
+                                .as_deref()
+                                .expect("read failure has an input source"),
+                        )
+                    })?;
                 let options = ReleaseOptions {
+                    note,
+                    intro,
                     version,
                     date,
                     next,
@@ -484,10 +534,11 @@ impl Cli {
                 };
                 let policy = link_resolution_policy(resolve_links, no_resolve_links);
                 let plan = if policy.is_enabled(repo.config()) {
-                    plan_release_with_link_resolution(&repo, options)?
+                    plan_release_with_link_resolution(&repo, options)
                 } else {
-                    plan_release(&repo, options)?
-                };
+                    plan_release(&repo, options)
+                }
+                .map_err(|source| release_input_report(source, intro_file.as_deref()))?;
                 apply_release(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -583,6 +634,24 @@ fn print_resolve_links_result(repo: &Repository, command: &str, result: ResolveL
     if result.changelog_changed {
         println!("{}", repo.config().changelog.path.display());
     }
+}
+
+fn release_intro_report(source: Error, path: &Path) -> CliReport {
+    let input = if path.as_os_str() == "-" {
+        "<stdin>".to_owned()
+    } else {
+        path.display().to_string()
+    };
+    CliReport::ReleaseIntro { input, source }
+}
+
+fn release_input_report(source: Error, path: Option<&Path>) -> CliReport {
+    if let Some(path) = path
+        && matches!(&source, Error::InvalidReleaseContext { option, .. } if option == "--intro-file")
+    {
+        return release_intro_report(source, path);
+    }
+    source.into()
 }
 
 fn resolve_release_date(date: Option<String>) -> Result<ReleaseDate, CliReport> {
@@ -1106,6 +1175,14 @@ pub enum CliReport {
     #[error("{0}")]
     #[diagnostic(code(sacho::error))]
     Sacho(#[from] Error),
+
+    #[error("--intro-file {input}: {source}")]
+    #[diagnostic(code(sacho::release_intro))]
+    ReleaseIntro {
+        input: String,
+        #[source]
+        source: Error,
+    },
 
     #[error("could not determine the local calendar date; pass `--date YYYY-MM-DD`: {source}")]
     #[diagnostic(code(sacho::local_release_date))]
