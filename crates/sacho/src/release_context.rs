@@ -81,14 +81,20 @@ pub(crate) fn validate(note: Option<&str>, intro: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn node_offset(source: &str, node: &AstNode<'_>) -> usize {
+/// Index CommonMark lines once, treating CRLF as one newline.
+pub(crate) fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' || (byte == b'\r' && source.as_bytes().get(index + 1) != Some(&b'\n')) {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+pub(crate) fn node_offset(starts: &[usize], node: &AstNode<'_>) -> usize {
     let position = node.data().sourcepos.start;
-    source
-        .split_inclusive('\n')
-        .take(position.line.saturating_sub(1))
-        .map(str::len)
-        .sum::<usize>()
-        + position.column.saturating_sub(1)
+    starts[position.line.saturating_sub(1)] + position.column.saturating_sub(1)
 }
 
 pub(crate) fn marker(node: &AstNode<'_>) -> Option<bool> {
@@ -100,13 +106,13 @@ pub(crate) fn marker(node: &AstNode<'_>) -> Option<bool> {
 }
 
 pub(crate) fn introduction<'a>(
-    source: &str,
+    starts: &[usize],
     root: &'a AstNode<'a>,
     range: Range<usize>,
 ) -> Result<Option<Range<usize>>> {
     let nodes = root
         .children()
-        .filter(|node| range.contains(&node_offset(source, node)))
+        .filter(|node| range.contains(&node_offset(starts, node)))
         .collect::<Vec<_>>();
     let boundaries = nodes
         .iter()
@@ -120,7 +126,7 @@ pub(crate) fn introduction<'a>(
                 return Err(invalid("release introduction", "introduction boundary comments must precede change items and section headings"));
             }
             Ok(Some(
-                node_offset(source, nodes[*begin])..node_end_offset(source, nodes[*end]),
+                node_offset(starts, nodes[*begin])..node_end_offset(starts, nodes[*end]),
             ))
         }
         _ => Err(invalid(
@@ -130,29 +136,25 @@ pub(crate) fn introduction<'a>(
     }
 }
 
-fn node_end_offset(source: &str, node: &AstNode<'_>) -> usize {
+fn node_end_offset(starts: &[usize], node: &AstNode<'_>) -> usize {
     let position = node.data().sourcepos.end;
-    source
-        .split_inclusive('\n')
-        .take(position.line.saturating_sub(1))
-        .map(str::len)
-        .sum::<usize>()
-        + position.column
+    starts[position.line.saturating_sub(1)] + position.column
 }
 
 /// Collect valid pairs without rejecting unrelated damaged releases.
 pub(crate) fn introduction_spans(source: &str) -> Vec<Range<usize>> {
     let arena = Arena::new();
     let root = parse_document(&arena, source, &options());
+    let starts = line_starts(source);
     let mut begin = None;
     let mut spans = Vec::new();
     for node in root.children() {
-        let offset = node_offset(source, node);
+        let offset = node_offset(&starts, node);
         match marker(node) {
             Some(true) => begin = Some(offset),
             Some(false) => {
                 if let Some(begin) = begin.take() {
-                    spans.push(begin..node_end_offset(source, node));
+                    spans.push(begin..node_end_offset(&starts, node));
                 }
             }
             None if matches!(node.data().value, NodeValue::Heading(ref heading) if heading.level <= 2) => {
@@ -302,11 +304,12 @@ enum Part {
 fn signatures(source: &str, section: &Range<usize>, part: Part) -> Result<Vec<String>> {
     let arena = Arena::new();
     let root = parse_document(&arena, source, &options());
-    let intro = introduction(source, root, section.clone())?;
+    let starts = line_starts(source);
+    let intro = introduction(&starts, root, section.clone())?;
     let mut date_seen = false;
     let mut result = Vec::new();
     for node in root.children() {
-        let offset = node_offset(source, node);
+        let offset = node_offset(&starts, node);
         if matches!(node.data().value, NodeValue::FootnoteDefinition(_)) || marker(node).is_some() {
             continue;
         }
@@ -374,7 +377,7 @@ pub(crate) fn validate_meaning(
     if intro.is_some() {
         let arena = Arena::new();
         let root = parse_document(&arena, raw, &options());
-        let span = introduction(raw, root, raw_section.clone())?
+        let span = introduction(&line_starts(raw), root, raw_section.clone())?
             .ok_or_else(|| invalid("--intro-file", "missing introduction boundary comments"))?;
         // Only context definitions should take precedence in this oracle.
         // Moving compiled definitions ahead of the preamble would reject
@@ -519,7 +522,7 @@ mod tests {
         let source = format!("   {INTRO_BEGIN}\n\nIntro.\n\n   {INTRO_END}\n\n -  Change.\n");
         let arena = Arena::new();
         let root = parse_document(&arena, &source, &options());
-        let span = introduction(&source, root, 0..source.len())
+        let span = introduction(&line_starts(&source), root, 0..source.len())
             .unwrap()
             .unwrap();
         assert_eq!(&source[span.end..], "\n\n -  Change.\n");
@@ -538,7 +541,7 @@ mod tests {
             let arena = Arena::new();
             let root = parse_document(&arena, &source, &options());
             assert!(
-                introduction(&source, root, 0..source.len()).is_err(),
+                introduction(&line_starts(&source), root, 0..source.len()).is_err(),
                 "{source}"
             );
         }
@@ -614,6 +617,29 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn source_positions_match_generated_commonmark_lines(
+            paragraphs in prop::collection::vec("[a-zλ]{1,40}", 1..40),
+            endings in prop::collection::vec(prop::sample::select(vec!["\n", "\r", "\r\n"]), 1..40),
+        ) {
+            let mut source = String::new();
+            let mut expected = Vec::new();
+            for (index, paragraph) in paragraphs.iter().enumerate() {
+                expected.push(source.len()..source.len() + paragraph.len());
+                source.push_str(paragraph);
+                source.push_str(endings[index % endings.len()]);
+                source.push_str(endings[index % endings.len()]);
+            }
+            let arena = Arena::new();
+            let root = parse_document(&arena, &source, &options());
+            let starts = line_starts(&source);
+            prop_assert_eq!(root.children().count(), expected.len());
+            for (node, span) in root.children().zip(expected) {
+                prop_assert_eq!(node_offset(&starts, node), span.start);
+                prop_assert_eq!(node_end_offset(&starts, node), span.end);
+            }
+        }
+
         #[test]
         fn semantic_signatures_ignore_soft_line_wrapping(
             first in "[A-Za-z]{1,40}",

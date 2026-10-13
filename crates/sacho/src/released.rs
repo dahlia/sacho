@@ -18,6 +18,7 @@ use crate::fragment::{
     render_item_with_configured_markers, replace_configured_link_markers,
 };
 use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_word_wrap};
+use crate::release_context::line_starts;
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolver, has_sections};
 
@@ -484,8 +485,9 @@ fn render_target_section(
     let options = comrak_options();
     let document = parse_document(&arena, source, &options);
     let section = arena.alloc(NodeValue::Document.into());
-    let intro = crate::release_context::introduction(source, document, target.start..target.end)?;
     let line_starts = line_starts(source);
+    let intro =
+        crate::release_context::introduction(&line_starts, document, target.start..target.end)?;
     let mut nodes = document
         .children()
         .filter(|node| {
@@ -749,14 +751,14 @@ fn parse_entries(
     let line_starts = line_starts(document);
     let mut entries = Vec::new();
     let mut current_section = None;
-    let intro = crate::release_context::introduction(document, root, body.clone())?;
+    let intro = crate::release_context::introduction(&line_starts, root, body.clone())?;
 
     for child in root.children().filter(|child| {
         sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
             .is_some_and(|start| body.contains(&start))
     }) {
         if intro.as_ref().is_some_and(|span| {
-            span.contains(&crate::release_context::node_offset(document, child))
+            span.contains(&crate::release_context::node_offset(&line_starts, child))
         }) {
             continue;
         }
@@ -1254,16 +1256,6 @@ fn strip_atx_closing_sequence(text: &str) -> &str {
     } else {
         text
     }
-}
-
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (index, byte) in source.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
 }
 
 fn sourcepos_start_offset(

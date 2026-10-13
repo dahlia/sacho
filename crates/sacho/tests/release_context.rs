@@ -4,6 +4,51 @@ use sacho::Repository;
 use sacho::commands::{ReleaseDate, ReleaseOptions, apply_release, plan_release};
 
 #[test]
+fn introduction_line_endings_preserve_the_released_context() {
+    let mut expected = None;
+    for ending in ["\n", "\r", "\r\n"] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("sacho.toml"),
+            "[changelog]\nmaterialize = false\n",
+        )
+        .unwrap();
+        fs::create_dir(temp.path().join("changes.d")).unwrap();
+        let repo = Repository::from_root(temp.path()).unwrap();
+        let intro = [
+            "First paragraph.",
+            "",
+            "### Details",
+            "",
+            " -  Introduction item.",
+            "",
+            "> Read this.",
+            "",
+        ]
+        .join(ending);
+        let plan = plan_release(
+            &repo,
+            ReleaseOptions {
+                version: Some("1.0.0".into()),
+                date: ReleaseDate::parse("2026-10-13").unwrap(),
+                next: None,
+                allow_empty: false,
+                note: None,
+                intro: Some(intro),
+            },
+        )
+        .unwrap();
+        apply_release(&repo, plan).unwrap();
+        let output = fs::read_to_string(temp.path().join("CHANGES.md")).unwrap();
+        if let Some(expected) = &expected {
+            assert_eq!(&output, expected);
+        } else {
+            expected = Some(output);
+        }
+    }
+}
+
+#[test]
 fn release_context_is_captured_before_its_input_file_disappears() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(
