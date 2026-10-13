@@ -118,7 +118,7 @@ run = "cargo run --package sacho --"
 [tasks."docs:install"]
 description = "Install documentation dependencies"
 run = "npm ci --prefix docs"
-sources = ["docs/package.json", "docs/package-lock.json"]
+sources = ["docs/package-lock.json", "docs/package.json"]
 outputs = ["docs/node_modules/.package-lock.json"]
 
 [tasks."docs:dev"]

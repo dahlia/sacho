@@ -205,11 +205,11 @@ pub fn discover_section_candidates(
 
 /// Parses a released version section and returns deterministic carry fragments.
 pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Result<CarriedRelease> {
-    let target = find_target_section(changelog, version, None).ok_or_else(|| {
-        Error::ReleasedVersionNotFound {
-            version: version.to_owned(),
-        }
-    })?;
+    let target =
+        find_target_section_with_title(changelog, version, None, &repo.config().changelog.title)
+            .ok_or_else(|| Error::ReleasedVersionNotFound {
+                version: version.to_owned(),
+            })?;
     let entries = parse_entries(repo, changelog, target.body_start..target.end)?;
     let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
@@ -433,7 +433,7 @@ pub fn has_released_sections(
     unreleased_region: Option<UnreleasedRegionSpan>,
     document_title: &str,
 ) -> bool {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     let document_title_start =
         matching_document_title(&lines, document_title).map(|heading| heading.start);
     version_heading_candidates(&lines)
@@ -460,8 +460,11 @@ pub(crate) fn render_released_section(
     unreleased_region: Option<UnreleasedRegionSpan>,
     skip_heading: bool,
     word_wrap: bool,
+    document_title: &str,
 ) -> Result<Option<ReleasedSection>> {
-    let Some(target) = find_target_section(source, version, unreleased_region) else {
+    let Some(target) =
+        find_target_section_with_title(source, version, unreleased_region, document_title)
+    else {
         return Ok(None);
     };
     let markdown = render_target_section(source, &target, skip_heading, word_wrap)?;
@@ -481,6 +484,7 @@ fn render_target_section(
     let options = comrak_options();
     let document = parse_document(&arena, source, &options);
     let section = arena.alloc(NodeValue::Document.into());
+    let intro = crate::release_context::introduction(source, document, target.start..target.end)?;
     let line_starts = line_starts(source);
     let mut nodes = document
         .children()
@@ -488,6 +492,7 @@ fn render_target_section(
             sourcepos_start_offset(&line_starts, node.data().sourcepos.start)
                 .is_some_and(|start| (target.start..target.end).contains(&start))
         })
+        .filter(|node| !(intro.is_some() && crate::release_context::marker(node).is_some()))
         .collect::<Vec<_>>();
     if skip_heading
         && nodes
@@ -670,12 +675,43 @@ fn append_ordinary_reference_definition(markdown: &mut String, reference: &Ordin
     markdown.push('\n');
 }
 
+pub(crate) fn release_range(
+    source: &str,
+    version: &str,
+    document_title: &str,
+) -> Result<Range<usize>> {
+    find_target_section_with_title(source, version, None, document_title)
+        .map(|target| target.start..target.end)
+        .ok_or_else(|| Error::ReleasedVersionNotFound {
+            version: version.to_owned(),
+        })
+}
+
+fn find_target_section_with_title(
+    source: &str,
+    version: &str,
+    unreleased_region: Option<UnreleasedRegionSpan>,
+    document_title: &str,
+) -> Option<TargetSection> {
+    let offset = insertion_title_span(source, document_title).map_or(0, |span| span.end);
+    let region = unreleased_region.map(|span| UnreleasedRegionSpan {
+        start: span.start.saturating_sub(offset),
+        end: span.end.saturating_sub(offset),
+    });
+    let target = find_target_section(&source[offset..], version, region)?;
+    Some(TargetSection {
+        start: offset + target.start,
+        body_start: offset + target.body_start,
+        end: offset + target.end,
+    })
+}
+
 fn find_target_section(
     source: &str,
     version: &str,
     unreleased_region: Option<UnreleasedRegionSpan>,
 ) -> Option<TargetSection> {
-    let lines = source_lines(source);
+    let lines = source_lines_without_introductions(source);
     let candidates = version_heading_candidates(&lines);
     let target = format!("Version {version}");
     for (index, candidate) in candidates.iter().enumerate() {
@@ -713,11 +749,17 @@ fn parse_entries(
     let line_starts = line_starts(document);
     let mut entries = Vec::new();
     let mut current_section = None;
+    let intro = crate::release_context::introduction(document, root, body.clone())?;
 
     for child in root.children().filter(|child| {
         sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
             .is_some_and(|start| body.contains(&start))
     }) {
+        if intro.as_ref().is_some_and(|span| {
+            span.contains(&crate::release_context::node_offset(document, child))
+        }) {
+            continue;
+        }
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
@@ -969,6 +1011,19 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
         start = end;
     }
     lines
+}
+
+fn source_lines_without_introductions(source: &str) -> Vec<SourceLine<'_>> {
+    let spans = crate::release_context::introduction_spans(source);
+    source_lines(source)
+        .into_iter()
+        .map(|mut line| {
+            if spans.iter().any(|span| span.contains(&line.start)) {
+                line.text = "";
+            }
+            line
+        })
+        .collect()
 }
 
 fn version_heading_candidates<'a>(lines: &'a [SourceLine<'a>]) -> Vec<VersionHeading<'a>> {
@@ -1242,13 +1297,8 @@ fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
 }
 
 fn comrak_options() -> ComrakOptions<'static> {
-    let mut options = ComrakOptions::default();
-    options.extension.table = true;
-    options.extension.description_lists = true;
-    options.extension.alerts = true;
-    options.extension.footnotes = true;
-    options.extension.tasklist = true;
-    options.extension.math_dollars = true;
+    let mut options = crate::release_context::options();
+    options.parse.leave_footnote_definitions = false;
     options
 }
 

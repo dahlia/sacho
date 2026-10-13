@@ -6,11 +6,17 @@ Version 0.4.0
 
 To be released.
 
+ -  Added `--note` and `--intro-file` to `sacho release` for an inline date
+    note and a Markdown introduction from a file or standard input.
+    `sacho show` includes both; `sacho carry` excludes the introduction.
+    [[#7], [#8]]
  -  Added optional fragment arguments to `sacho resolve-links`, so only the
     named files are resolved.  [[#5], [#6]]
 
 [#5]: https://github.com/dahlia/sacho/issues/5
 [#6]: https://github.com/dahlia/sacho/pull/6
+[#7]: https://github.com/dahlia/sacho/issues/7
+[#8]: https://github.com/dahlia/sacho/pull/8
 
 
 Version 0.3.2

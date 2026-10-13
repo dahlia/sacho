@@ -93,6 +93,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// Per-release Markdown content or stored boundaries are invalid.
+    #[snafu(display("invalid {option}: {message}"))]
+    InvalidReleaseContext {
+        /// Option or stored content that needs correction.
+        option: String,
+        /// Explanation of the invalid Markdown or changed reference.
+        message: String,
+    },
     /// A section pattern could not resolve a concrete repository section.
     #[snafu(display("section pattern resolution failed: {message}"))]
     SectionPattern {

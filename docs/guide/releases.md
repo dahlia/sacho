@@ -62,6 +62,52 @@ Supply the date when reproducibility or a release process requires it:
 sacho release 1.2.0 --date 2026-07-19
 ~~~~
 
+Add release context when it applies to the whole version. `--note` appends a
+short inline Markdown note to the date paragraph:
+
+~~~~ sh
+sacho release 1.0.0 --note="Initial release."
+~~~~
+
+This produces `Released on <date>.  Initial release.` The note must be one
+paragraph without embedded line breaks. Supply punctuation yourself. For a
+value beginning with a hyphen, use the equals form, such as `--note=-x`.
+
+Use `--intro-file` for Markdown blocks between the date paragraph and the
+change items:
+
+~~~~ sh
+sacho release 2.0.0 --note="Major release." --intro-file=migration.md
+~~~~
+
+The UTF-8 file can contain paragraphs, lists, quotations, code blocks, links,
+and footnotes. Top-level headings must be level three or deeper so they cannot
+open a separate changelog version. Relative paths use the directory where you
+run the command. To read standard input, pass exactly `-`; to read a file named
+`-`, pass `./-`:
+
+~~~~ sh
+cat migration.md | sacho release 2.0.0 --intro-file=-
+sacho release 2.0.0 --intro-file=./-
+~~~~
+
+Empty or whitespace-only content
+adds nothing. Sacho applies Hongdown formatting to the complete new release
+section after inserting the note and introduction. Existing released sections
+are preserved. Input errors or definitions that change existing links or
+footnotes stop the release before files are changed. If formatting would change
+a reference defined elsewhere in the changelog, add an identical definition to
+the introduction file.
+
+The note and introduction remain in the released changelog and are included by
+`sacho show`. Sacho stores the introduction between HTML boundary comments;
+`show` omits those comments, and `carry` skips the enclosed content. Keep the
+generated comments in the changelog. Actual reserved Sacho boundary comments
+cannot be supplied as context; examples inside code are allowed.
+
+Release context does not count as a change item. The first-release exception
+and `--allow-empty` rules above still apply.
+
 Commit the changed changelog, removed fragments, and removed *changes.d/next*
 together, then tag that commit. Afterward, start the next development cycle:
 
@@ -128,7 +174,7 @@ notes, run:
 sacho carry 1.2.0
 ~~~~
 
-This decompiles the released section into *carried-from-1.2.0.md* fragments.
+This converts the released change items into *carried-from-1.2.0.md* fragments.
 Edit those fragments if the later branch presents the change differently, then
 handle them like any other unreleased entry. If the imported released section
 is sufficient for the project's policy, no carry is needed.
