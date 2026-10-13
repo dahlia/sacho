@@ -140,23 +140,14 @@ pub fn discover_section_candidates(
     let arena = Arena::new();
     let root = parse_document(&arena, changelog, &comrak_options());
     let starts = line_starts(changelog);
-    let introduction_starts = crate::release_context::introduction_spans(changelog)
-        .into_iter()
-        .map(|span| span.start)
-        .collect::<BTreeSet<_>>();
-    let mut in_introduction = false;
+    let mut introductions = crate::release_context::IntroductionMask::new(changelog);
     let mut regions = Vec::<SectionCandidateRegion>::new();
     let mut current = None;
     let mut first_heading = true;
 
     for child in root.children() {
         let offset = crate::release_context::node_offset(&starts, child);
-        if introduction_starts.contains(&offset) {
-            in_introduction = true;
-        } else if crate::release_context::marker(child) == Some(false) {
-            in_introduction = false;
-        }
-        if in_introduction {
+        if introductions.contains(offset) {
             continue;
         }
         match &child.data().value {
@@ -1032,11 +1023,11 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
 }
 
 fn source_lines_without_introductions(source: &str) -> Vec<SourceLine<'_>> {
-    let spans = crate::release_context::introduction_spans(source);
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
     source_lines(source)
         .into_iter()
         .map(|mut line| {
-            if spans.iter().any(|span| span.contains(&line.start)) {
+            if introductions.contains(line.start) {
                 line.text = "";
             }
             line

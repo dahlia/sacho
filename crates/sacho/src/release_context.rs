@@ -1,6 +1,6 @@
 //! Per-release context validation and stored introduction boundaries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
 
 use comrak::nodes::{AstNode, NodeValue};
@@ -141,7 +141,35 @@ fn node_end_offset(starts: &[usize], node: &AstNode<'_>) -> usize {
     starts[position.line.saturating_sub(1)] + position.column
 }
 
-/// Collect valid pairs without rejecting unrelated damaged releases.
+/// Mask introduction content while visiting source offsets in increasing order.
+///
+/// Every exhausted span is discarded, so a document scan visits each span once.
+pub(crate) struct IntroductionMask {
+    spans: VecDeque<Range<usize>>,
+}
+
+impl IntroductionMask {
+    /// Build ordered spans, bounding damaged introductions at release headings.
+    pub(crate) fn new(source: &str) -> Self {
+        Self {
+            spans: introduction_spans(source).into(),
+        }
+    }
+
+    /// Discard spans ending at or before this offset, then check membership.
+    pub(crate) fn contains(&mut self, offset: usize) -> bool {
+        while self.spans.front().is_some_and(|span| span.end <= offset) {
+            self.spans.pop_front();
+        }
+        self.spans
+            .front()
+            .is_some_and(|span| span.contains(&offset))
+    }
+}
+
+/// Find introduction ranges without rejecting unrelated damaged releases.
+///
+/// Unclosed ranges stop before the next level-one/two heading or at EOF.
 pub(crate) fn introduction_spans(source: &str) -> Vec<Range<usize>> {
     let arena = Arena::new();
     let root = parse_document(&arena, source, &options());
@@ -151,17 +179,27 @@ pub(crate) fn introduction_spans(source: &str) -> Vec<Range<usize>> {
     for node in root.children() {
         let offset = node_offset(&starts, node);
         match marker(node) {
-            Some(true) => begin = Some(offset),
+            Some(true) => {
+                if let Some(previous) = begin.replace(offset) {
+                    spans.push(previous..offset);
+                }
+            }
             Some(false) => {
                 if let Some(begin) = begin.take() {
                     spans.push(begin..node_end_offset(&starts, node));
                 }
             }
             None if matches!(node.data().value, NodeValue::Heading(ref heading) if heading.level <= 2) => {
-                begin = None
+                if let Some(begin) = begin.take() {
+                    let line_start = starts[node.data().sourcepos.start.line.saturating_sub(1)];
+                    spans.push(begin..line_start);
+                }
             }
             None => {}
         }
+    }
+    if let Some(begin) = begin {
+        spans.push(begin..source.len());
     }
     spans
 }
@@ -616,7 +654,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn damaged_introductions_are_bounded_at_eof_and_nested_starts() {
+        let source = format!("{INTRO_BEGIN}\n\nUnclosed.\n");
+        assert_eq!(introduction_spans(&source), vec![0..source.len()]);
+        let nested = format!("{source}{INTRO_BEGIN}\n\nInner.\n\n{INTRO_END}\n");
+        let spans = introduction_spans(&nested);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], 0..source.len());
+        assert_eq!(&nested[spans[1].clone()], nested[source.len()..].trim_end());
+    }
+
     proptest! {
+        #[test]
+        fn introduction_mask_matches_ranges_and_discards_exhausted_spans(
+            lengths in prop::collection::vec((0usize..8, 1usize..16), 0..30),
+        ) {
+            let mut end = 0;
+            let spans = lengths.into_iter().map(|(gap, width)| {
+                let start = end + gap;
+                end = start + width;
+                start..end
+            }).collect::<Vec<_>>();
+            let mut mask = IntroductionMask { spans: spans.clone().into() };
+            for offset in 0..=end + 1 {
+                prop_assert_eq!(mask.contains(offset), spans.iter().any(|span| span.contains(&offset)));
+                // The cursor must release exhausted spans, including at their
+                // exclusive end, rather than revisit them on subsequent calls.
+                prop_assert!(mask.spans.front().is_none_or(|span| span.end > offset));
+            }
+            prop_assert!(mask.spans.is_empty());
+        }
+
         #[test]
         fn source_positions_match_generated_commonmark_lines(
             paragraphs in prop::collection::vec("[a-zλ]{1,40}", 1..40),
@@ -656,19 +725,25 @@ mod tests {
         #[test]
         fn introduction_spans_never_cross_release_headings(
             level in 1usize..=2,
+            indent in 0usize..=3,
             words in "[A-Za-z][A-Za-z ]{0,80}",
         ) {
             for heading in [
                 format!("{} {words}", "#".repeat(level)),
                 format!("{words}\n{}", if level == 1 { "========" } else { "--------" }),
             ] {
+                let heading = heading.lines()
+                    .map(|line| format!("{}{line}", " ".repeat(indent)))
+                    .collect::<Vec<_>>().join("\n");
                 let source = format!("{INTRO_BEGIN}\n\nDamaged introduction.\n\n{heading}\n\nReleased today.\n\n{INTRO_END}\n");
-                prop_assert!(introduction_spans(&source).is_empty());
+                let boundary = source.find(&heading).unwrap();
+                prop_assert_eq!(introduction_spans(&source), vec![0..boundary]);
                 let valid = format!("\n{INTRO_BEGIN}\n\nValid introduction.\n\n{INTRO_END}\n");
                 let document = format!("{source}{valid}");
                 let spans = introduction_spans(&document);
-                prop_assert_eq!(spans.len(), 1);
-                prop_assert!(spans[0].start >= source.len());
+                prop_assert_eq!(spans.len(), 2);
+                prop_assert_eq!(&spans[0], &(0..boundary));
+                prop_assert!(spans[1].start >= source.len());
             }
         }
 

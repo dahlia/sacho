@@ -304,11 +304,11 @@ fn source_lines(source: &str) -> Vec<SourceLine<'_>> {
 }
 
 fn source_lines_without_introductions(source: &str) -> Vec<SourceLine<'_>> {
-    let spans = crate::release_context::introduction_spans(source);
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
     source_lines(source)
         .into_iter()
         .map(|mut line| {
-            if spans.iter().any(|span| span.contains(&line.start)) {
+            if introductions.contains(line.start) {
                 line.text = "";
             }
             line

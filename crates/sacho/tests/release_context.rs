@@ -4,6 +4,46 @@ use sacho::Repository;
 use sacho::commands::{ReleaseDate, ReleaseOptions, apply_release, plan_release};
 
 #[test]
+fn unmatched_intro_cannot_shadow_a_later_release() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("sacho.toml"),
+        "[changelog]\nmaterialize = false\n",
+    )
+    .unwrap();
+    let repo = Repository::from_root(temp.path()).unwrap();
+    let source = "# Changelog\n\n## Version 2.0.0\n\nReleased today.\n\n<!-- sacho:release-intro:begin -->\n\n### Version 1.0.0\n\n -  Introduction example.\n\n## Version 1.0.0\n\nReleased yesterday.\n\n -  Actual release item.\n";
+    let carried = sacho::released::carry_release(&repo, source, "1.0.0").unwrap();
+    assert_eq!(carried.fragments.len(), 1);
+    assert!(
+        carried.fragments[0]
+            .markdown
+            .contains("Actual release item.")
+    );
+    assert!(
+        !carried.fragments[0]
+            .markdown
+            .contains("Introduction example.")
+    );
+    fs::write(temp.path().join("CHANGES.md"), source).unwrap();
+    let shown = sacho::commands::show(
+        &repo,
+        sacho::commands::ShowOptions {
+            version: "1.0.0".into(),
+            skip_heading: false,
+            word_wrap: false,
+        },
+    )
+    .unwrap();
+    assert!(shown.markdown.contains("Actual release item."));
+    assert!(!shown.markdown.contains("Introduction example."));
+    assert!(matches!(
+        sacho::released::carry_release(&repo, source, "2.0.0"),
+        Err(sacho::Error::InvalidReleaseContext { .. })
+    ));
+}
+
+#[test]
 fn introduction_line_endings_preserve_the_released_context() {
     let mut expected = None;
     for ending in ["\n", "\r", "\r\n"] {
