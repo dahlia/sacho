@@ -128,8 +128,9 @@ struct SectionCandidateRegion {
 ///
 /// Candidates from a region containing `unreleased_heading` are ordered before
 /// candidates found only in released history. Within each group, candidates
-/// retain their first-appearance order. Callers must still ask a person which
-/// headings represent stable repository sections because change categories
+/// retain their first-appearance order. Release introduction blocks are excluded.
+/// Callers must still ask a person which headings represent stable repository
+/// sections because change categories
 /// such as `Added` have the same Markdown shape.
 pub fn discover_section_candidates(
     changelog: &str,
@@ -138,11 +139,26 @@ pub fn discover_section_candidates(
 ) -> Vec<ChangelogSectionCandidate> {
     let arena = Arena::new();
     let root = parse_document(&arena, changelog, &comrak_options());
+    let starts = line_starts(changelog);
+    let introduction_starts = crate::release_context::introduction_spans(changelog)
+        .into_iter()
+        .map(|span| span.start)
+        .collect::<BTreeSet<_>>();
+    let mut in_introduction = false;
     let mut regions = Vec::<SectionCandidateRegion>::new();
     let mut current = None;
     let mut first_heading = true;
 
     for child in root.children() {
+        let offset = crate::release_context::node_offset(&starts, child);
+        if introduction_starts.contains(&offset) {
+            in_introduction = true;
+        } else if crate::release_context::marker(child) == Some(false) {
+            in_introduction = false;
+        }
+        if in_introduction {
+            continue;
+        }
         match &child.data().value {
             NodeValue::Heading(heading) => {
                 let text = plain_text(child).trim().to_owned();
@@ -1417,6 +1433,28 @@ Released on July 1, 2026.
                 },
             ]
         );
+    }
+
+    #[test]
+    fn section_candidates_exclude_release_introductions() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let changelog = "# Project changes\n\n## Unreleased\n\n### core\n\n -  New change.\n\n## Version 1.0.0\n\nReleased on July 1, 2026.\n\n<!-- sacho:release-intro:begin -->\n\n### Details\n\nTo be released.\n\n### cli\n\nIntroduction text.\n\n<!-- sacho:release-intro:end -->\n\n### cli\n\n -  Released change.\n\n## Version 0.9.0\n\nReleased on June 1, 2026.\n\n<!-- sacho:release-intro:begin -->\n\n### core\n\nAnother introduction.\n\n<!-- sacho:release-intro:end -->\n\n### cli\n\n -  Older change.\n".replace('\n', ending);
+            assert_eq!(
+                discover_section_candidates(&changelog, "Project changes", "To be released."),
+                vec![
+                    ChangelogSectionCandidate {
+                        id: "core".into(),
+                        occurrences: 1,
+                        appears_in_unreleased: true,
+                    },
+                    ChangelogSectionCandidate {
+                        id: "cli".into(),
+                        occurrences: 2,
+                        appears_in_unreleased: false,
+                    },
+                ]
+            );
+        }
     }
 
     #[test]
@@ -3171,6 +3209,26 @@ To be released.
     }
 
     proptest! {
+        #[test]
+        fn introduction_headings_do_not_change_section_candidates(
+            headings in prop::collection::vec("[a-zλ]{1,20}", 1..12),
+            ending in prop::sample::select(vec!["\n", "\r", "\r\n"]),
+        ) {
+            let before = "# Project changes\n\n## Version 1.0.0\n\nReleased today.\n\n";
+            let after = "### core\n\n -  Core change.\n\n### cli\n\n -  CLI change.\n";
+            let original = format!("{before}{after}").replace('\n', ending);
+            let headings = headings.iter().map(|text| format!("### {text}\n\n")).collect::<String>();
+            let with_intro = format!(
+                "{before}{}\n\n{headings}To be released.\n\n{}\n\n{after}",
+                crate::release_context::INTRO_BEGIN,
+                crate::release_context::INTRO_END,
+            ).replace('\n', ending);
+            prop_assert_eq!(
+                discover_section_candidates(&with_intro, "Project changes", "To be released."),
+                discover_section_candidates(&original, "Project changes", "To be released."),
+            );
+        }
+
         #[test]
         fn decompiled_reference_pins_preserve_generated_destinations(
             number in 1_u64..=u32::MAX.into(),
