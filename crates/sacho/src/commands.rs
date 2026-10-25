@@ -6,9 +6,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use comrak::nodes::NodeValue;
-use comrak::{Arena, Options as ComrakOptions, parse_document};
+use comrak::nodes::{AstNode, NodeValue, Sourcepos};
+use comrak::options::BrokenLinkReference;
+use comrak::{Arena, Options as ComrakOptions, ResolvedReference, parse_document};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use indexmap::IndexSet;
 use serde_yaml_ng::{Mapping, Value};
@@ -1995,7 +1997,24 @@ fn link_targets_outside_region(
     source: &str,
     region: Option<&std::ops::Range<usize>>,
 ) -> Vec<MaterializedLinkTarget> {
-    let arena = Arena::new();
+    materialized_link_targets(source)
+        .into_iter()
+        .filter(|(offset, _)| !region.is_some_and(|region| region.contains(offset)))
+        .map(|(_, target)| target)
+        .collect()
+}
+
+type MaterializedLinkTarget = (bool, Arc<str>, Arc<str>);
+type ReferenceSpellings = BTreeMap<String, BTreeSet<String>>;
+
+#[derive(Default)]
+struct MaterializedReferences {
+    resolved: BTreeMap<String, usize>,
+    failed: ReferenceSpellings,
+    targets: Vec<(Arc<str>, Arc<str>)>,
+}
+
+fn link_target_options<'c>() -> ComrakOptions<'c> {
     let mut options = ComrakOptions::default();
     options.extension.table = true;
     options.extension.description_lists = true;
@@ -2003,7 +2022,153 @@ fn link_targets_outside_region(
     options.extension.footnotes = true;
     options.extension.tasklist = true;
     options.extension.math_dollars = true;
-    let root = parse_document(&arena, source, &options);
+    options
+}
+
+impl MaterializedReferences {
+    fn parse<'a>(
+        &self,
+        arena: &'a Arena<'a>,
+        source: &str,
+        missing: &Mutex<ReferenceSpellings>,
+        prefix: Option<&str>,
+    ) -> &'a AstNode<'a> {
+        let mut options = link_target_options();
+        options.parse.broken_link_callback =
+            Some(Arc::new(|reference: BrokenLinkReference<'_>| {
+                // An empty label cannot be defined. Probing it would instead
+                // create a collapsed reference to the probe's own link text.
+                if reference.normalized.is_empty() {
+                    return None;
+                }
+                if let Some(index) = self.resolved.get(reference.normalized) {
+                    // Callback targets bypass Comrak's expansion budget. Keep
+                    // them short and share the real URL/title outside the AST.
+                    return Some(ResolvedReference {
+                        url: prefix.map_or_else(String::new, |prefix| format!("{prefix}{index}")),
+                        title: String::new(),
+                    });
+                }
+                if !self
+                    .failed
+                    .get(reference.normalized)
+                    .is_some_and(|spellings| spellings.contains(reference.original))
+                {
+                    missing
+                        .lock()
+                        .expect("reference spelling lock")
+                        .entry(reference.normalized.to_owned())
+                        .or_default()
+                        .insert(reference.original.to_owned());
+                }
+                None
+            }));
+        parse_document(arena, source, &options)
+    }
+
+    fn recover(&mut self, source: &str, missing: ReferenceSpellings) {
+        let mut pending = missing
+            .into_iter()
+            .flat_map(|(normalized, spellings)| {
+                spellings
+                    .into_iter()
+                    .map(move |original| (normalized.clone(), original))
+            })
+            .collect::<Vec<_>>();
+        // Every round settles at least its first candidate, even when later
+        // probes run out of budget. The explicit bound also prevents spinning.
+        for _ in 0..pending.len() {
+            if pending.is_empty() {
+                return;
+            }
+            let probes = pending
+                .iter()
+                .enumerate()
+                .map(|(index, (_, original))| {
+                    format!(
+                        "[sacho reference probe {index}][{}]",
+                        original.replace(['\t', '\r', '\n'], " "),
+                    )
+                })
+                .collect::<Vec<_>>();
+            // A non-paragraph block prevents a leading description-list item
+            // in the body from attaching to the final probe and changing defs.
+            let document = format!(
+                "{}\n\n***\n\n{}",
+                probes.join("\n\n"),
+                source.strip_prefix('\u{feff}').unwrap_or(source),
+            );
+            let arena = Arena::new();
+            let root = parse_document(&arena, &document, &link_target_options());
+            let paragraphs = root
+                .children()
+                .filter(|node| matches!(node.data().value, NodeValue::Paragraph))
+                .map(|node| (node.data().sourcepos.start.line, node))
+                .collect::<BTreeMap<_, _>>();
+            let mut charged = false;
+            let mut retry = Vec::new();
+            for (index, ((normalized, original), probe)) in
+                pending.into_iter().zip(&probes).enumerate()
+            {
+                let line = 2 * index + 1;
+                let paragraph = paragraphs.get(&line).expect("reference probe paragraph");
+                let span: Sourcepos = (line, 1, line, probe.len()).into();
+                let resolved = paragraph.first_child().and_then(|node| {
+                    let data = node.data();
+                    let NodeValue::Link(link) = &data.value else {
+                        return None;
+                    };
+                    // A shortcut to the probe text, or a link to just a label
+                    // prefix, must not be mistaken for the full reference.
+                    (data.sourcepos == span).then(|| (link.url.clone(), link.title.clone()))
+                });
+                let was_charged = charged;
+                charged |= paragraph.descendants().any(|node| {
+                    matches!(node.data().value, NodeValue::Link(_) | NodeValue::Image(_))
+                });
+                match resolved {
+                    Some((url, title)) => {
+                        self.resolved.entry(normalized).or_insert_with(|| {
+                            let index = self.targets.len();
+                            self.targets.push((Arc::from(url), Arc::from(title)));
+                            index
+                        });
+                    }
+                    None if !was_charged => {
+                        // A spelling too long for a full-reference probe can
+                        // still share a normalized label with a valid spelling.
+                        self.failed.entry(normalized).or_default().insert(original);
+                    }
+                    None => retry.push((normalized, original)),
+                }
+            }
+            pending = retry;
+        }
+        assert!(
+            pending.is_empty(),
+            "each probe round settles its first candidate"
+        );
+    }
+}
+
+fn materialized_reference_prefix<'a>(root: &'a AstNode<'a>) -> String {
+    let urls = root
+        .descendants()
+        .filter_map(|node| match &node.data().value {
+            NodeValue::Link(link) | NodeValue::Image(link) => Some(link.url.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // The delimiter makes candidates pairwise non-prefixing. Each URL can
+    // exclude only one candidate, so one of these n+1 prefixes must be free.
+    (0..=urls.len())
+        .map(|nonce| format!("sacho-reference-target-{nonce}:"))
+        .find(|prefix| urls.iter().all(|url| !url.starts_with(prefix)))
+        .expect("a marker prefix absent from all parsed URLs")
+}
+
+fn materialized_link_targets(source: &str) -> Vec<(usize, MaterializedLinkTarget)> {
+    let mut references = MaterializedReferences::default();
     let mut line_starts = vec![0];
     line_starts.extend(
         source
@@ -2011,26 +2176,62 @@ fn link_targets_outside_region(
             .enumerate()
             .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
     );
-    root.descendants()
-        .filter_map(|node| {
-            let data = node.data();
-            let position = data.sourcepos.start;
-            let offset = line_starts
-                .get(position.line.checked_sub(1)?)?
-                .checked_add(position.column.checked_sub(1)?)?;
-            if region.is_some_and(|region| region.contains(&offset)) {
-                return None;
-            }
-            match &data.value {
-                NodeValue::Link(link) => Some((false, link.url.clone(), link.title.clone())),
-                NodeValue::Image(link) => Some((true, link.url.clone(), link.title.clone())),
-                _ => None,
-            }
-        })
-        .collect()
+    // Each growing pass recovers a distinct original definition, and each
+    // definition needs an opening bracket. One final pass collects the result.
+    let definitions_bound = source.matches('[').count();
+    for _ in 0..=definitions_bound {
+        let missing = Mutex::new(ReferenceSpellings::new());
+        let arena = Arena::new();
+        let discovery = references.parse(&arena, source, &missing, None);
+        let prefix =
+            (!references.targets.is_empty()).then(|| materialized_reference_prefix(discovery));
+        let marker_arena = Arena::new();
+        // Empty and symbolic callback URLs produce identical parse trees and
+        // refmap charges. Choosing against decoded discovery URLs also handles
+        // escaped destinations and raw NULs without risking marker collisions.
+        let root = match prefix.as_deref() {
+            Some(prefix) => references.parse(&marker_arena, source, &missing, Some(prefix)),
+            None => discovery,
+        };
+        let targets = root
+            .descendants()
+            .filter_map(|node| {
+                let data = node.data();
+                let (image, link) = match &data.value {
+                    NodeValue::Link(link) => (false, link),
+                    NodeValue::Image(link) => (true, link),
+                    _ => return None,
+                };
+                let position = data.sourcepos.start;
+                let offset = line_starts
+                    .get(position.line.checked_sub(1)?)?
+                    .checked_add(position.column.checked_sub(1)?)?;
+                let (url, title) = match prefix
+                    .as_deref()
+                    .and_then(|prefix| link.url.strip_prefix(prefix))
+                {
+                    Some(index) => references
+                        .targets
+                        .get(index.parse::<usize>().expect("reference marker index"))
+                        .expect("reference marker target")
+                        .clone(),
+                    None => (Arc::from(link.url.as_str()), Arc::from(link.title.as_str())),
+                };
+                Some((offset, (image, url, title)))
+            })
+            .collect();
+        let before = references.targets.len();
+        references.recover(
+            source,
+            missing.into_inner().expect("reference spelling lock"),
+        );
+        if references.targets.len() == before {
+            return targets;
+        }
+    }
+    unreachable!("each growing pass requires a distinct original definition")
 }
 
-type MaterializedLinkTarget = (bool, String, String);
 type ReleasedSectionKey = (String, usize);
 type ReleasedLinkTargets = BTreeMap<ReleasedSectionKey, Vec<MaterializedLinkTarget>>;
 
@@ -2085,39 +2286,8 @@ fn released_link_targets(
             (heading.start..end, key)
         })
         .collect::<Vec<_>>();
-    let arena = Arena::new();
-    let mut options = ComrakOptions::default();
-    options.extension.table = true;
-    options.extension.description_lists = true;
-    options.extension.alerts = true;
-    options.extension.footnotes = true;
-    options.extension.tasklist = true;
-    options.extension.math_dollars = true;
-    let root = parse_document(&arena, source, &options);
-    let mut line_starts = vec![0];
-    line_starts.extend(
-        source
-            .bytes()
-            .enumerate()
-            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
-    );
     let mut targets = BTreeMap::<_, Vec<_>>::new();
-    for node in root.descendants() {
-        let data = node.data();
-        let position = data.sourcepos.start;
-        let Some(offset) = position
-            .line
-            .checked_sub(1)
-            .and_then(|line| line_starts.get(line))
-            .and_then(|start| {
-                position
-                    .column
-                    .checked_sub(1)
-                    .and_then(|column| start.checked_add(column))
-            })
-        else {
-            continue;
-        };
+    for (offset, target) in materialized_link_targets(source) {
         if unreleased_region.is_some_and(|region| region.contains(&offset)) {
             continue;
         }
@@ -2130,11 +2300,6 @@ fn released_link_targets(
             .filter(|(range, _)| range.contains(&offset))
         else {
             continue;
-        };
-        let target = match &data.value {
-            NodeValue::Link(link) => (false, link.url.clone(), link.title.clone()),
-            NodeValue::Image(link) => (true, link.url.clone(), link.title.clone()),
-            _ => continue,
         };
         targets.entry(section.clone()).or_default().push(target);
     }
@@ -13420,6 +13585,354 @@ Released previously.
                 .expect("read")
                 .contains(" -  Fixed sync.\n")
         );
+    }
+
+    #[test]
+    fn reference_budget_recovers_short_document_links_and_images() {
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let source = format!("[guide] ![guide] [guide]\n\n[guide]: {url} \"Guide\"\n");
+
+        let targets = link_targets_outside_region(&source, None);
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(
+            targets.iter().map(|target| target.0).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| &*target.1 == url && &*target.2 == "Guide")
+        );
+    }
+
+    fn reference_budget_changelog(unreleased: &str, released: &str, definitions: &str) -> String {
+        format!(
+            "Unreleased\n----------\n\nTo be released.\n\n{unreleased}\n\nVersion 1.0.0\n-------------\n\nReleased previously.\n\n{released}\n\n{definitions}\n\n<!-- {} -->\n",
+            "x".repeat(100_001),
+        )
+    }
+
+    #[test]
+    fn reference_budget_sync_and_format_preserve_released_links() {
+        let (temp, repo) = repo_with_config("");
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let released = " -  Read [guide].\n".repeat(100);
+        let changelog = reference_budget_changelog("", &released, &format!("[guide]: {url}"));
+        fs::create_dir(temp.path().join("changes.d")).expect("fragments");
+        let fragment_path = temp.path().join("changes.d/change.md");
+        fs::write(&fragment_path, " -  Fixed a bug.\n").expect("fragment");
+        let changelog_path = temp.path().join("CHANGES.md");
+        fs::write(&changelog_path, changelog).expect("changelog");
+        let plan = plan_sync(&repo, SyncOptions { force: true }).expect("baseline sync");
+        apply_sync(&repo, plan).expect("baseline sync applied");
+        let before = fs::read_to_string(&changelog_path).expect("baseline");
+        fs::write(
+            &fragment_path,
+            format!(" -  Read [guide].\n\n[guide]: {url}\n"),
+        )
+        .expect("updated fragment");
+
+        let format =
+            plan_format(&repo, FormatOptions).expect("format plan accepts unchanged targets");
+        assert!(matches!(format.sync, SyncPlan::NeedsConfirmation { .. }));
+        let sync = plan_sync(&repo, SyncOptions { force: true }).expect("sync accepts new use");
+        apply_sync(&repo, sync).expect("sync applied");
+        format_fragments(&repo, FormatOptions).expect("format synchronized fragments");
+
+        let after = fs::read_to_string(changelog_path).expect("updated changelog");
+        assert_eq!(
+            &before[before.find("Version 1.0.0").expect("released heading")..],
+            &after[after.find("Version 1.0.0").expect("released heading")..],
+        );
+    }
+
+    #[test]
+    fn reference_budget_still_rejects_real_released_target_changes() {
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let uses = "[guide] ".repeat(100);
+        let definitions = format!("[guide]: {url}\n[guard]: /old \"Old title\"");
+        let before = reference_budget_changelog(&uses, "[guard]", &definitions);
+        for (unreleased, released) in [
+            (format!("[guard]: /new \"Old title\"\n\n{uses}"), "[guard]"),
+            (format!("[guard]: /old \"New title\"\n\n{uses}"), "[guard]"),
+            (uses.clone(), "![guard]"),
+        ] {
+            let after = reference_budget_changelog(&unreleased, released, &definitions);
+            for result in [
+                validate_materialized_link_targets(
+                    &before,
+                    &after,
+                    RegionDetection::Heading,
+                    "To be released.",
+                    Path::new("CHANGES.md"),
+                ),
+                validate_released_link_targets(
+                    &before,
+                    &after,
+                    Path::new("CHANGES.md"),
+                    RegionDetection::Heading,
+                    "To be released.",
+                ),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(Error::MaterializedLinkTargetChanged { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn reference_budget_failed_long_spelling_does_not_hide_later_short_spelling() {
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let short = "k".repeat(334);
+        let long = "\u{212a}".repeat(334);
+        let definitions = format!("[guide]: {url}\n[{short}]: /target \"Target\"\n[`gate]: /gate");
+        let source = reference_budget_changelog(
+            &"[guide] ".repeat(100),
+            &format!("[{long}]\n\n[a][`gate] [text][{short}] `"),
+            &definitions,
+        );
+
+        let targets = link_targets_outside_region(&source, None);
+
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| &*target.1 == "/target")
+                .count(),
+            2
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| &*target.1 == "/gate")
+                .count(),
+            1
+        );
+        let retargeted = source.replace("/target \"Target\"", "/changed \"Target\"");
+        assert!(
+            validate_released_link_targets(
+                &source,
+                &retargeted,
+                Path::new("CHANGES.md"),
+                RegionDetection::Heading,
+                "To be released.",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reference_budget_preserves_offsets_at_the_start_marker_boundary() {
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let source = format!(
+            "한글\n\n{}\n\n{BEGIN_MARKER}\n[guide]\n{END_MARKER}\n\n[guide]: {url}\n\n<!-- {} -->\n",
+            "[guide] ".repeat(100),
+            "x".repeat(100_001),
+        );
+        let region = find_unreleased_region(&source, RegionDetection::Marker, "To be released.")
+            .expect("marker region");
+        assert!(source[region.start..].starts_with("[guide]"));
+
+        let targets = materialized_link_targets(&source);
+
+        assert_eq!(targets.last().expect("unreleased link").0, region.start);
+        assert_eq!(
+            link_targets_outside_region(&source, Some(&(region.start..region.end))).len(),
+            100,
+        );
+    }
+
+    #[test]
+    fn reference_budget_probes_do_not_invent_definitions_or_empty_labels() {
+        for source in [
+            ": [x]: /invented\n\n[x]\n",
+            "[x][y\n\n[sacho reference probe 0]: /wrong\n",
+            "[a `]` b]\n\n[a `]: /partial\n",
+        ] {
+            assert!(
+                link_targets_outside_region(source, None).is_empty(),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_budget_markers_preserve_decoded_urls_and_share_targets() {
+        let url = format!("https://example.com/{}", "a".repeat(980));
+        let source = format!(
+            "[first](sacho-reference-target-0&#58;0) [second](sacho-reference-target-1:0) [nul](<\0sacho-reference-target-0:0>)\n\n[guide] [guide] [guide]\n\n[guide]: {url}\n"
+        );
+        let targets = link_targets_outside_region(&source, None);
+
+        assert_eq!(targets.len(), 6);
+        assert_eq!(&*targets[0].1, "sacho-reference-target-0:0");
+        assert_eq!(&*targets[1].1, "sacho-reference-target-1:0");
+        assert_eq!(&*targets[2].1, "\0sacho-reference-target-0:0");
+        assert!(targets[3..].iter().all(|target| &*target.1 == url));
+        assert!(Arc::ptr_eq(&targets[4].1, &targets[5].1));
+    }
+
+    #[test]
+    fn reference_budget_callback_keeps_large_targets_out_of_the_tree() {
+        let url: Arc<str> = Arc::from(format!("https://example.com/{}", "a".repeat(90_000)));
+        let references = MaterializedReferences {
+            resolved: BTreeMap::from([(String::from("g"), 0)]),
+            targets: vec![(url, Arc::from("A title"))],
+            ..MaterializedReferences::default()
+        };
+        let source = "[g] ".repeat(1_000);
+        let missing = Mutex::new(ReferenceSpellings::new());
+        let arena = Arena::new();
+        let root = references.parse(&arena, &source, &missing, Some("marker:"));
+        let links = root
+            .descendants()
+            .filter_map(|node| match &node.data().value {
+                NodeValue::Link(link) => Some((link.url.clone(), link.title.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(links.len(), 1_000);
+        assert!(
+            links
+                .iter()
+                .all(|(url, title)| url == "marker:0" && title.is_empty())
+        );
+    }
+
+    #[test]
+    fn reference_budget_preserves_labels_and_nested_definitions() {
+        let url = format!("https://example.com/{}", "a".repeat(2_980));
+        for (definition, usage) in [
+            ("ss", "ẞ"),
+            ("k", "\u{212a}"),
+            ("σ", "ς"),
+            ("İ", "i\u{307}"),
+            ("\u{a0}foo", "\u{a0}foo"),
+            ("a\\]b", "a\\]b"),
+            ("a`b", "a`b"),
+            ("x y", "x\n   y"),
+            ("x y", "x\ty"),
+        ] {
+            let source = format!(
+                "{}\n[{definition}]: {url}\n",
+                format!("[{usage}]\n\n").repeat(3)
+            );
+            let targets = link_targets_outside_region(&source, None);
+            assert_eq!(targets.len(), 3, "{definition:?}/{usage:?}");
+            assert!(targets.iter().all(|target| &*target.1 == url));
+        }
+        let source = format!("[\u{a0}foo] [\u{a0}foo]\n\n[foo]: {url}\n");
+        assert!(link_targets_outside_region(&source, None).is_empty());
+
+        for definitions in [
+            format!("\u{feff}[g]: {url}\n"),
+            format!("> [g]: {url}\n"),
+            format!(" -  item\n\n    [g]: {url}\n"),
+            format!("> [!NOTE]\n> [g]: {url}\n"),
+            format!("[^unused]: note\n\n    [g]: {url}\n"),
+            format!("Term\n\n: Details\n\n    [g]: {url}\n"),
+        ] {
+            let source = format!("{definitions}\n[g] [g] [g]\n");
+            let targets = link_targets_outside_region(&source, None);
+            assert_eq!(targets.len(), 3, "{definitions:?}");
+            assert!(targets.iter().all(|target| &*target.1 == url));
+        }
+    }
+
+    #[test]
+    fn reference_budget_preserves_extension_context_and_footnote_pruning() {
+        let url = format!("https://example.com/{}", "a".repeat(2_980));
+        for (body, expected) in [
+            ("| Column |\n| --- |\n| [g] [g] [g] |", 3),
+            (" -  [x] [g] [g]", 2),
+            ("$[g]$ [g] [g]", 2),
+            ("[^unused]: [g] [g]\n\n[g] [g] [g]", 3),
+        ] {
+            let source = format!("{body}\n\n[g]: {url}\n");
+            let targets = link_targets_outside_region(&source, None);
+            assert_eq!(targets.len(), expected, "{body:?}");
+            assert!(targets.iter().all(|target| &*target.1 == url));
+        }
+        let table = "| [a | b] |\n| --- | --- |\n\n[a | b]: /table\n";
+        assert!(link_targets_outside_region(table, None).is_empty());
+    }
+
+    #[test]
+    fn reference_budget_recovers_title_expansion_and_multiple_probe_batches() {
+        let title = "t".repeat(1_500);
+        let source = format!("[a] [a] [a]\n\n[a]: /a \"{title}\"\n");
+        let targets = link_targets_outside_region(&source, None);
+        assert_eq!(targets.len(), 3);
+        assert!(
+            targets
+                .iter()
+                .all(|target| &*target.1 == "/a" && &*target.2 == title)
+        );
+
+        let a = format!("https://a.example/{}", "a".repeat(59_980));
+        let b = format!("https://b.example/{}", "b".repeat(59_980));
+        let source = format!("[a] [a] [b] [missing]\n\n[a]: {a}\n[b]: {b}\n");
+        let targets = link_targets_outside_region(&source, None);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(&*targets[0].1, a);
+        assert_eq!(&*targets[1].1, a);
+        assert_eq!(&*targets[2].1, b);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn reference_budget_released_targets_ignore_added_unreleased_uses(
+            extra in 0_usize..40,
+            suffix in 980_usize..2_980,
+        ) {
+            let url = format!("https://example.com/{}", "a".repeat(suffix));
+            let body = " -  Read [guide].\n".repeat(100);
+            let definitions = format!("[guide]: {url}");
+            let before = reference_budget_changelog("", &body, &definitions);
+            let after = reference_budget_changelog(&"[guide] ".repeat(extra), &body, &definitions);
+            let before_region = find_unreleased_region(&before, RegionDetection::Heading, "To be released.").expect("before region");
+            let after_region = find_unreleased_region(&after, RegionDetection::Heading, "To be released.").expect("after region");
+            let expected = link_targets_outside_region(&before, Some(&(before_region.start..before_region.end)));
+            prop_assert_eq!(expected.len(), 100);
+            prop_assert_eq!(expected, link_targets_outside_region(&after, Some(&(after_region.start..after_region.end))));
+        }
+
+        #[test]
+        fn reference_budget_matches_comrak_without_exhaustion(
+            entries in prop::collection::vec((0_usize..4, 0_usize..4), 0..30),
+            definitions in prop::collection::vec((0_usize..4, "[a-z]{1,3}"), 0..6),
+        ) {
+            let labels = ["a", "B", "c d", "missing"];
+            let mut source = String::new();
+            for (label, form) in entries {
+                let label = labels[label];
+                source.push_str(&match form {
+                    0 => format!("[{label}] "),
+                    1 => format!("![text][{label}] "),
+                    2 => format!("[{label}][] "),
+                    _ => format!("[text](/inline) [{label}] "),
+                });
+            }
+            source.push_str("\n\n");
+            for (label, destination) in definitions {
+                source.push_str(&format!("[{}]: /{destination}\n", labels[label]));
+            }
+            source.push_str(&format!("\n<!-- {} -->\n", "padding".repeat(1_000)));
+            let arena = Arena::new();
+            let root = parse_document(&arena, &source, &link_target_options());
+            let expected = root.descendants().filter_map(|node| match &node.data().value {
+                NodeValue::Link(link) => Some((false, Arc::from(link.url.as_str()), Arc::from(link.title.as_str()))),
+                NodeValue::Image(link) => Some((true, Arc::from(link.url.as_str()), Arc::from(link.title.as_str()))),
+                _ => None,
+            }).collect::<Vec<_>>();
+            prop_assert_eq!(link_targets_outside_region(&source, None), expected);
+        }
     }
 
     #[test]
