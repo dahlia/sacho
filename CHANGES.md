@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.3.3
 -------------
 
-To be released.
+Released on October 26, 2026.
 
  -  Fixed false errors about changes to released links from `sacho sync` and
     `sacho fmt` in changelogs whose Markdown reference links exceed the
