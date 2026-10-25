@@ -19,6 +19,20 @@ To be released.
 [#8]: https://github.com/dahlia/sacho/pull/8
 
 
+Version 0.3.3
+-------------
+
+Released on October 26, 2026.
+
+ -  Fixed false errors about changes to released links from `sacho sync` and
+    `sacho fmt` in changelogs whose Markdown reference links exceed the
+    parser's reference expansion limit. Validation also catches destination
+    and title changes that the same limit previously hid.  [[#9], [#10]]
+
+[#9]: https://github.com/dahlia/sacho/issues/9
+[#10]: https://github.com/dahlia/sacho/pull/10
+
+
 Version 0.3.2
 -------------
 
