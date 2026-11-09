@@ -1,7 +1,7 @@
 섹션 식별과 이름 변경 설계 및 작업 계획
 =======================================
 
-상태: 구현 전 설계 제안. 아래 설정과 CLI는 현재 지원되는 기능이 아니다.
+상태: 구현 완료. 검증 범위와 실행 기준은 아래에 기록한다.
 대상은 [이슈 #11]과 Sacho 0.4이며,
 설계 기준 소스는 `de87595`이다.
 
@@ -367,14 +367,14 @@ init은 설정을 쓰기 전에 유효한 제목으로 편집하도록 요구한
 각 단계는 선행 단계의 계약 테스트가 통과한 뒤 진행한다. 중간 단계는
 구현 단위이고, writer를 reader보다 먼저 활성화한 부분 릴리스를 내지 않는다.
 
-| 단계 | 작업과 소유 파일                                                                 | 완료 기준                                                                    |
-| ---- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| A    | 구버전 fixture와 파이프라인 회귀: `released.rs`, `commands.rs` 테스트            | 이슈의 archived 바이트·순서·링크와 현재 unknown-section 실패를 고정          |
-| B    | `config.rs`, `section_pattern.rs`와 새 title 타입, `section.rs`                  | 설정 왕복, title/ID 해석 분리, 기본값의 출력 호환을 테스트                   |
-| C    | 새 metadata 모듈, `released.rs`, `release_context.rs`, `fragment.rs`, `error.rs` | 대상 범위 codec/결합/오류, 빈 maps로 전체 선택표 구현, import 정규화 완료    |
-| D    | `compile.rs`, `commands.rs`, `cli.rs`, `merge.rs`, discovery/init, `show`        | sync/release 주석 보존, fmt 전후 의미 동일, merge 후 ID 동일, show 표시 제거 |
-| E    | map 설정/해석, `cli.rs`, command/library options                                 | 선택표·N:1·CLI/target 오류, 비-materialize 제목 충돌과 no-write 통과         |
-| F    | 사용자 문서, rustdoc, changelog, 전체 검증                                       | 아래 acceptance matrix와 프로젝트 finishing gates 통과                       |
+| 단계 | 작업과 소유 파일                                                                                                            | 완료 기준                                                                    |
+| ---- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| A    | 구버전 fixture와 파이프라인 회귀: `crates/sacho/tests/section_identity.rs`, `crates/sacho/tests/fixtures/section-identity/` | 이슈의 archived 바이트·순서·링크와 현재 unknown-section 실패를 고정          |
+| B    | `config.rs`, `section_pattern.rs`와 새 title 타입, `section.rs`                                                             | 설정 왕복, title/ID 해석 분리, 기본값의 출력 호환을 테스트                   |
+| C    | 새 metadata 모듈, `released.rs`, `release_context.rs`, `fragment.rs`, `error.rs`                                            | 대상 범위 codec/결합/오류, 빈 maps로 전체 선택표 구현, import 정규화 완료    |
+| D    | `compile.rs`, `commands.rs`, `cli.rs`, `merge.rs`, discovery/init, `show`                                                   | sync/release 주석 보존, fmt 전후 의미 동일, merge 후 ID 동일, show 표시 제거 |
+| E    | map 설정/해석, `cli.rs`, command/library options                                                                            | 선택표·N:1·CLI/target 오류, 비-materialize 제목 충돌과 no-write 통과         |
+| F    | 사용자 문서, rustdoc, changelog, 최종 검증                                                                                  | 아래 acceptance matrix와 프로젝트 finishing gates 통과                       |
 
 단계 C와 D는 같은 feature release에 포함한다. B/C에서 reader 없이
 title-only 문서를 만들지 않도록 writer 활성화는 D까지 보류한다.
@@ -407,10 +407,16 @@ HTML 거부를 각각 고정 예제로 둔다.
 비대상 영역의 닫힌 손상 marker와 미종결 HTML에 의한 문서 구조 손상을
 구별하며, 후자의 성공적인 복구를 acceptance 조건으로 요구하지 않는다.
 
-미래 구현의 finishing gates는 `mise run check`, `mise run test`, 전체
-`mise run mutants`다. mutation 결과는 missed와 timed-out이 모두 0이어야
-한다. 실제 VCS adapter를 바꾸면 `mise run test:vcs`도 추가한다.
-문서만 작성하는 이번 작업에서는 기능 구현 검증을 통과했다고 주장하지 않는다.
+F의 finishing gates는 `mise run check`, `mise run test`다. 이번 작업에서는
+사용자 지시에 따라 전체 workspace의 `mise run mutants`를 면제한다.
+기존 기능 범위 집중 mutation 기록도 검증 증거로 함께 검토한다. 외부 준비
+사본에서 제목/resolver 44개, metadata/reader 및 fmt 80개, 렌더 제목 검증
+14개, 매핑 및 우선순위 해석 55개 mutant를 검사했고 각 범위에서 missed와
+timed-out이 모두 0이었다.
+이 기록은 당시 선택한 기능 범위의 증거이며, 최종 통합 소스 전체의 mutation
+통과를 뜻하지 않는다. 최종 통합 소스는 check/test로 검증한다. 실제 VCS
+adapter를 바꾸면
+`mise run test:vcs`도 추가한다.
 
 
 설계의 경계
@@ -423,8 +429,11 @@ HTML 거부를 각각 고정 예제로 둔다.
 문서 해석 경로와 함께 유지해야 한다.
 
 
-현재 구현의 근거
-----------------
+설계 기준 소스의 근거
+---------------------
+
+아래 고정 링크는 설계 기준인 `de87595`의 구현을 가리킨다. 설계 당시의
+동작과 변경 지점을 확인하기 위한 근거이며, 최종 통합 소스는 별도로 확인한다.
 
  -  [`SectionConfig` 및 Config]
  -  [가역 패턴과 캡처 안전 규칙]

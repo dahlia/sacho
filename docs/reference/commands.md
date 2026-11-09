@@ -21,7 +21,12 @@ selected candidate, it suggests a fragment directory and source path globs. If
 at least two selections map to sibling directories under one unambiguous
 parent, Sacho first offers to replace their repeated `[[sections]]` entries
 with one inferred `[[section-patterns]]` table. The prompts remain editable,
-and selecting no candidates leaves both tables absent.
+and selecting no candidates leaves both tables absent. A valid section identity
+comment supplies the stable ID; the observed plain heading is retained as an
+explicit title. Without a comment, that heading supplies both values. If one ID
+has several titles, unreleased headings take precedence, then the first
+occurrence in document order. Invalid plain titles must be edited before setup
+can write a configuration.
 
 | Option                            | Meaning                                                          |
 | --------------------------------- | ---------------------------------------------------------------- |
@@ -232,12 +237,69 @@ next development cycle.
 -------------
 
 ~~~~ text
-sacho carry <VERSION>
+sacho carry <VERSION> [--map <FROM> <TO>] [--map-pattern <FROM> <TO>]
 ~~~~
 
 Turns the entries from one released section back into editable fragments named
 *carried-from-VERSION.md*. Sectioned releases produce one fragment in each
 populated section. Existing carried fragment destinations are replaced.
+
+Use stable IDs as targets for one-time overrides:
+
+~~~~ sh
+sacho carry 1.0.0 --map 'Old API' 'core' --map '-Legacy API' 'cli'
+sacho carry 1.0.0 --map-pattern 'legacy/{name}' 'python/{name}'
+~~~~
+
+Both options accept two arguments and can be repeated. Literal `--map` treats
+spaces, `=`, `->`, and braces as part of the value. Leading hyphens are allowed;
+quote values as required by your shell. Only `--map-pattern` interprets
+captures. Sources and targets are never automatically trimmed. A source is the
+recorded ID when a heading has metadata, otherwise its trimmed plain heading.
+
+Sacho validates syntax and every literal target before processing entries. Each
+runtime rule must match at least one input heading, including headings without
+items. A pattern counts as used when it matches even if a literal rule takes
+precedence. Unused rules fail before writing and report the actual input keys.
+Duplicate sources in the same literal/pattern category are errors even if their
+targets agree. An empty plain section heading is a format error.
+
+Interpretation uses the first matching step below. Errors in matching targets,
+ambiguous current titles, and shadowed sections stop processing rather than
+falling through:
+
+| Step | Heading with recorded ID                 | Heading without metadata           |
+| ---- | ---------------------------------------- | ---------------------------------- |
+| 1    | CLI literal, otherwise CLI pattern       | CLI literal, otherwise CLI pattern |
+| 2    | ID literal map, otherwise ID pattern map | Title literal map                  |
+| 3    | Recorded current ID                      | Explicit current title             |
+| 4    | Unknown-ID error                         | Title pattern map                  |
+| 5    | No fallback                              | ID literal map                     |
+| 6    | No fallback                              | ID pattern map                     |
+| 7    | No fallback                              | Raw current ID                     |
+
+Explicit current-title matches take precedence over reversible title patterns.
+Only configured titles participate in that step; omitted titles reach the raw
+ID step. Sacho never combines title and raw-ID candidates into one pool.
+A broad `{name}` historical pattern explicitly opts into catching every valid
+single-segment name, including typos and names that remain valid raw IDs.
+
+Within a mapping stage, literals are exceptions to patterns. Overlapping
+patterns can agree on the same canonical ID and directory; different targets
+are ambiguous. Targets resolve in one hop through the current ID resolver,
+without following other maps. Multiple old headings may merge into one fragment
+in their observed document order. Entries are not deduplicated.
+
+A recorded unknown ID has no title fallback. A damaged or misplaced identity
+comment cannot be overridden with CLI maps: manually correct or delete it, then
+use an explicit mapping if recovery needs one. Validation covers the selected
+release body, including nested HTML and introductions. Damage in another
+structurally separate release does not block the selected release.
+
+The command preserves released history and validates pins, destinations, and
+active output-title collisions before writing, including when
+`materialize = false`. Existing carried files are still replaced on rerun;
+changing maps does not clean up earlier output files automatically.
 
 
 `sacho import-unreleased`
@@ -259,6 +321,13 @@ changes released history. If normalized fragment output changes the unreleased
 region, an interactive invocation shows the diff and asks for confirmation. A
 noninteractive invocation exits with status 2; `--force` applies the reviewed
 normalization without a prompt. It does not bypass safety errors.
+
+Section identity comments and explicitly configured current titles resolve to
+stable IDs. Historical configuration maps and carry overrides do not apply to
+import. With no configured sections, reserved section metadata, valid or
+damaged, is an error rather than permission to discard identity. Restore the
+configuration or manually remove metadata and section structure before choosing
+a flat import compatible with the command's input rules.
 
 
 `sacho merge-driver`

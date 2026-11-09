@@ -34,7 +34,6 @@ pub mod repo;
 mod repository_url;
 mod section;
 mod section_map;
-#[allow(dead_code)] // Writer and tolerant consumers are activated in stage D.
 mod section_metadata;
 /// Section pattern parsing and matching types.
 pub mod section_pattern;
