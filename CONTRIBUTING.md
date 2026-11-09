@@ -96,10 +96,10 @@ inference:
 mise run test:vcs
 ~~~~
 
-Use mutation testing for changes to core Rust logic and the tests that protect
-it.  This includes parsing, ordering, normalization, reference resolution,
-repository discovery, changelog compilation, VCS checks, and repository
-mutations:
+Mutation testing is optional.  Consider running it when a change adds a lot of
+tests or reworks logic those tests are meant to protect, such as parsing,
+ordering, normalization, reference resolution, repository discovery, changelog
+compilation, VCS checks, or repository mutations:
 
 ~~~~ sh
 mise run mutants
@@ -107,12 +107,12 @@ mise run mutants
 
 This runs cargo-mutants, which checks whether the test suite catches small
 changes injected into the Rust code.  A full workspace run can take tens of
-minutes or longer, depending on the machine and the number of mutants.  Treat
-it as a finishing-stage check after the implementation and normal tests are
-stable, not as part of the edit-compile-test loop.
+minutes or longer, depending on the machine and the number of mutants.  A
+nightly CI workflow already runs the full suite, so a pull request does not
+need local results.
 
-During active development, skip mutation testing or limit it to the code being
-worked on.  Pass cargo-mutants filters through the mise task, for example:
+When you do run it locally, limit the run to the code you are working on.  Pass
+cargo-mutants filters through the mise task, for example:
 
 ~~~~ sh
 mise run mutants -- --file 'crates/sacho/src/fragment.rs'
@@ -120,11 +120,10 @@ mise run mutants -- --in-diff HEAD~1
 mise run mutants -- --re 'fragment'
 ~~~~
 
-The `--iterate` option skips mutants caught by previous runs.  Once the change
-is ready for final review, run the full workspace mutation suite without
-development-only filters.  A successful run must report zero missed mutants and
-zero timed-out mutants.  Unviable mutants are acceptable; missed or timed-out
-mutants mean the test suite or implementation needs more work.
+The `--iterate` option skips mutants caught by previous runs.  A useful run
+reports zero missed mutants and zero timed-out mutants; unviable mutants are
+acceptable.  Missed or timed-out mutants mean the test suite or the
+implementation still needs work.
 
 On a machine with spare CPU and memory, pass `-j` through the mise task to test
 several mutants in parallel:
@@ -217,18 +216,9 @@ If your change affects runtime behavior, also run:
 mise run test
 ~~~~
 
-If your change affects core Rust logic or the tests that protect it, run the
-mutation suite after the implementation is stable:
-
-~~~~ sh
-mise run mutants
-~~~~
-
-The mutation-testing result must have zero missed mutants and zero timed-out
-mutants before opening a pull request.
-
-Changes limited to documentation, packaging, CI configuration, non-Rust
-tooling, CLI help text, or other presentational metadata do not require
-mutation testing.
+Mutation testing is not a requirement for a pull request.  If your change adds
+or rewrites a substantial amount of test coverage, running it locally can be a
+useful extra check; the Development section above shows how to keep a run
+manageable.
 
 Make sure generated formatting changes are included in your commit.
