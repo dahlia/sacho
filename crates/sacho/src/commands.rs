@@ -1029,6 +1029,7 @@ pub fn infer_section_pattern(
         return Ok(None);
     };
     let pattern = SectionPatternConfig {
+        title: None,
         source,
         id,
         directory: capture_pattern,
@@ -7398,6 +7399,7 @@ mod tests {
     fn init_config_renders_selected_sections() {
         let options = InitOptions {
             sections: vec![SectionConfig {
+                title: None,
                 id: String::from("👨‍👩‍👧 core"),
                 directory: PathBuf::from("core"),
                 paths: vec![String::from("packages/core/**")],

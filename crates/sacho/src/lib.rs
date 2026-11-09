@@ -35,6 +35,7 @@ mod repository_url;
 mod section;
 /// Section pattern parsing and matching types.
 pub mod section_pattern;
+pub mod section_title;
 /// Version-control integration types.
 pub mod vcs;
 
@@ -49,3 +50,5 @@ pub use crate::section_pattern::{
     SectionPattern, SectionPatternConfig, SectionPatternConfigError, SectionPatternError,
     SectionPatternSegment,
 };
+
+pub use crate::section_title::{SectionTitleError, SectionTitleTemplate, validate_section_title};

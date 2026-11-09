@@ -88,6 +88,10 @@ pub struct SectionPatternConfig {
     /// Changelog section identifier template.
     pub id: SectionPattern,
 
+    /// Optional plain output title template, independent of the stable ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<crate::section_title::SectionTitleTemplate>,
+
     /// Fragment subdirectory template.
     pub directory: SectionPattern,
 
@@ -129,6 +133,17 @@ impl SectionPatternConfig {
                     "must contain each source capture exactly once and no other captures",
                 ));
             }
+        }
+
+        if let Some(title) = &self.title
+            && let Some(variable) = title
+                .variables()
+                .find(|variable| !source_variables.contains(*variable))
+        {
+            return Err(config_error(
+                "title",
+                format!("uses undeclared capture {variable:?}"),
+            ));
         }
 
         for (index, pattern) in self.paths.iter().flatten().enumerate() {
@@ -790,6 +805,7 @@ mod tests {
     #[test]
     fn validates_reversible_pattern_configuration() {
         let config = SectionPatternConfig {
+            title: None,
             source: SectionPattern::from_str("packages/{scope}/plugin-{name}").expect("source"),
             id: SectionPattern::from_str("@{scope}/{name}").expect("id"),
             directory: SectionPattern::from_str("{scope}/plugin-{name}").expect("directory"),
@@ -805,30 +821,35 @@ mod tests {
     fn rejects_non_reversible_pattern_configuration() {
         let cases = [
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str("packages/core").expect("source"),
                 id: SectionPattern::from_str("core").expect("id"),
                 directory: SectionPattern::from_str("core").expect("directory"),
                 paths: None,
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str("packages/{name}").expect("source"),
                 id: SectionPattern::from_str("{other}").expect("id"),
                 directory: SectionPattern::from_str("{name}").expect("directory"),
                 paths: None,
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str("packages/{name}").expect("source"),
                 id: SectionPattern::from_str("{name}/{name}").expect("id"),
                 directory: SectionPattern::from_str("{name}").expect("directory"),
                 paths: None,
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str("packages/{name}").expect("source"),
                 id: SectionPattern::from_str("{name}").expect("id"),
                 directory: SectionPattern::from_str("../{name}").expect("directory"),
                 paths: None,
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str("packages/{name}").expect("source"),
                 id: SectionPattern::from_str("{name}").expect("id"),
                 directory: SectionPattern::from_str("{name}").expect("directory"),
@@ -837,12 +858,14 @@ mod tests {
                 ]),
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str(r"packages\{name}").expect("source"),
                 id: SectionPattern::from_str("{name}").expect("id"),
                 directory: SectionPattern::from_str("{name}").expect("directory"),
                 paths: None,
             },
             SectionPatternConfig {
+                title: None,
                 source: SectionPattern::from_str(r"{name}\packages").expect("source"),
                 id: SectionPattern::from_str("{name}").expect("id"),
                 directory: SectionPattern::from_str("{name}").expect("directory"),

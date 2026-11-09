@@ -988,6 +988,7 @@ fn resolve_interactive_sections(
                 .collect()
         };
         sections.push(SectionConfig {
+            title: None,
             id: candidate.id.clone(),
             directory,
             paths,

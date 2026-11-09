@@ -750,6 +750,25 @@ pub enum Error {
 /// Configuration-specific error.
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
+    /// An explicitly configured plain title is invalid.
+    #[snafu(display("invalid sections[{index}].title: {message}"))]
+    InvalidSectionTitle {
+        /// Section configuration index.
+        index: usize,
+        /// Validation diagnostic.
+        message: String,
+    },
+    /// Two explicit sections have the same effective output title.
+    #[snafu(display("section title {title:?} is shared by {first_id:?} and {second_id:?}"))]
+    DuplicateSectionTitle {
+        /// Conflicting output title.
+        title: String,
+        /// First stable identifier.
+        first_id: String,
+        /// Second stable identifier.
+        second_id: String,
+    },
+
     /// The TOML document could not be parsed.
     #[snafu(display("TOML parse error: {source}"))]
     Parse {
