@@ -941,11 +941,22 @@ fn resolve_interactive_sections(
             Err(error) => eprintln!("{error}"),
         }
     };
-    let selected_ids = selected
+    let mut selected_sections = selected
         .iter()
-        .map(|index| candidates[*index].id.clone())
+        .map(|index| {
+            (
+                candidates[*index].id.clone(),
+                candidates[*index].title.clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    if let Some(pattern) = infer_section_pattern(root, &selected_ids, fragment_directory)?
+    for (id, title) in &mut selected_sections {
+        while let Err(error) = sacho::validate_section_title(title) {
+            eprintln!("Invalid title for {id}: {error}");
+            *title = prompt(&format!("Plain one-line title for {id}"), "")?;
+        }
+    }
+    if let Some(pattern) = infer_section_pattern(root, &selected_sections, fragment_directory)?
         && prompt_bool(
             &format!(
                 "Use inferred section pattern {} -> {}",
@@ -959,7 +970,7 @@ fn resolve_interactive_sections(
     let mut sections = Vec::new();
     let mut used_directories = Vec::new();
     let reserved_directories = [FragmentsConfig::default().next_file];
-    for index in selected {
+    for (position, index) in selected.into_iter().enumerate() {
         let candidate = &candidates[index];
         let suggested = suggest_section_directory_avoiding(
             &candidate.id,
@@ -988,7 +999,7 @@ fn resolve_interactive_sections(
                 .collect()
         };
         sections.push(SectionConfig {
-            title: None,
+            title: Some(selected_sections[position].1.clone()),
             id: candidate.id.clone(),
             directory,
             paths,

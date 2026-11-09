@@ -58,8 +58,11 @@ pub struct ImportedUnreleased {
 /// A possible Sacho section found in an existing changelog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogSectionCandidate {
-    /// Text of the direct level-three heading.
+    /// Recorded stable ID, or the plain heading when no valid metadata exists.
     pub id: String,
+
+    /// Observed plain title, retained independently of the stable ID.
+    pub title: String,
 
     /// Number of matching level-three heading occurrences.
     pub occurrences: usize,
@@ -117,7 +120,7 @@ struct FragmentFrontmatter<'a> {
 #[derive(Debug, Clone)]
 struct SectionCandidateRegion {
     unreleased: bool,
-    sections: Vec<String>,
+    sections: Vec<(String, String)>,
 }
 
 /// Finds direct level-three headings inside changelog version regions.
@@ -138,7 +141,7 @@ pub fn discover_section_candidates(
     unreleased_heading: &str,
 ) -> Vec<ChangelogSectionCandidate> {
     let arena = Arena::new();
-    let root = parse_document(&arena, changelog, &comrak_options());
+    let root = parse_document(&arena, changelog, &crate::release_context::options());
     let starts = line_starts(changelog);
     let mut introductions = crate::release_context::IntroductionMask::new(changelog);
     let mut regions = Vec::<SectionCandidateRegion>::new();
@@ -169,7 +172,8 @@ pub fn discover_section_candidates(
                     && let Some(index) = current
                     && !text.is_empty()
                 {
-                    regions[index].sections.push(text);
+                    let id = crate::section_metadata::probe(child).unwrap_or_else(|| text.clone());
+                    regions[index].sections.push((id, text));
                 }
             }
             NodeValue::Paragraph
@@ -187,23 +191,24 @@ pub fn discover_section_candidates(
             .iter()
             .filter(|region| region.unreleased == unreleased)
         {
-            for id in &region.sections {
+            for (id, title) in &region.sections {
                 if candidates.iter().any(|candidate| candidate.id == *id) {
                     continue;
                 }
                 let occurrences = regions
                     .iter()
                     .flat_map(|region| &region.sections)
-                    .filter(|section| *section == id)
+                    .filter(|(section, _)| section == id)
                     .count();
                 candidates.push(ChangelogSectionCandidate {
                     id: id.clone(),
+                    title: title.clone(),
                     occurrences,
                     appears_in_unreleased: regions
                         .iter()
                         .filter(|region| region.unreleased)
                         .flat_map(|region| &region.sections)
-                        .any(|section| section == id),
+                        .any(|(section, _)| section == id),
                 });
             }
         }
@@ -518,6 +523,41 @@ fn render_target_section(
     let line_starts = line_starts(source);
     let intro =
         crate::release_context::introduction(&line_starts, document, target.start..target.end)?;
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
+    // Determine attachment before the rendering parse drops or moves footnotes.
+    let structural_arena = Arena::new();
+    let structural = parse_document(
+        &structural_arena,
+        source,
+        &crate::release_context::options(),
+    );
+    let owned_headings = structural
+        .children()
+        .filter(|heading| crate::section_metadata::probe(heading).is_some())
+        .map(|heading| crate::release_context::node_offset(&line_starts, heading))
+        .collect::<BTreeSet<_>>();
+    let metadata_nodes = document
+        .children()
+        .filter(|heading| {
+            !introductions.contains(crate::release_context::node_offset(&line_starts, heading))
+                && owned_headings
+                    .contains(&crate::release_context::node_offset(&line_starts, heading))
+                && crate::section_metadata::probe(heading).is_some()
+        })
+        .filter_map(|heading| heading.next_sibling())
+        .collect::<Vec<_>>();
+    // Comrak's CommonMark serializer does not protect literal dollars from
+    // its math extension. Preserve already-plain text in owned headings while
+    // leaving intentional math, links, and formatting in other nodes intact.
+    for marker in &metadata_nodes {
+        let heading = marker.previous_sibling().expect("paired identity heading");
+        for node in heading.descendants() {
+            let mut data = node.data_mut();
+            if let NodeValue::Text(text) = &data.value {
+                data.value = NodeValue::Raw(crate::compile::escape_section_title(text));
+            }
+        }
+    }
     let mut nodes = document
         .children()
         .filter(|node| {
@@ -525,6 +565,11 @@ fn render_target_section(
                 .is_some_and(|start| (target.start..target.end).contains(&start))
         })
         .filter(|node| !(intro.is_some() && crate::release_context::marker(node).is_some()))
+        .filter(|node| {
+            !metadata_nodes
+                .iter()
+                .any(|metadata| std::ptr::eq(*metadata, *node))
+        })
         .collect::<Vec<_>>();
     if skip_heading
         && nodes
@@ -1456,6 +1501,109 @@ mod tests {
     }
 
     #[test]
+    fn discovery_retains_observed_titles_and_prefers_unreleased_identity() {
+        let source = "# Changes\n\n## Unreleased\n\n### New API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  New.\n\n## Version 1.0.0\n\n### Old API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Old.\n\n### Broken API\n\n<!-- sacho:section:v2 id=unknown -->\n";
+        let candidates = discover_section_candidates(source, "Changes", "To be released.");
+        assert_eq!(candidates[0].id, "stable");
+        assert_eq!(candidates[0].title, "New API");
+        assert_eq!(candidates[0].occurrences, 2);
+        assert!(candidates[0].appears_in_unreleased);
+        assert_eq!(candidates[1].id, "Broken API");
+    }
+
+    #[test]
+    fn discovery_does_not_attach_identity_across_footnote_definitions() {
+        for reference in ["", "[^a]"] {
+            let source = format!(
+                "## Version 1.0.0\n\n### Other\n\n[^a]: note\n\n<!-- sacho:section:v1 id=core -->\n\n -  Item.{reference}\n"
+            );
+            let candidates = discover_section_candidates(&source, "Changes", "To be released.");
+            assert_eq!(candidates[0].id, "Other");
+        }
+    }
+
+    #[test]
+    fn show_does_not_hide_identity_across_footnote_definitions() {
+        for reference in ["", "[^a]"] {
+            let source = format!(
+                "## Version 1.0.0\n\n### Other\n\n[^a]: note\n\n<!-- sacho:section:v1 id=core -->\n\n -  Item.{reference}\n"
+            );
+            let rendered = render_released_section(&source, "1.0.0", None, false, true, "Changes")
+                .unwrap()
+                .unwrap();
+            assert!(rendered.markdown.contains("sacho:section:v1 id=core"));
+        }
+    }
+
+    #[test]
+    fn show_preserves_plain_owned_titles_without_flattening_other_headings() {
+        for (title, heading) in [
+            ("$x$ API", r"$x\$ API"),
+            ("C #", r"C \#"),
+            ("#", r"\#"),
+            ("<a>", r"\<a\>"),
+            ("<https://x.y>", r"\<https://x.y\>"),
+            ("<mailto:a@b.c>", r"\<mailto:a@b.c\>"),
+            ("<foo:bar>", r"\<foo:bar\>"),
+            ("&lt;", r"\&lt;"),
+            ("&gt;", r"\&gt;"),
+            ("&quot;", r"\&quot;"),
+            (r"\<foo:bar>", r"\\\<foo:bar\>"),
+            ("&amp;", r"\&amp;"),
+            ("*bold*", r"\*bold\*"),
+        ] {
+            for intro in [
+                "",
+                "<!-- sacho:release-intro:begin -->\n\nIntro.\n\n<!-- sacho:release-intro:end -->\n\n",
+            ] {
+                for wrap in [false, true] {
+                    for skip in [false, true] {
+                        let source = format!(
+                            "## Version 1.0.0\n\n{intro}### {heading}\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Fixed.\n\n### Math $x$\n\n -  Existing math.\n"
+                        );
+                        let shown =
+                            render_released_section(&source, "1.0.0", None, skip, wrap, "Changes")
+                                .unwrap()
+                                .unwrap();
+                        assert!(!shown.markdown.contains("sacho:section:"));
+                        let arena = Arena::new();
+                        let root = parse_document(&arena, &shown.markdown, &comrak_options());
+                        let headings = root.children().filter(|node| matches!(node.data().value, NodeValue::Heading(h) if h.level == 3)).collect::<Vec<_>>();
+                        assert_eq!(headings.len(), 2);
+                        assert_eq!(plain_text(headings[0]), title, "{}", shown.markdown);
+                        assert!(
+                            headings[1]
+                                .descendants()
+                                .any(|node| matches!(node.data().value, NodeValue::Math(_)))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn show_hides_only_valid_attached_identity_comments() {
+        for intro in [
+            "",
+            "<!-- sacho:release-intro:begin -->\n\nIntro.\n\n<!-- sacho:release-intro:end -->\n\n",
+        ] {
+            let source = format!(
+                "# Changes\n\n## Version 1.0.0\n\nReleased.\n\n{intro}### API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Fixed.\n\n<!-- ordinary -->\n\n### Broken\n\n<!-- sacho:section:v2 id=broken -->\n"
+            );
+            let rendered = render_released_section(&source, "1.0.0", None, false, true, "Changes")
+                .unwrap()
+                .unwrap();
+            assert!(!rendered.markdown.contains("id=stable"));
+            assert!(rendered.markdown.contains("<!-- ordinary -->"));
+            assert!(rendered.markdown.contains("sacho:section:v2 id=broken"));
+            if !intro.is_empty() {
+                assert!(rendered.markdown.contains("Intro."));
+            }
+        }
+    }
+
+    #[test]
     fn discovers_section_candidates_with_unreleased_entries_first() {
         let changelog = "\
 Project changes
@@ -1507,21 +1655,25 @@ Released on July 1, 2026.
             candidates,
             vec![
                 ChangelogSectionCandidate {
+                    title: String::from("core"),
                     id: String::from("core"),
                     occurrences: 2,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("Added"),
                     id: String::from("Added"),
                     occurrences: 1,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("Version 9.9.9"),
                     id: String::from("Version 9.9.9"),
                     occurrences: 1,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("cli"),
                     id: String::from("cli"),
                     occurrences: 1,
                     appears_in_unreleased: false,
@@ -1538,11 +1690,13 @@ Released on July 1, 2026.
                 discover_section_candidates(&changelog, "Project changes", "To be released."),
                 vec![
                     ChangelogSectionCandidate {
+                        title: "core".into(),
                         id: "core".into(),
                         occurrences: 1,
                         appears_in_unreleased: true,
                     },
                     ChangelogSectionCandidate {
+                        title: "cli".into(),
                         id: "cli".into(),
                         occurrences: 2,
                         appears_in_unreleased: false,
@@ -1563,6 +1717,7 @@ Released on July 1, 2026.
         assert_eq!(
             candidates,
             vec![ChangelogSectionCandidate {
+                title: String::from("server"),
                 id: String::from("server"),
                 occurrences: 1,
                 appears_in_unreleased: true,
@@ -1599,6 +1754,7 @@ Released on July 1, 2026.
             assert_eq!(
                 candidates,
                 vec![ChangelogSectionCandidate {
+                    title: String::from("core"),
                     id: String::from("core"),
                     occurrences: 1,
                     appears_in_unreleased: false,
@@ -1629,6 +1785,7 @@ Released on July 1, 2026.
         assert_eq!(
             candidates,
             vec![ChangelogSectionCandidate {
+                title: String::from("core"),
                 id: String::from("core"),
                 occurrences: 1,
                 appears_in_unreleased: false,

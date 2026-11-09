@@ -961,7 +961,7 @@ pub fn infer_section_paths(
     Ok(matches)
 }
 
-/// Infers one reversible section pattern from selected changelog section ids.
+/// Infers a reversible ID pattern and a consistent observed title template.
 ///
 /// Inference succeeds only when at least two ids share the same prefix and
 /// their final components name sibling directories under exactly one common
@@ -969,9 +969,13 @@ pub fn infer_section_paths(
 /// also pass the runtime path-safety checks for patterned sections.
 pub fn infer_section_pattern(
     root: impl AsRef<Path>,
-    ids: &[String],
+    sections: &[(String, String)],
     fragment_directory: &Path,
 ) -> Result<Option<SectionPatternConfig>> {
+    let ids = sections
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
     if ids.len() < 2 {
         return Ok(None);
     }
@@ -981,7 +985,7 @@ pub fn infer_section_pattern(
     let mut id_prefix = None::<&str>;
     let mut common_parents = None::<BTreeSet<String>>;
     let mut capture_values = BTreeSet::new();
-    for id in ids {
+    for id in &ids {
         let stem = id.rsplit('/').next().unwrap_or(id);
         if capture_pattern.captures(stem).is_none() || !capture_values.insert(stem) {
             return Ok(None);
@@ -1028,8 +1032,28 @@ pub fn infer_section_pattern(
     let Ok(id) = SectionPattern::from_str(&id) else {
         return Ok(None);
     };
+    let (first_id, first_title) = &sections[0];
+    let first_name = first_id.rsplit('/').next().unwrap_or(first_id);
+    if !first_title.contains(first_name) {
+        return Ok(None);
+    }
+    let title_source = first_title
+        .split(first_name)
+        .map(escape_section_pattern_literal)
+        .collect::<Vec<_>>()
+        .join("{name}");
+    let Ok(title) = title_source.parse::<crate::SectionTitleTemplate>() else {
+        return Ok(None);
+    };
+    for (id, observed) in sections {
+        let name = id.rsplit('/').next().unwrap_or(id);
+        let captures = BTreeMap::from([("name".into(), name.to_owned())]);
+        if title.render(&captures).ok().as_ref() != Some(observed) {
+            return Ok(None);
+        }
+    }
     let pattern = SectionPatternConfig {
-        title: None,
+        title: Some(title),
         source,
         id,
         directory: capture_pattern,
@@ -1038,7 +1062,7 @@ pub fn infer_section_pattern(
     if pattern.validate().is_err() {
         return Ok(None);
     }
-    if !inferred_section_pattern_is_safe(root.as_ref(), ids, fragment_directory, &pattern) {
+    if !inferred_section_pattern_is_safe(root.as_ref(), &ids, fragment_directory, &pattern) {
         return Ok(None);
     }
     Ok(Some(pattern))
@@ -6326,6 +6350,9 @@ fn render_init_config(config: &Config) -> String {
     for section in &config.sections {
         output.push_str("\n[[sections]]\n");
         output.push_str(&format!("id = {}\n", toml_basic_string(&section.id)));
+        if let Some(title) = &section.title {
+            output.push_str(&format!("title = {}\n", toml_basic_string(title)));
+        }
         output.push_str(&format!(
             "directory = {}\n",
             toml_basic_string(&section.directory.display().to_string())
@@ -6342,6 +6369,12 @@ fn render_init_config(config: &Config) -> String {
             "id = {}\n",
             toml_basic_string(&pattern.id.to_string())
         ));
+        if let Some(title) = &pattern.title {
+            output.push_str(&format!(
+                "title = {}\n",
+                toml_basic_string(&title.to_string())
+            ));
+        }
         output.push_str(&format!(
             "directory = {}\n",
             toml_basic_string(&pattern.directory.to_string())
@@ -7387,6 +7420,72 @@ mod tests {
     }
 
     #[test]
+    fn title_aware_inference_preserves_titles_and_declines_inconsistent_titles() {
+        let temp = TempDir::new().unwrap();
+        for name in ["core", "cli"] {
+            fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+        }
+        let selected = [
+            ("@pkg/core".into(), "core (Rust)".into()),
+            ("@pkg/cli".into(), "cli (Rust)".into()),
+        ];
+        let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pattern.id.to_string(), "@pkg/{name}");
+        assert_eq!(pattern.title.unwrap().to_string(), "{name} (Rust)");
+        let inconsistent = [
+            ("@pkg/core".into(), "Main API".into()),
+            ("@pkg/cli".into(), "Command API".into()),
+        ];
+        assert!(
+            infer_section_pattern(temp.path(), &inconsistent, Path::new("changes.d"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn init_preserves_plain_titles_and_rejects_invalid_titles_before_writes() {
+        let temp = TempDir::new().unwrap();
+        let section = SectionConfig {
+            id: "opaque".into(),
+            title: Some("API (Rust)".into()),
+            directory: "core".into(),
+            paths: vec![],
+        };
+        let options = InitOptions {
+            sections: vec![section.clone()],
+            ..Default::default()
+        };
+        let config = default_init_config(temp.path(), &options).unwrap();
+        assert_eq!(
+            Config::parse(&render_init_config(&config))
+                .unwrap()
+                .sections,
+            vec![section.clone()]
+        );
+        let invalid = SectionConfig {
+            title: Some(" API".into()),
+            ..section
+        };
+        let before = fs::read_dir(temp.path()).unwrap().count();
+        assert!(
+            init_repository(
+                temp.path(),
+                InitOptions {
+                    sections: vec![invalid],
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("sacho.toml").exists());
+        assert!(!temp.path().join("changes.d").exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), before);
+    }
+
+    #[test]
     fn init_config_omits_blank_repository_url() {
         let config = default_init_config(
             Path::new("project"),
@@ -7438,7 +7537,10 @@ mod tests {
         fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference");
@@ -7527,7 +7629,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7547,7 +7652,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7567,7 +7675,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/next".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/next".to_owned(), "@example/next".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("best-effort inference");
@@ -7589,7 +7700,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("generated/changes"),
         )
         .expect("best-effort inference");
@@ -7611,7 +7725,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference");
@@ -7627,13 +7744,19 @@ mod tests {
 
         let duplicate = infer_section_pattern(
             temp.path(),
-            &["team{old}/core".to_owned(), "team{old}/core".to_owned()],
+            &[
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("duplicate inference");
         let pattern = infer_section_pattern(
             temp.path(),
-            &["team{old}/core".to_owned(), "team{old}/cli".to_owned()],
+            &[
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+                ("team{old}/cli".to_owned(), "team{old}/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7652,7 +7775,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["/packages/core".to_owned(), "/packages/cli".to_owned()],
+            &[
+                ("/packages/core".to_owned(), "/packages/core".to_owned()),
+                ("/packages/cli".to_owned(), "/packages/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("best-effort inference");

@@ -179,7 +179,6 @@ impl<'a> SectionResolver<'a> {
 
     /// Returns the explicitly configured title for a current stable ID.
     /// Unknown and legacy shadowed fragment IDs retain their legacy heading.
-    #[allow(dead_code)] // Activated by the common writer in stage D.
     pub(crate) fn current_title(&self, id: &str) -> Result<Option<String>, SectionResolutionError> {
         let section = match self.resolve_id(id) {
             Ok(Some(section)) => section,
@@ -388,6 +387,32 @@ impl<'a> SectionResolver<'a> {
         ordered.extend(unknown);
         Ok(ordered)
     }
+}
+
+/// Validates all active titles before filtering or writing and records explicit titles.
+/// This accepts section IDs only, so non-materialized carry need not parse bodies.
+pub(crate) fn active_titles(
+    config: &Config,
+    ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let resolver = SectionResolver::from_config(config)?;
+    let mut effective = BTreeMap::<String, String>::new();
+    let mut titles = BTreeMap::new();
+    for id in ids {
+        let title = resolver
+            .current_title(id)
+            .map_err(|error| Error::SectionPattern {
+                message: error.to_string(),
+            })?;
+        let heading = title.as_deref().unwrap_or(id);
+        if let Some(previous) = effective.insert(heading.to_owned(), id.clone()) {
+            return Err(Error::SectionPattern {
+                message: format!("section title {heading:?} is shared by {previous:?} and {id:?}"),
+            });
+        }
+        titles.insert(id.clone(), title);
+    }
+    Ok(titles)
 }
 
 pub(crate) fn has_sections(config: &Config) -> bool {
