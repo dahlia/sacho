@@ -109,6 +109,7 @@ fn unmapped_renamed_archive_fails_before_writing_any_fragment() {
             let error = carry(
                 &repo,
                 CarryOptions {
+                    runtime_maps: Vec::new(),
                     version: "1.0.0".into(),
                 },
             )

@@ -21,6 +21,7 @@ use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_wor
 use crate::release_context::line_starts;
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolver, has_sections};
+use crate::section_map::{CompiledMaps, MapDomain, MapUsage};
 
 /// Entries decompiled from a released changelog section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +219,40 @@ pub fn discover_section_candidates(
 
 /// Parses a released version section and returns deterministic carry fragments.
 pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Result<CarriedRelease> {
+    carry_release_with_options(repo, changelog, version, &CarryReleaseOptions::default())
+}
+
+/// Options for interpreting historical section names in one carry operation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CarryReleaseOptions {
+    /// Carry-only overrides for recorded IDs or historical plain headings.
+    pub runtime_maps: Vec<crate::RuntimeSectionMap>,
+}
+
+/// Parses a released section using explicit historical identity overrides.
+///
+/// All mappings target current stable IDs in one hop. Syntax and literal
+/// targets are validated before parsing the selected release; unused overrides
+/// and conflicting matching patterns fail before producing fragment outputs.
+pub fn carry_release_with_options(
+    repo: &Repository,
+    changelog: &str,
+    version: &str,
+    options: &CarryReleaseOptions,
+) -> Result<CarriedRelease> {
+    let mut evaluator = CarrySectionEvaluator::new(repo, options)?;
     let target =
         find_target_section_with_title(changelog, version, None, &repo.config().changelog.title)
             .ok_or_else(|| Error::ReleasedVersionNotFound {
                 version: version.to_owned(),
             })?;
-    let entries = parse_entries(repo, changelog, target.body_start..target.end)?;
+    let entries = parse_entries(
+        repo,
+        changelog,
+        target.body_start..target.end,
+        &mut evaluator,
+    )?;
+    evaluator.finish(&options.runtime_maps)?;
     let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
         merge_fragment_entry(&mut grouped, entry)?;
@@ -813,10 +842,162 @@ fn find_target_section(
     None
 }
 
+/// Carry interpretation layers; imports deliberately use current identities only.
+struct CarrySectionEvaluator<'a> {
+    resolver: SectionResolver<'a>,
+    config_maps: CompiledMaps,
+    runtime_maps: CompiledMaps,
+    runtime_usage: MapUsage,
+    observed_keys: BTreeSet<String>,
+}
+
+impl<'a> CarrySectionEvaluator<'a> {
+    fn new(repo: &'a Repository, options: &CarryReleaseOptions) -> Result<Self> {
+        if !has_sections(repo.config())
+            && (!options.runtime_maps.is_empty() || !repo.config().section_maps.is_empty())
+        {
+            return Err(Error::SectionMapping {
+                message: "maps require sections".into(),
+            });
+        }
+        let resolver = SectionResolver::from_config(repo.config())?;
+        let current = |id: &str| resolver.resolve_id(id).map_err(|error| error.to_string());
+        let config_maps = CompiledMaps::configuration(&repo.config().section_maps, current)
+            .map_err(|error| Error::SectionMapping {
+                message: error.to_string(),
+            })?;
+        let runtime_maps =
+            CompiledMaps::runtime(&options.runtime_maps, current).map_err(|error| {
+                Error::SectionMapping {
+                    message: error.to_string(),
+                }
+            })?;
+        let runtime_usage = runtime_maps.usage();
+        Ok(Self {
+            resolver,
+            config_maps,
+            runtime_maps,
+            runtime_usage,
+            observed_keys: BTreeSet::new(),
+        })
+    }
+
+    fn resolve(
+        &mut self,
+        title: &str,
+        recorded_id: Option<&str>,
+        line: usize,
+        column: usize,
+    ) -> Result<String> {
+        if title.is_empty() {
+            return Err(Error::SectionMetadata {
+                line,
+                column,
+                message: "section heading must not be empty".into(),
+            });
+        }
+        let key = recorded_id.unwrap_or(title);
+        self.observed_keys.insert(key.to_owned());
+        self.runtime_maps
+            .observe(MapDomain::Runtime, key, &mut self.runtime_usage);
+        let context = |message: String| {
+            format!("heading {title:?}, recorded ID {recorded_id:?} at {line}:{column}: {message}")
+        };
+        let mapping_error = |error: crate::section_map::MapError| Error::SectionMapping {
+            message: context(error.to_string()),
+        };
+        let current = |id: &str| {
+            self.resolver
+                .resolve_id(id)
+                .map_err(|error| error.to_string())
+        };
+        if let Some(section) = self
+            .runtime_maps
+            .select(MapDomain::Runtime, key, current)
+            .map_err(mapping_error)?
+        {
+            return Ok(section.id);
+        }
+        let selected = if let Some(recorded_id) = recorded_id {
+            self.config_maps
+                .select(MapDomain::Id, recorded_id, current)
+                .map_err(mapping_error)?
+        } else {
+            match self
+                .config_maps
+                .select_literal(MapDomain::Title, title, current)
+                .map_err(mapping_error)?
+            {
+                Some(section) => Some(section),
+                None => match self.resolver.resolve_title(title).map_err(|error| {
+                    Error::SectionPattern {
+                        message: context(error.to_string()),
+                    }
+                })? {
+                    Some(section) => Some(section),
+                    None => match self
+                        .config_maps
+                        .select_patterns(MapDomain::Title, title, current)
+                        .map_err(mapping_error)?
+                    {
+                        Some(section) => Some(section),
+                        None => self
+                            .config_maps
+                            .select(MapDomain::Id, title, current)
+                            .map_err(mapping_error)?,
+                    },
+                },
+            }
+        };
+        if let Some(section) = selected {
+            return Ok(section.id);
+        }
+        if let Some(section) =
+            self.resolver
+                .resolve_id(key)
+                .map_err(|error| Error::SectionPattern {
+                    message: context(error.to_string()),
+                })?
+        {
+            return Ok(section.id);
+        }
+        if let Some(id) = recorded_id {
+            return Err(Error::SectionMetadata {
+                line,
+                column,
+                message: format!(
+                    "unknown recorded section ID {id:?} for heading {title:?}; manually correct or delete the comment and use an explicit section mapping to recover"
+                ),
+            });
+        }
+        Err(Error::UnknownSection {
+            section: title.to_owned(),
+        })
+    }
+
+    fn finish(&self, rules: &[crate::RuntimeSectionMap]) -> Result<()> {
+        let unused = self.runtime_maps.unused(&self.runtime_usage);
+        if unused.is_empty() {
+            return Ok(());
+        }
+        Err(Error::SectionMapping {
+            message: format!(
+                "unused runtime rules {:?}; actual section input keys: {:?}",
+                unused
+                    .iter()
+                    .map(|index| (index, &rules[*index]))
+                    .collect::<Vec<_>>(),
+                self.observed_keys
+            ),
+        })
+    }
+}
+
 fn parse_entries(
     repo: &Repository,
     document: &str,
     body: Range<usize>,
+    evaluator: &mut CarrySectionEvaluator<'_>,
 ) -> Result<Vec<ParsedEntry>> {
     let arena = Arena::new();
     let options = comrak_options_with_configured_references(&BTreeMap::new(), &repo.config().links);
@@ -850,13 +1031,8 @@ fn parse_entries(
                             == crate::release_context::node_offset(&line_starts, child)
                     })
                     .map(|record| record.id.as_str());
-                current_section = Some(resolve_document_section(
-                    repo,
-                    &title,
-                    recorded_id,
-                    position.line,
-                    position.column,
-                )?);
+                current_section =
+                    Some(evaluator.resolve(&title, recorded_id, position.line, position.column)?);
             }
             NodeValue::List(list) if list.list_type == ListType::Bullet => {
                 if has_sections(repo.config()) && current_section.is_none() {

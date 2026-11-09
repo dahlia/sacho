@@ -37,8 +37,8 @@ use crate::link_resolution::{LinkResolutionPolicy, ReferenceUrlResolver, is_http
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
-    carry_release, has_released_sections, import_unreleased_document_region, insertion_title_span,
-    render_released_section,
+    CarryReleaseOptions, carry_release_with_options, has_released_sections,
+    import_unreleased_document_region, insertion_title_span, render_released_section,
 };
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
@@ -524,6 +524,9 @@ pub struct ReleaseResult {
 pub struct CarryOptions {
     /// Released version to decompile back into fragments.
     pub version: String,
+
+    /// Carry-only historical title or ID overrides, applied before config maps.
+    pub runtime_maps: Vec<crate::RuntimeSectionMap>,
 }
 
 /// Options for showing a released changelog section.
@@ -2809,7 +2812,8 @@ pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResu
 /// [`CarryResult::cleanup_warnings`].
 pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     let _lock = acquire_mutation_lock(repo)?;
-    let (plan, written_fragments, sync) = plan_carry_mutation(repo, &options.version)?;
+    let (plan, written_fragments, sync) =
+        plan_carry_mutation(repo, &options.version, &options.runtime_maps)?;
     let outcome = apply_repository_mutation(repo, &plan)?;
     Ok(CarryResult {
         written_fragments,
@@ -2967,6 +2971,7 @@ pub fn apply_import_unreleased(
 fn plan_carry_mutation(
     repo: &Repository,
     version: &str,
+    runtime_maps: &[crate::RuntimeSectionMap],
 ) -> Result<(RepositoryMutationPlan, Vec<PathBuf>, Option<SyncResult>)> {
     let changelog_path = repo.config().changelog.path.clone();
     let changelog_before = read_release_file_state(repo, &changelog_path)?;
@@ -2977,7 +2982,14 @@ fn plan_carry_mutation(
                 source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
             }
         })?;
-    let mut carried = carry_release(repo, changelog, version)?;
+    let mut carried = carry_release_with_options(
+        repo,
+        changelog,
+        version,
+        &CarryReleaseOptions {
+            runtime_maps: runtime_maps.to_vec(),
+        },
+    )?;
     for fragment in &mut carried.fragments {
         fragment.markdown = format_fragment_source(&fragment.markdown)
             .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
@@ -3021,6 +3033,13 @@ fn plan_carry_mutation(
         }
     }
     after_sources.sort_by(|left, right| compare_fragment_paths(&left.path, &right.path));
+    crate::section::active_titles(
+        repo.config(),
+        &after_sources
+            .iter()
+            .filter_map(|source| source.section.clone())
+            .collect(),
+    )?;
     let parsed_after = repo
         .config()
         .changelog
@@ -9342,6 +9361,7 @@ mod tests {
         let carry_error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9659,6 +9679,7 @@ mod tests {
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9764,6 +9785,7 @@ Released on July 1, 2026.
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9800,6 +9822,7 @@ Released on July 1, 2026.
         carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9832,6 +9855,7 @@ Released on July 1, 2026.
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9879,6 +9903,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9928,6 +9953,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9963,6 +9989,7 @@ links:
         carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10005,6 +10032,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10044,6 +10072,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10073,6 +10102,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10123,6 +10153,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10180,6 +10211,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10218,6 +10250,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10255,6 +10288,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -12982,6 +13016,7 @@ Released previously.
         assert_mutation_locked(carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.0"),
             },
         ));

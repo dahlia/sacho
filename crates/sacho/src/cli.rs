@@ -265,6 +265,16 @@ enum Command {
         /// Released version whose entries should be carried.
         #[arg(help = "Released version whose entries should be carried")]
         version: String,
+
+        /// Map one recorded ID or historical heading to a current stable ID.
+        #[arg(long = "map", num_args = 2, action = clap::ArgAction::Append,
+              value_names = ["FROM", "TO"], allow_hyphen_values = true)]
+        map: Vec<String>,
+
+        /// Map a historical family using reversible named captures.
+        #[arg(long = "map-pattern", num_args = 2, action = clap::ArgAction::Append,
+              value_names = ["FROM", "TO"], allow_hyphen_values = true)]
+        map_pattern: Vec<String>,
     },
 
     /// Import the materialized unreleased region into fragments.
@@ -542,9 +552,32 @@ impl Cli {
                 apply_release(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Carry { version } => {
+            Command::Carry {
+                version,
+                map,
+                map_pattern,
+            } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let result = carry(&repo, CarryOptions { version })?;
+                let runtime_maps = map
+                    .chunks_exact(2)
+                    .map(|pair| sacho::RuntimeSectionMap::Literal {
+                        from: pair[0].clone(),
+                        to: pair[1].clone(),
+                    })
+                    .chain(map_pattern.chunks_exact(2).map(|pair| {
+                        sacho::RuntimeSectionMap::Pattern {
+                            from: pair[0].clone(),
+                            to: pair[1].clone(),
+                        }
+                    }))
+                    .collect();
+                let result = carry(
+                    &repo,
+                    CarryOptions {
+                        version,
+                        runtime_maps,
+                    },
+                )?;
                 print_mutation_cleanup_warnings("sacho carry", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }

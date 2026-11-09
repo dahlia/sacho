@@ -93,6 +93,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// Historical mapping syntax, usage, target, or precedence is invalid.
+    #[snafu(display("section mapping failed: {message}"))]
+    SectionMapping {
+        /// Mapping detail with heading and recorded-ID context when available.
+        message: String,
+    },
     /// Section identity metadata is malformed, misplaced, or unresolvable.
     #[snafu(display("section metadata at {line}:{column}: {message}"))]
     SectionMetadata {
@@ -761,6 +767,12 @@ pub enum Error {
 /// Configuration-specific error.
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
+    /// Historical mapping syntax or a literal current-ID target is invalid.
+    #[snafu(display("invalid section maps: {message}"))]
+    InvalidSectionMaps {
+        /// Explanation of the invalid mapping or unresolved target.
+        message: String,
+    },
     /// An explicitly configured plain title is invalid.
     #[snafu(display("invalid sections[{index}].title: {message}"))]
     InvalidSectionTitle {

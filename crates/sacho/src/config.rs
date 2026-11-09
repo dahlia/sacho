@@ -44,6 +44,10 @@ pub struct Config {
     /// Ordered section pattern configuration.
     #[serde(default)]
     pub section_patterns: Vec<SectionPatternConfig>,
+
+    /// Historical title and ID mappings used only when carrying releases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub section_maps: Vec<crate::section_map::SectionMapConfig>,
 }
 
 impl Config {
@@ -133,6 +137,24 @@ impl Config {
             }) {
                 return Err(ConfigError::DuplicateSectionPattern { index });
             }
+        }
+        if !self.section_maps.is_empty() {
+            if !crate::section::has_sections(self) {
+                return Err(ConfigError::InvalidSectionMaps {
+                    message: "maps require sections".into(),
+                });
+            }
+            let resolver =
+                crate::section::SectionResolver::new(&self.sections, &self.section_patterns)
+                    .map_err(|error| ConfigError::InvalidSectionMaps {
+                        message: error.to_string(),
+                    })?;
+            crate::section_map::CompiledMaps::configuration(&self.section_maps, |id| {
+                resolver.resolve_id(id).map_err(|error| error.to_string())
+            })
+            .map_err(|error| ConfigError::InvalidSectionMaps {
+                message: error.to_string(),
+            })?;
         }
         self.vcs.validate()?;
         Ok(())
@@ -649,6 +671,7 @@ directory = "core"
                     check: CheckConfig::default(),
                     sections: unique_sections,
                     section_patterns: Vec::new(),
+                    section_maps: Vec::new(),
                 }
             })
     }
