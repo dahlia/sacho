@@ -3,6 +3,13 @@ min_version = "2026.6.15"
 [settings]
 experimental = true
 
+[env]
+# Some callers (editor integrations, agent harnesses, wrappers) set PWD with a
+# trailing slash.  Nushell refuses to start in that state, which breaks every
+# `shell = "nu -c"` task, dependency, and hook.  Rewrite PWD from the actual
+# working directory mise is using so child processes always see a clean value.
+PWD = "{{cwd}}"
+
 [tools]
 "aqua:dahlia/hongdown" = "0.5.3"
 "aqua:koalaman/shellcheck" = "0.11.0"
