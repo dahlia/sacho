@@ -5977,6 +5977,19 @@ fn ensure_materialized_current_before_mutation(repo: &Repository) -> Result<()> 
 
 fn format_fragment_source(source: &str) -> Result<String> {
     let parsed = parse_frontmatter_for_format(source)?;
+    // Reuse the formatter's lossless frontmatter split; typed fragment parsing
+    // remains after formatting, and this preflight checks reserved HTML only.
+    let body_start = source.len() - parsed.body.len();
+    let body_line_offset = source[..body_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    crate::fragment::validate_section_metadata_html(parsed.body, body_line_offset).map_err(
+        |source| Error::Fragment {
+            path: PathBuf::new(),
+            source,
+        },
+    )?;
     let body = format_markdown(parsed.body)?;
     let mut output = canonical_frontmatter(parsed.frontmatter)?;
     output.push_str(body.trim_end());
@@ -18318,6 +18331,27 @@ priority: 0
             let name = format!("{prefix}..{suffix}");
 
             prop_assert!(validate_fragment_name(&name).is_err());
+        }
+    }
+    #[test]
+    fn metadata_format_reports_original_location_without_writing() {
+        for prefix in [
+            "",
+            "---\npriority: 1\n---\n",
+            "\u{feff}---\r\npriority: 1\r\n---\r\n",
+        ] {
+            let (temp, repo) = repo_with_config("");
+            fs::create_dir_all(temp.path().join("changes.d")).unwrap();
+            let source = format!("{prefix} -  Item.\n\n    <!-- sacho:section:v1 id=evil -->\n");
+            let path = temp.path().join("changes.d/a.md");
+            fs::write(&path, &source).unwrap();
+            let expected_line = 3 + prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let error = plan_format(&repo, FormatOptions).unwrap_err();
+            assert!(
+                matches!(error, Error::Fragment { path, source: crate::FragmentError::ReservedSectionMetadata { line, column: 5 } } if path == PathBuf::from("changes.d/a.md") && line == expected_line)
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            assert!(!temp.path().join("CHANGES.md").exists());
         }
     }
 }

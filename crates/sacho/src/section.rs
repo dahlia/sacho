@@ -135,7 +135,6 @@ impl<'a> SectionResolver<'a> {
     }
 
     /// Resolves only explicitly configured current titles, never raw IDs.
-    #[allow(dead_code)] // Activated by the metadata reader in stage C.
     pub(crate) fn resolve_title(
         &self,
         title: &str,

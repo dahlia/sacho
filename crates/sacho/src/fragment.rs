@@ -387,6 +387,7 @@ pub fn parse_fragment(
         .map(|key| FragmentWarning::UnknownFrontmatterKey { key })
         .collect::<Vec<_>>();
 
+    validate_section_metadata_html(body, body_line_offset)?;
     let options = comrak_options_with_configured_references(&frontmatter.links, link_templates);
     let arena = Arena::new();
     let root = parse_document(&arena, body, &options);
@@ -541,6 +542,35 @@ fn is_configured_section_dir(
 
 fn repo_relative_path(repo: &Repository, path: &Path) -> PathBuf {
     path.strip_prefix(repo.root()).unwrap_or(path).to_path_buf()
+}
+
+/// Validates only reserved section HTML, without requiring fragment shape.
+/// Formatting calls this before normalization so errors refer to original text.
+pub(crate) fn validate_section_metadata_html(
+    body: &str,
+    body_line_offset: usize,
+) -> std::result::Result<(), FragmentError> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, body, &crate::release_context::options());
+    check_section_metadata_html(root, body, body_line_offset)
+}
+
+fn check_section_metadata_html<'a>(
+    root: &'a AstNode<'a>,
+    body: &str,
+    body_line_offset: usize,
+) -> std::result::Result<(), FragmentError> {
+    if let Some((line, column)) = crate::section_metadata::reserved_position(
+        root,
+        &crate::release_context::line_starts(body),
+        0..body.len(),
+    ) {
+        return Err(FragmentError::ReservedSectionMetadata {
+            line: line + body_line_offset,
+            column,
+        });
+    }
+    Ok(())
 }
 
 struct ParsedSource<'a> {
@@ -1314,6 +1344,23 @@ mod tests {
             ReferenceSigil::new("#"),
             UrlTemplate::new("https://example.com/issues/{n}"),
         )])
+    }
+
+    #[test]
+    fn metadata_reserved_section_html_is_rejected_with_frontmatter_location() {
+        let source = "---\npriority: 1\n---\n\n -  Bad <!-- sacho:section:v1 id=core -->\n";
+        let error = parse_fragment("test.md".into(), source, None, &IndexMap::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            FragmentError::ReservedSectionMetadata { line: 5, .. }
+        ));
+        for source in [
+            " -  Example `<!-- sacho:section:v1 id=core -->`.\n",
+            " -  Example:\n\n    ```html\n    <!-- sacho:section:v1 id=core -->\n    ```\n",
+            " -  Escaped &lt;!-- sacho:section:v1 id=core --&gt;.\n",
+        ] {
+            assert!(parse_fragment("test.md".into(), source, None, &IndexMap::new()).is_ok());
+        }
     }
 
     #[test]
@@ -2499,6 +2546,34 @@ mod tests {
                     .collect::<Vec<_>>(),
                 paths
             );
+        }
+    }
+    #[test]
+    fn metadata_preflight_does_not_require_fragment_shape() {
+        assert!(validate_section_metadata_html("A paragraph.\n\nAnother paragraph.\n", 0).is_ok());
+        assert!(
+            validate_section_metadata_html("```html\n<!-- sacho:section:v1 id=core -->\n```\n", 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn metadata_checks_unreferenced_footnotes_before_normalization() {
+        for reference in ["", "[^a]"] {
+            for definition in [
+                "[^a]: note <!-- sacho:section:v1 id=core -->\n",
+                "[^a]:\n    <!-- sacho:section:v1 id=core -->\n",
+            ] {
+                let source = format!(" -  Item.{reference}\n\n{definition}");
+                assert!(matches!(
+                    parse_fragment("test.md".into(), &source, None, &IndexMap::new()),
+                    Err(FragmentError::ReservedSectionMetadata { .. })
+                ));
+                assert!(matches!(
+                    validate_section_metadata_html(&source, 0),
+                    Err(FragmentError::ReservedSectionMetadata { .. })
+                ));
+            }
         }
     }
 }

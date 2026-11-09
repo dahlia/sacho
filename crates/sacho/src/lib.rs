@@ -33,6 +33,8 @@ pub mod released;
 pub mod repo;
 mod repository_url;
 mod section;
+#[allow(dead_code)] // Writer and tolerant consumers are activated in stage D.
+mod section_metadata;
 /// Section pattern parsing and matching types.
 pub mod section_pattern;
 pub mod section_title;

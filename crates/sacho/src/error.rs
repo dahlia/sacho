@@ -93,6 +93,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// Section identity metadata is malformed, misplaced, or unresolvable.
+    #[snafu(display("section metadata at {line}:{column}: {message}"))]
+    SectionMetadata {
+        /// Original one-based source line.
+        line: usize,
+        /// Original one-based source column.
+        column: usize,
+        /// Diagnostic including recovery guidance where appropriate.
+        message: String,
+    },
+
     /// Per-release Markdown content or stored boundaries are invalid.
     #[snafu(display("invalid {option}: {message}"))]
     InvalidReleaseContext {
@@ -977,6 +988,17 @@ pub enum ConfigError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum FragmentError {
+    /// Reserved section identity HTML appeared inside a fragment.
+    #[snafu(display(
+        "reserved section metadata is not allowed in fragments at {line}:{column}; use a code block or inline code for examples"
+    ))]
+    ReservedSectionMetadata {
+        /// Original one-based source line, including YAML frontmatter.
+        line: usize,
+        /// Original one-based source column.
+        column: usize,
+    },
+
     /// YAML frontmatter was opened but never closed.
     #[snafu(display("YAML frontmatter delimiter was not closed"))]
     UnclosedFrontmatter,
