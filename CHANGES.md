@@ -4,7 +4,7 @@ Sacho changelog
 Version 0.4.0
 -------------
 
-To be released.
+Released on November 10, 2026.
 
  -  Added `--note` and `--intro-file` to `sacho release` for an inline date
     note and a Markdown introduction from a file or standard input.
