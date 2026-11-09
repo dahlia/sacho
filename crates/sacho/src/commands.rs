@@ -1035,26 +1035,41 @@ pub fn infer_section_pattern(
     let Ok(id) = SectionPattern::from_str(&id) else {
         return Ok(None);
     };
-    let (first_id, first_title) = &sections[0];
-    let first_name = first_id.rsplit('/').next().unwrap_or(first_id);
-    if !first_title.contains(first_name) {
-        return Ok(None);
-    }
-    let title_source = first_title
-        .split(first_name)
-        .map(escape_section_pattern_literal)
-        .collect::<Vec<_>>()
-        .join("{name}");
-    let Ok(title) = title_source.parse::<crate::SectionTitleTemplate>() else {
-        return Ok(None);
-    };
+    // A package name may also occur literally in its scope. Try the repeated-
+    // capture and final-occurrence candidates from every observed title. Sorting
+    // and deduplicating candidates keeps inference independent of section order.
+    let mut title_sources = BTreeSet::new();
     for (id, observed) in sections {
         let name = id.rsplit('/').next().unwrap_or(id);
-        let captures = BTreeMap::from([("name".into(), name.to_owned())]);
-        if title.render(&captures).ok().as_ref() != Some(observed) {
+        let Some((before_name, after_name)) = observed.rsplit_once(name) else {
             return Ok(None);
-        }
+        };
+        title_sources.insert(
+            observed
+                .split(name)
+                .map(escape_section_pattern_literal)
+                .collect::<Vec<_>>()
+                .join("{name}"),
+        );
+        title_sources.insert(format!(
+            "{}{{name}}{}",
+            escape_section_pattern_literal(before_name),
+            escape_section_pattern_literal(after_name),
+        ));
     }
+    let Some(title) = title_sources
+        .into_iter()
+        .filter_map(|source| source.parse::<crate::SectionTitleTemplate>().ok())
+        .find(|title| {
+            sections.iter().all(|(id, observed)| {
+                let name = id.rsplit('/').next().unwrap_or(id);
+                let captures = BTreeMap::from([("name".into(), name.to_owned())]);
+                title.render(&captures).ok().as_ref() == Some(observed)
+            })
+        })
+    else {
+        return Ok(None);
+    };
     let pattern = SectionPatternConfig {
         title: Some(title),
         source,
@@ -7453,6 +7468,14 @@ mod tests {
             .unwrap();
         assert_eq!(pattern.id.to_string(), "@pkg/{name}");
         assert_eq!(pattern.title.unwrap().to_string(), "{name} (Rust)");
+        let repeated = [
+            ("@pkg/core".into(), "core / core".into()),
+            ("@pkg/cli".into(), "cli / cli".into()),
+        ];
+        let pattern = infer_section_pattern(temp.path(), &repeated, Path::new("changes.d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pattern.title.unwrap().to_string(), "{name} / {name}");
         let inconsistent = [
             ("@pkg/core".into(), "Main API".into()),
             ("@pkg/cli".into(), "Command API".into()),
@@ -7462,6 +7485,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn title_aware_inference_handles_names_in_scopes_in_either_order() {
+        for (scope, name) in [("pkg", "pkg"), ("acme", "me")] {
+            let temp = TempDir::new().unwrap();
+            for name in [name, "cli"] {
+                fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+            }
+            let mut selected = [
+                (format!("@{scope}/{name}"), format!("@{scope}/{name}")),
+                (format!("@{scope}/cli"), format!("@{scope}/cli")),
+            ];
+            for _ in 0..2 {
+                let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(pattern.id.to_string(), format!("@{scope}/{{name}}"));
+                assert_eq!(
+                    pattern.title.unwrap().to_string(),
+                    format!("@{scope}/{{name}}")
+                );
+                selected.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn title_aware_inference_combines_scope_overlap_and_repeated_names() {
+        let temp = TempDir::new().unwrap();
+        for name in ["pkg", "cli"] {
+            fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+        }
+        let mut selected = [
+            ("@pkg/pkg".into(), "@pkg/pkg / pkg".into()),
+            ("@pkg/cli".into(), "@pkg/cli / cli".into()),
+        ];
+        for _ in 0..2 {
+            let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pattern.title.unwrap().to_string(), "@pkg/{name} / {name}");
+            selected.reverse();
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn inferred_title_templates_are_independent_of_section_permutation(suffix in "[a-z]{1,5}") {
+            let scope = format!("pkg{suffix}");
+            let names = [scope.as_str(), "cli", "tool"];
+            let temp = TempDir::new().unwrap();
+            for name in names {
+                fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+            }
+            let selected = names.map(|name| (
+                format!("@{scope}/{name}"),
+                format!("@{scope}/{name} / {name}"),
+            ));
+            let expected = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                .unwrap().unwrap();
+            prop_assert_eq!(
+                expected.title.as_ref().unwrap().to_string(),
+                format!("@{scope}/{{name}} / {{name}}"),
+            );
+            for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+                let ordered = order.map(|index| selected[index].clone());
+                prop_assert_eq!(
+                    infer_section_pattern(temp.path(), &ordered, Path::new("changes.d")).unwrap(),
+                    Some(expected.clone()),
+                );
+            }
+        }
     }
 
     #[test]
