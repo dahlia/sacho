@@ -32,6 +32,12 @@ pub(crate) enum SectionResolutionError {
     },
 
     #[error(transparent)]
+    Title {
+        #[from]
+        source: crate::section_title::SectionTitleError,
+    },
+
+    #[error(transparent)]
     Render {
         #[from]
         source: SectionPatternError,
@@ -125,6 +131,76 @@ impl<'a> SectionResolver<'a> {
                 Some(error) => Err(error),
                 None => Ok(None),
             },
+        }
+    }
+
+    /// Resolves only explicitly configured current titles, never raw IDs.
+    pub(crate) fn resolve_title(
+        &self,
+        title: &str,
+    ) -> Result<Option<ResolvedSection>, SectionResolutionError> {
+        if let Some(section) = self
+            .explicit
+            .iter()
+            .find(|section| section.title.as_deref() == Some(title))
+        {
+            return Ok(Some(explicit_section(section)));
+        }
+        let mut candidates = Vec::new();
+        for (index, pattern) in self.patterns.iter().enumerate() {
+            let Some(inverse) = pattern
+                .title
+                .as_ref()
+                .and_then(|title| title.reversible_pattern(&pattern.source))
+            else {
+                continue;
+            };
+            let Some(captures) = inverse.captures(title) else {
+                continue;
+            };
+            let candidate = instantiate(pattern, index, &captures)?;
+            // Instantiating a validated reversible ID pattern always produces a
+            // current ID candidate. Resolving it again applies explicit overrides
+            // and catches ambiguity without enumerating the source tree.
+            let canonical = self
+                .resolve_id(&candidate.id)?
+                .expect("rendered pattern ID resolves");
+            if canonical != candidate {
+                return Err(SectionResolutionError::Shadowed {
+                    requested_id: candidate.id,
+                    explicit_id: canonical.id,
+                    directory: canonical.directory,
+                });
+            }
+            candidates.push(candidate);
+        }
+        one_candidate(title, candidates)
+    }
+
+    /// Returns the explicitly configured title for a current stable ID.
+    /// Unknown and legacy shadowed fragment IDs retain their legacy heading.
+    pub(crate) fn current_title(&self, id: &str) -> Result<Option<String>, SectionResolutionError> {
+        let section = match self.resolve_id(id) {
+            Ok(Some(section)) => section,
+            Ok(None) | Err(SectionResolutionError::Shadowed { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match section.pattern_index {
+            None => Ok(self
+                .explicit
+                .iter()
+                .find(|section| section.id == id)
+                .and_then(|section| section.title.clone())),
+            Some(index) => {
+                let pattern = &self.patterns[index];
+                let captures = pattern.id.captures(id).expect("resolved pattern ID");
+                pattern
+                    .title
+                    .as_ref()
+                    .map(|title| title.render(&captures))
+                    .transpose()
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -313,6 +389,32 @@ impl<'a> SectionResolver<'a> {
     }
 }
 
+/// Validates all active titles before filtering or writing and records explicit titles.
+/// This accepts section IDs only, so non-materialized carry need not parse bodies.
+pub(crate) fn active_titles(
+    config: &Config,
+    ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let resolver = SectionResolver::from_config(config)?;
+    let mut effective = BTreeMap::<String, String>::new();
+    let mut titles = BTreeMap::new();
+    for id in ids {
+        let title = resolver
+            .current_title(id)
+            .map_err(|error| Error::SectionPattern {
+                message: error.to_string(),
+            })?;
+        let heading = title.as_deref().unwrap_or(id);
+        if let Some(previous) = effective.insert(heading.to_owned(), id.clone()) {
+            return Err(Error::SectionPattern {
+                message: format!("section title {heading:?} is shared by {previous:?} and {id:?}"),
+            });
+        }
+        titles.insert(id.clone(), title);
+    }
+    Ok(titles)
+}
+
 pub(crate) fn has_sections(config: &Config) -> bool {
     !config.sections.is_empty() || !config.section_patterns.is_empty()
 }
@@ -429,6 +531,7 @@ mod tests {
         paths: Option<&[&str]>,
     ) -> SectionPatternConfig {
         SectionPatternConfig {
+            title: None,
             source: SectionPattern::from_str(source).expect("source"),
             id: SectionPattern::from_str(id).expect("id"),
             directory: SectionPattern::from_str(directory).expect("directory"),
@@ -443,10 +546,111 @@ mod tests {
 
     fn explicit(id: &str, directory: &str, paths: &[&str]) -> SectionConfig {
         SectionConfig {
+            title: None,
             id: id.to_owned(),
             directory: PathBuf::from(directory),
             paths: paths.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    #[test]
+    fn explicit_current_title_lookup_preserves_omission_and_exact_identity() {
+        let mut sections = [explicit("core", "core", &[]), explicit("cli", "cli", &[])];
+        sections[0].title = Some("Core API".into());
+        let resolver = SectionResolver::new(&sections, &[]).unwrap();
+        assert_eq!(
+            resolver.current_title("core").unwrap(),
+            Some("Core API".into())
+        );
+        assert_eq!(resolver.current_title("cli").unwrap(), None);
+        assert_eq!(resolver.current_title("missing").unwrap(), None);
+        assert_eq!(
+            resolver.resolve_title("Core API").unwrap().unwrap().id,
+            "core"
+        );
+        assert_eq!(resolver.resolve_title("core").unwrap(), None);
+    }
+
+    #[test]
+    fn current_title_reports_exact_explicit_shadowing_even_for_equal_directories() {
+        let mut patterns = [pattern("crates/{name}", "{name}", "{name}", None)];
+        patterns[0].title = Some("{name} (Rust)".parse().unwrap());
+        for directory in ["core", "special"] {
+            let sections = [explicit("core", directory, &[])];
+            let resolver = SectionResolver::new(&sections, &patterns).unwrap();
+            assert!(
+                matches!(resolver.resolve_title("core (Rust)"), Err(SectionResolutionError::Shadowed { requested_id, explicit_id, directory: actual }) if requested_id == "core" && explicit_id == "core" && actual == PathBuf::from(directory))
+            );
+        }
+    }
+
+    #[test]
+    fn current_titles_are_separate_from_raw_ids() {
+        let mut patterns = [pattern("crates/{name}", "{name}", "{name}", None)];
+        patterns[0].title = Some("{name} (Rust)".parse().unwrap());
+        let resolver = SectionResolver::new(&[], &patterns).unwrap();
+        assert_eq!(
+            resolver.resolve_title("core (Rust)").unwrap().unwrap().id,
+            "core"
+        );
+        assert_eq!(
+            resolver.resolve_id("core (Rust)").unwrap().unwrap().id,
+            "core (Rust)"
+        );
+        assert_eq!(
+            resolver.current_title("core").unwrap(),
+            Some("core (Rust)".into())
+        );
+        assert!(resolver.resolve_title("core").unwrap().is_none());
+        patterns[0].title = None;
+        let resolver = SectionResolver::new(&[], &patterns).unwrap();
+        assert!(resolver.resolve_title("core").unwrap().is_none());
+        assert!(resolver.current_title("core").unwrap().is_none());
+    }
+
+    #[test]
+    fn render_only_titles_and_shadowed_titles_are_not_misidentified() {
+        let mut patterns = [pattern("crates/{name}", "{name}", "{name}", None)];
+        patterns[0].title = Some("API".parse().unwrap());
+        let resolver = SectionResolver::new(&[], &patterns).unwrap();
+        assert_eq!(resolver.current_title("core").unwrap(), Some("API".into()));
+        assert!(resolver.resolve_title("API").unwrap().is_none());
+        patterns[0].title = Some("{name} (Rust)".parse().unwrap());
+        let explicit = [explicit("core", "special", &[])];
+        let resolver = SectionResolver::new(&explicit, &patterns).unwrap();
+        assert!(matches!(
+            resolver.resolve_title("core (Rust)"),
+            Err(SectionResolutionError::Shadowed { .. })
+        ));
+        assert!(
+            resolver
+                .current_title("unknown/nonmatch")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_current_titles_take_precedence_and_pattern_conflicts_fail() {
+        let mut patterns = [
+            pattern("crates/{name}", "rust/{name}", "rust/{name}", None),
+            pattern("packages/{name}", "js/{name}", "js/{name}", None),
+        ];
+        for pattern in &mut patterns {
+            pattern.title = Some("{name} API".parse().unwrap());
+        }
+        let resolver = SectionResolver::new(&[], &patterns).unwrap();
+        assert!(matches!(
+            resolver.resolve_title("core API"),
+            Err(SectionResolutionError::Ambiguous { .. })
+        ));
+        let mut explicit = [explicit("override", "override", &[])];
+        explicit[0].title = Some("core API".into());
+        let resolver = SectionResolver::new(&explicit, &patterns).unwrap();
+        assert_eq!(
+            resolver.resolve_title("core API").unwrap().unwrap().id,
+            "override"
+        );
     }
 
     #[test]

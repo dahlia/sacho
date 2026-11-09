@@ -21,6 +21,7 @@ use crate::markdown::{escape_angle_bracket_destination, format_markdown_with_wor
 use crate::release_context::line_starts;
 use crate::repo::Repository;
 use crate::section::{ResolvedSection, SectionResolver, has_sections};
+use crate::section_map::{CompiledMaps, MapDomain, MapUsage};
 
 /// Entries decompiled from a released changelog section.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,8 +59,11 @@ pub struct ImportedUnreleased {
 /// A possible Sacho section found in an existing changelog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogSectionCandidate {
-    /// Text of the direct level-three heading.
+    /// Recorded stable ID, or the plain heading when no valid metadata exists.
     pub id: String,
+
+    /// Observed plain title, retained independently of the stable ID.
+    pub title: String,
 
     /// Number of matching level-three heading occurrences.
     pub occurrences: usize,
@@ -117,7 +121,7 @@ struct FragmentFrontmatter<'a> {
 #[derive(Debug, Clone)]
 struct SectionCandidateRegion {
     unreleased: bool,
-    sections: Vec<String>,
+    sections: Vec<(String, String)>,
 }
 
 /// Finds direct level-three headings inside changelog version regions.
@@ -138,7 +142,7 @@ pub fn discover_section_candidates(
     unreleased_heading: &str,
 ) -> Vec<ChangelogSectionCandidate> {
     let arena = Arena::new();
-    let root = parse_document(&arena, changelog, &comrak_options());
+    let root = parse_document(&arena, changelog, &crate::release_context::options());
     let starts = line_starts(changelog);
     let mut introductions = crate::release_context::IntroductionMask::new(changelog);
     let mut regions = Vec::<SectionCandidateRegion>::new();
@@ -169,7 +173,8 @@ pub fn discover_section_candidates(
                     && let Some(index) = current
                     && !text.is_empty()
                 {
-                    regions[index].sections.push(text);
+                    let id = crate::section_metadata::probe(child).unwrap_or_else(|| text.clone());
+                    regions[index].sections.push((id, text));
                 }
             }
             NodeValue::Paragraph
@@ -187,23 +192,24 @@ pub fn discover_section_candidates(
             .iter()
             .filter(|region| region.unreleased == unreleased)
         {
-            for id in &region.sections {
+            for (id, title) in &region.sections {
                 if candidates.iter().any(|candidate| candidate.id == *id) {
                     continue;
                 }
                 let occurrences = regions
                     .iter()
                     .flat_map(|region| &region.sections)
-                    .filter(|section| *section == id)
+                    .filter(|(section, _)| section == id)
                     .count();
                 candidates.push(ChangelogSectionCandidate {
                     id: id.clone(),
+                    title: title.clone(),
                     occurrences,
                     appears_in_unreleased: regions
                         .iter()
                         .filter(|region| region.unreleased)
                         .flat_map(|region| &region.sections)
-                        .any(|section| section == id),
+                        .any(|(section, _)| section == id),
                 });
             }
         }
@@ -213,12 +219,40 @@ pub fn discover_section_candidates(
 
 /// Parses a released version section and returns deterministic carry fragments.
 pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Result<CarriedRelease> {
+    carry_release_with_options(repo, changelog, version, &CarryReleaseOptions::default())
+}
+
+/// Options for interpreting historical section names in one carry operation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CarryReleaseOptions {
+    /// Carry-only overrides for recorded IDs or historical plain headings.
+    pub runtime_maps: Vec<crate::RuntimeSectionMap>,
+}
+
+/// Parses a released section using explicit historical identity overrides.
+///
+/// All mappings target current stable IDs in one hop. Syntax and literal
+/// targets are validated before parsing the selected release; unused overrides
+/// and conflicting matching patterns fail before producing fragment outputs.
+pub fn carry_release_with_options(
+    repo: &Repository,
+    changelog: &str,
+    version: &str,
+    options: &CarryReleaseOptions,
+) -> Result<CarriedRelease> {
+    let mut evaluator = CarrySectionEvaluator::new(repo, options)?;
     let target =
         find_target_section_with_title(changelog, version, None, &repo.config().changelog.title)
             .ok_or_else(|| Error::ReleasedVersionNotFound {
                 version: version.to_owned(),
             })?;
-    let entries = parse_entries(repo, changelog, target.body_start..target.end)?;
+    let entries = parse_entries(
+        repo,
+        changelog,
+        target.body_start..target.end,
+        &mut evaluator,
+    )?;
+    evaluator.finish(&options.runtime_maps)?;
     let mut grouped = BTreeMap::<Option<String>, FragmentContents>::new();
     for entry in entries {
         merge_fragment_entry(&mut grouped, entry)?;
@@ -250,6 +284,7 @@ pub fn carry_release(repo: &Repository, changelog: &str, version: &str) -> Resul
         }
     }
 
+    ensure_no_unconsumed_groups(&grouped)?;
     Ok(CarriedRelease {
         version: version.to_owned(),
         fragments,
@@ -277,6 +312,7 @@ pub(crate) fn import_unreleased_document_region(
     let configured_links = released_configured_links(repo, document, root);
     let marker_prefix = configured_link_marker_prefix(document);
     let line_starts = line_starts(document);
+    let metadata = document_metadata(repo, document, region.clone())?;
     let mut version = None;
     let mut saw_heading = false;
     let mut current_section = None;
@@ -286,6 +322,13 @@ pub(crate) fn import_unreleased_document_region(
         sourcepos_start_offset(&line_starts, child.data().sourcepos.start)
             .is_some_and(|start| region.contains(&start))
     }) {
+        let offset = crate::release_context::node_offset(&line_starts, child);
+        if metadata
+            .iter()
+            .any(|record| record.marker_span.contains(&offset))
+        {
+            continue;
+        }
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level <= 2 && !saw_heading => {
@@ -309,9 +352,22 @@ pub(crate) fn import_unreleased_document_region(
                         "section heading appears before version heading",
                     ));
                 }
-                let section = plain_text(child).trim().to_owned();
-                ensure_known_section(repo, &section)?;
-                current_section = Some(section);
+                let title = plain_text(child).trim().to_owned();
+                let position = child.data().sourcepos.start;
+                let recorded_id = metadata
+                    .iter()
+                    .find(|record| {
+                        record.heading_offset
+                            == crate::release_context::node_offset(&line_starts, child)
+                    })
+                    .map(|record| record.id.as_str());
+                current_section = Some(resolve_document_section(
+                    repo,
+                    &title,
+                    recorded_id,
+                    position.line,
+                    position.column,
+                )?);
             }
             NodeValue::Heading(heading) if heading.level == 3 => {
                 if !saw_heading {
@@ -411,6 +467,7 @@ fn fragments_from_entries(
             });
         }
     }
+    ensure_no_unconsumed_groups(&grouped)?;
     Ok(fragments)
 }
 
@@ -495,6 +552,41 @@ fn render_target_section(
     let line_starts = line_starts(source);
     let intro =
         crate::release_context::introduction(&line_starts, document, target.start..target.end)?;
+    let mut introductions = crate::release_context::IntroductionMask::new(source);
+    // Determine attachment before the rendering parse drops or moves footnotes.
+    let structural_arena = Arena::new();
+    let structural = parse_document(
+        &structural_arena,
+        source,
+        &crate::release_context::options(),
+    );
+    let owned_headings = structural
+        .children()
+        .filter(|heading| crate::section_metadata::probe(heading).is_some())
+        .map(|heading| crate::release_context::node_offset(&line_starts, heading))
+        .collect::<BTreeSet<_>>();
+    let metadata_nodes = document
+        .children()
+        .filter(|heading| {
+            !introductions.contains(crate::release_context::node_offset(&line_starts, heading))
+                && owned_headings
+                    .contains(&crate::release_context::node_offset(&line_starts, heading))
+                && crate::section_metadata::probe(heading).is_some()
+        })
+        .filter_map(|heading| heading.next_sibling())
+        .collect::<Vec<_>>();
+    // Comrak's CommonMark serializer does not protect literal dollars from
+    // its math extension. Preserve already-plain text in owned headings while
+    // leaving intentional math, links, and formatting in other nodes intact.
+    for marker in &metadata_nodes {
+        let heading = marker.previous_sibling().expect("paired identity heading");
+        for node in heading.descendants() {
+            let mut data = node.data_mut();
+            if let NodeValue::Text(text) = &data.value {
+                data.value = NodeValue::Raw(crate::compile::escape_section_title(text));
+            }
+        }
+    }
     let mut nodes = document
         .children()
         .filter(|node| {
@@ -502,6 +594,11 @@ fn render_target_section(
                 .is_some_and(|start| (target.start..target.end).contains(&start))
         })
         .filter(|node| !(intro.is_some() && crate::release_context::marker(node).is_some()))
+        .filter(|node| {
+            !metadata_nodes
+                .iter()
+                .any(|metadata| std::ptr::eq(*metadata, *node))
+        })
         .collect::<Vec<_>>();
     if skip_heading
         && nodes
@@ -745,10 +842,162 @@ fn find_target_section(
     None
 }
 
+/// Carry interpretation layers; imports deliberately use current identities only.
+struct CarrySectionEvaluator<'a> {
+    resolver: SectionResolver<'a>,
+    config_maps: CompiledMaps,
+    runtime_maps: CompiledMaps,
+    runtime_usage: MapUsage,
+    observed_keys: BTreeSet<String>,
+}
+
+impl<'a> CarrySectionEvaluator<'a> {
+    fn new(repo: &'a Repository, options: &CarryReleaseOptions) -> Result<Self> {
+        if !has_sections(repo.config())
+            && (!options.runtime_maps.is_empty() || !repo.config().section_maps.is_empty())
+        {
+            return Err(Error::SectionMapping {
+                message: "maps require sections".into(),
+            });
+        }
+        let resolver = SectionResolver::from_config(repo.config())?;
+        let current = |id: &str| resolver.resolve_id(id).map_err(|error| error.to_string());
+        let config_maps = CompiledMaps::configuration(&repo.config().section_maps, current)
+            .map_err(|error| Error::SectionMapping {
+                message: error.to_string(),
+            })?;
+        let runtime_maps =
+            CompiledMaps::runtime(&options.runtime_maps, current).map_err(|error| {
+                Error::SectionMapping {
+                    message: error.to_string(),
+                }
+            })?;
+        let runtime_usage = runtime_maps.usage();
+        Ok(Self {
+            resolver,
+            config_maps,
+            runtime_maps,
+            runtime_usage,
+            observed_keys: BTreeSet::new(),
+        })
+    }
+
+    fn resolve(
+        &mut self,
+        title: &str,
+        recorded_id: Option<&str>,
+        line: usize,
+        column: usize,
+    ) -> Result<String> {
+        if title.is_empty() {
+            return Err(Error::SectionMetadata {
+                line,
+                column,
+                message: "section heading must not be empty".into(),
+            });
+        }
+        let key = recorded_id.unwrap_or(title);
+        self.observed_keys.insert(key.to_owned());
+        self.runtime_maps
+            .observe(MapDomain::Runtime, key, &mut self.runtime_usage);
+        let context = |message: String| {
+            format!("heading {title:?}, recorded ID {recorded_id:?} at {line}:{column}: {message}")
+        };
+        let mapping_error = |error: crate::section_map::MapError| Error::SectionMapping {
+            message: context(error.to_string()),
+        };
+        let current = |id: &str| {
+            self.resolver
+                .resolve_id(id)
+                .map_err(|error| error.to_string())
+        };
+        if let Some(section) = self
+            .runtime_maps
+            .select(MapDomain::Runtime, key, current)
+            .map_err(mapping_error)?
+        {
+            return Ok(section.id);
+        }
+        let selected = if let Some(recorded_id) = recorded_id {
+            self.config_maps
+                .select(MapDomain::Id, recorded_id, current)
+                .map_err(mapping_error)?
+        } else {
+            match self
+                .config_maps
+                .select_literal(MapDomain::Title, title, current)
+                .map_err(mapping_error)?
+            {
+                Some(section) => Some(section),
+                None => match self.resolver.resolve_title(title).map_err(|error| {
+                    Error::SectionPattern {
+                        message: context(error.to_string()),
+                    }
+                })? {
+                    Some(section) => Some(section),
+                    None => match self
+                        .config_maps
+                        .select_patterns(MapDomain::Title, title, current)
+                        .map_err(mapping_error)?
+                    {
+                        Some(section) => Some(section),
+                        None => self
+                            .config_maps
+                            .select(MapDomain::Id, title, current)
+                            .map_err(mapping_error)?,
+                    },
+                },
+            }
+        };
+        if let Some(section) = selected {
+            return Ok(section.id);
+        }
+        if let Some(section) =
+            self.resolver
+                .resolve_id(key)
+                .map_err(|error| Error::SectionPattern {
+                    message: context(error.to_string()),
+                })?
+        {
+            return Ok(section.id);
+        }
+        if let Some(id) = recorded_id {
+            return Err(Error::SectionMetadata {
+                line,
+                column,
+                message: format!(
+                    "unknown recorded section ID {id:?} for heading {title:?}; manually correct or delete the comment and use an explicit section mapping to recover"
+                ),
+            });
+        }
+        Err(Error::UnknownSection {
+            section: title.to_owned(),
+        })
+    }
+
+    fn finish(&self, rules: &[crate::RuntimeSectionMap]) -> Result<()> {
+        let unused = self.runtime_maps.unused(&self.runtime_usage);
+        if unused.is_empty() {
+            return Ok(());
+        }
+        Err(Error::SectionMapping {
+            message: format!(
+                "unused runtime rules {:?}; actual section input keys: {:?}",
+                unused
+                    .iter()
+                    .map(|index| (index, &rules[*index]))
+                    .collect::<Vec<_>>(),
+                self.observed_keys
+            ),
+        })
+    }
+}
+
 fn parse_entries(
     repo: &Repository,
     document: &str,
     body: Range<usize>,
+    evaluator: &mut CarrySectionEvaluator<'_>,
 ) -> Result<Vec<ParsedEntry>> {
     let arena = Arena::new();
     let options = comrak_options_with_configured_references(&BTreeMap::new(), &repo.config().links);
@@ -756,6 +1005,7 @@ fn parse_entries(
     let configured_links = released_configured_links(repo, document, root);
     let marker_prefix = configured_link_marker_prefix(document);
     let line_starts = line_starts(document);
+    let metadata = document_metadata(repo, document, body.clone())?;
     let mut entries = Vec::new();
     let mut current_section = None;
     let intro = crate::release_context::introduction(&line_starts, root, body.clone())?;
@@ -772,9 +1022,17 @@ fn parse_entries(
         let value = child.data().value.clone();
         match value {
             NodeValue::Heading(heading) if heading.level == 3 && has_sections(repo.config()) => {
-                let section = plain_text(child).trim().to_owned();
-                ensure_known_section(repo, &section)?;
-                current_section = Some(section);
+                let title = plain_text(child).trim().to_owned();
+                let position = child.data().sourcepos.start;
+                let recorded_id = metadata
+                    .iter()
+                    .find(|record| {
+                        record.heading_offset
+                            == crate::release_context::node_offset(&line_starts, child)
+                    })
+                    .map(|record| record.id.as_str());
+                current_section =
+                    Some(evaluator.resolve(&title, recorded_id, position.line, position.column)?);
             }
             NodeValue::List(list) if list.list_type == ListType::Bullet => {
                 if has_sections(repo.config()) && current_section.is_none() {
@@ -803,20 +1061,87 @@ fn parse_entries(
     Ok(entries)
 }
 
-fn ensure_known_section(repo: &Repository, section: &str) -> Result<()> {
-    if SectionResolver::from_config(repo.config())?
-        .resolve_id(section)
-        .map_err(|error| Error::SectionPattern {
-            message: error.to_string(),
-        })?
-        .is_some()
-    {
-        Ok(())
-    } else {
-        Err(Error::UnknownSection {
-            section: section.to_owned(),
-        })
+fn ensure_no_unconsumed_groups(grouped: &BTreeMap<Option<String>, FragmentContents>) -> Result<()> {
+    if grouped.is_empty() {
+        return Ok(());
     }
+    Err(Error::SectionPattern {
+        message: format!(
+            "unconsumed canonical section groups: {:?}",
+            grouped.keys().collect::<Vec<_>>()
+        ),
+    })
+}
+
+fn document_metadata(
+    repo: &Repository,
+    document: &str,
+    range: Range<usize>,
+) -> Result<Vec<crate::section_metadata::SectionRecord>> {
+    // Preserve even unreferenced footnotes and their original block order.
+    // The rendering parse may drop or move them before metadata is inspected.
+    let arena = Arena::new();
+    let root = parse_document(&arena, document, &crate::release_context::options());
+    if !has_sections(repo.config()) {
+        if let Some((line, column)) =
+            crate::section_metadata::reserved_position(root, &line_starts(document), range.clone())
+        {
+            return Err(Error::SectionMetadata { line, column, message: "section metadata requires sections; restore the section configuration or manually remove metadata and section structure to flatten the document".into() });
+        }
+        return Ok(Vec::new());
+    }
+    crate::section_metadata::records(root, document, range).map_err(|error| {
+        Error::SectionMetadata {
+            line: error.line,
+            column: error.column,
+            message: format!("{}; manually correct or delete the comment and use an explicit section mapping to recover", error.message),
+        }
+    })
+}
+
+/// Current-document interpretation only: explicit title first, then raw ID.
+/// Historical maps and runtime overrides are added by the carry evaluator in E.
+fn resolve_document_section(
+    repo: &Repository,
+    title: &str,
+    recorded_id: Option<&str>,
+    line: usize,
+    column: usize,
+) -> Result<String> {
+    if title.is_empty() {
+        return Err(Error::SectionMetadata {
+            line,
+            column,
+            message: "section heading must not be empty".into(),
+        });
+    }
+    let resolver = SectionResolver::from_config(repo.config())?;
+    let resolution = if let Some(id) = recorded_id {
+        resolver.resolve_id(id)
+    } else {
+        match resolver.resolve_title(title) {
+            Ok(None) => resolver.resolve_id(title),
+            result => result,
+        }
+    }
+    .map_err(|error| Error::SectionPattern {
+        message: error.to_string(),
+    })?;
+    if let Some(section) = resolution {
+        return Ok(section.id);
+    }
+    if let Some(id) = recorded_id {
+        return Err(Error::SectionMetadata {
+            line,
+            column,
+            message: format!(
+                "unknown recorded section ID {id:?} for heading {title:?}; manually correct or delete the comment and use an explicit section mapping to recover"
+            ),
+        });
+    }
+    Err(Error::UnknownSection {
+        section: title.to_owned(),
+    })
 }
 
 fn grouped_sections(
@@ -1352,6 +1677,109 @@ mod tests {
     }
 
     #[test]
+    fn discovery_retains_observed_titles_and_prefers_unreleased_identity() {
+        let source = "# Changes\n\n## Unreleased\n\n### New API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  New.\n\n## Version 1.0.0\n\n### Old API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Old.\n\n### Broken API\n\n<!-- sacho:section:v2 id=unknown -->\n";
+        let candidates = discover_section_candidates(source, "Changes", "To be released.");
+        assert_eq!(candidates[0].id, "stable");
+        assert_eq!(candidates[0].title, "New API");
+        assert_eq!(candidates[0].occurrences, 2);
+        assert!(candidates[0].appears_in_unreleased);
+        assert_eq!(candidates[1].id, "Broken API");
+    }
+
+    #[test]
+    fn discovery_does_not_attach_identity_across_footnote_definitions() {
+        for reference in ["", "[^a]"] {
+            let source = format!(
+                "## Version 1.0.0\n\n### Other\n\n[^a]: note\n\n<!-- sacho:section:v1 id=core -->\n\n -  Item.{reference}\n"
+            );
+            let candidates = discover_section_candidates(&source, "Changes", "To be released.");
+            assert_eq!(candidates[0].id, "Other");
+        }
+    }
+
+    #[test]
+    fn show_does_not_hide_identity_across_footnote_definitions() {
+        for reference in ["", "[^a]"] {
+            let source = format!(
+                "## Version 1.0.0\n\n### Other\n\n[^a]: note\n\n<!-- sacho:section:v1 id=core -->\n\n -  Item.{reference}\n"
+            );
+            let rendered = render_released_section(&source, "1.0.0", None, false, true, "Changes")
+                .unwrap()
+                .unwrap();
+            assert!(rendered.markdown.contains("sacho:section:v1 id=core"));
+        }
+    }
+
+    #[test]
+    fn show_preserves_plain_owned_titles_without_flattening_other_headings() {
+        for (title, heading) in [
+            ("$x$ API", r"$x\$ API"),
+            ("C #", r"C \#"),
+            ("#", r"\#"),
+            ("<a>", r"\<a\>"),
+            ("<https://x.y>", r"\<https://x.y\>"),
+            ("<mailto:a@b.c>", r"\<mailto:a@b.c\>"),
+            ("<foo:bar>", r"\<foo:bar\>"),
+            ("&lt;", r"\&lt;"),
+            ("&gt;", r"\&gt;"),
+            ("&quot;", r"\&quot;"),
+            (r"\<foo:bar>", r"\\\<foo:bar\>"),
+            ("&amp;", r"\&amp;"),
+            ("*bold*", r"\*bold\*"),
+        ] {
+            for intro in [
+                "",
+                "<!-- sacho:release-intro:begin -->\n\nIntro.\n\n<!-- sacho:release-intro:end -->\n\n",
+            ] {
+                for wrap in [false, true] {
+                    for skip in [false, true] {
+                        let source = format!(
+                            "## Version 1.0.0\n\n{intro}### {heading}\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Fixed.\n\n### Math $x$\n\n -  Existing math.\n"
+                        );
+                        let shown =
+                            render_released_section(&source, "1.0.0", None, skip, wrap, "Changes")
+                                .unwrap()
+                                .unwrap();
+                        assert!(!shown.markdown.contains("sacho:section:"));
+                        let arena = Arena::new();
+                        let root = parse_document(&arena, &shown.markdown, &comrak_options());
+                        let headings = root.children().filter(|node| matches!(node.data().value, NodeValue::Heading(h) if h.level == 3)).collect::<Vec<_>>();
+                        assert_eq!(headings.len(), 2);
+                        assert_eq!(plain_text(headings[0]), title, "{}", shown.markdown);
+                        assert!(
+                            headings[1]
+                                .descendants()
+                                .any(|node| matches!(node.data().value, NodeValue::Math(_)))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn show_hides_only_valid_attached_identity_comments() {
+        for intro in [
+            "",
+            "<!-- sacho:release-intro:begin -->\n\nIntro.\n\n<!-- sacho:release-intro:end -->\n\n",
+        ] {
+            let source = format!(
+                "# Changes\n\n## Version 1.0.0\n\nReleased.\n\n{intro}### API\n\n<!-- sacho:section:v1 id=stable -->\n\n -  Fixed.\n\n<!-- ordinary -->\n\n### Broken\n\n<!-- sacho:section:v2 id=broken -->\n"
+            );
+            let rendered = render_released_section(&source, "1.0.0", None, false, true, "Changes")
+                .unwrap()
+                .unwrap();
+            assert!(!rendered.markdown.contains("id=stable"));
+            assert!(rendered.markdown.contains("<!-- ordinary -->"));
+            assert!(rendered.markdown.contains("sacho:section:v2 id=broken"));
+            if !intro.is_empty() {
+                assert!(rendered.markdown.contains("Intro."));
+            }
+        }
+    }
+
+    #[test]
     fn discovers_section_candidates_with_unreleased_entries_first() {
         let changelog = "\
 Project changes
@@ -1403,21 +1831,25 @@ Released on July 1, 2026.
             candidates,
             vec![
                 ChangelogSectionCandidate {
+                    title: String::from("core"),
                     id: String::from("core"),
                     occurrences: 2,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("Added"),
                     id: String::from("Added"),
                     occurrences: 1,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("Version 9.9.9"),
                     id: String::from("Version 9.9.9"),
                     occurrences: 1,
                     appears_in_unreleased: true,
                 },
                 ChangelogSectionCandidate {
+                    title: String::from("cli"),
                     id: String::from("cli"),
                     occurrences: 1,
                     appears_in_unreleased: false,
@@ -1434,11 +1866,13 @@ Released on July 1, 2026.
                 discover_section_candidates(&changelog, "Project changes", "To be released."),
                 vec![
                     ChangelogSectionCandidate {
+                        title: "core".into(),
                         id: "core".into(),
                         occurrences: 1,
                         appears_in_unreleased: true,
                     },
                     ChangelogSectionCandidate {
+                        title: "cli".into(),
                         id: "cli".into(),
                         occurrences: 2,
                         appears_in_unreleased: false,
@@ -1459,6 +1893,7 @@ Released on July 1, 2026.
         assert_eq!(
             candidates,
             vec![ChangelogSectionCandidate {
+                title: String::from("server"),
                 id: String::from("server"),
                 occurrences: 1,
                 appears_in_unreleased: true,
@@ -1495,6 +1930,7 @@ Released on July 1, 2026.
             assert_eq!(
                 candidates,
                 vec![ChangelogSectionCandidate {
+                    title: String::from("core"),
                     id: String::from("core"),
                     occurrences: 1,
                     appears_in_unreleased: false,
@@ -1525,6 +1961,7 @@ Released on July 1, 2026.
         assert_eq!(
             candidates,
             vec![ChangelogSectionCandidate {
+                title: String::from("core"),
                 id: String::from("core"),
                 occurrences: 1,
                 appears_in_unreleased: false,
@@ -4035,5 +4472,175 @@ code block
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text:?}");
         }
+    }
+    #[test]
+    fn metadata_carry_normalizes_titles_and_preserves_repeated_identity_order() {
+        let (_temp, repo) = repo_with_config(
+            r#"[[section-patterns]]
+source = "crates/{name}"
+id = "{name}"
+title = "{name} (Rust)"
+directory = "rust/{name}"
+"#,
+        );
+        let source = "## Version 1.0.0\n\n### core (Rust)\n\n -  First.\n\n### Older display name\n\n<!-- sacho:section:v1 id=core -->\n\n -  Second.\n\n### core\n\n -  Third.\n";
+        let carried = carry_release(&repo, source, "1.0.0").unwrap();
+        assert_eq!(carried.fragments.len(), 1);
+        assert_eq!(carried.fragments[0].section.as_deref(), Some("core"));
+        assert!(
+            carried.fragments[0]
+                .path
+                .ends_with("rust/core/carried-from-1.0.0.md")
+        );
+        let markdown = &carried.fragments[0].markdown;
+        assert!(markdown.find("First.").unwrap() < markdown.find("Second.").unwrap());
+        assert!(markdown.find("Second.").unwrap() < markdown.find("Third.").unwrap());
+        assert!(!markdown.contains("sacho:section:"));
+    }
+
+    #[test]
+    fn metadata_checks_footnotes_and_requires_immediate_attachment() {
+        let (_temp, repo) = repo_with_config("[[sections]]\nid = 'core'\ndirectory = 'core'\n");
+        let (_empty_temp, no_sections) = repo_with_config("");
+        for body in [
+            "### core\n\n -  Item.\n\n[^a]: note <!-- sacho:section:v1 id=core -->\n",
+            "### core\n\n -  Item.\n\n[^a]:\n    <!-- sacho:section:v1 id=core -->\n",
+            "### Other\n\n[^a]: note\n\n<!-- sacho:section:v1 id=core -->\n\n -  Item.\n",
+        ] {
+            for repo in [&repo, &no_sections] {
+                assert!(matches!(
+                    carry_release(repo, &format!("## Version 1.0.0\n\n{body}"), "1.0.0"),
+                    Err(Error::SectionMetadata { .. })
+                ));
+                assert!(matches!(
+                    import_unreleased_region(repo, &format!("## Unreleased\n\n{body}")),
+                    Err(Error::SectionMetadata { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_error_reports_location_once() {
+        let (_temp, repo) = repo_with_config("[[sections]]\nid = 'core'\ndirectory = 'core'\n");
+        let error = carry_release(
+            &repo,
+            "## Version 1.0.0\n\n### core\n\n<!-- sacho:section:v9 -->\n\n -  Item.\n",
+            "1.0.0",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "section metadata at 5:1: expected one exact v1 section identity comment; manually correct or delete the comment and use an explicit section mapping to recover"
+        );
+    }
+
+    #[test]
+    fn metadata_import_uses_id_and_skips_owned_marker() {
+        let (_temp, repo) = repo_with_config(
+            r#"[[sections]]
+id = " key "
+title = "Current API"
+directory = "core"
+"#,
+        );
+        for heading in ["Old API", "Current API"] {
+            let source = format!(
+                "## Unreleased\n\nTo be released.\n\n### {heading}\n\n<!-- sacho:section:v1 id=%20key%20 -->\n\n -  Fixed.\n"
+            );
+            let imported = import_unreleased_region(&repo, &source).unwrap();
+            assert_eq!(imported.fragments[0].section.as_deref(), Some(" key "));
+            assert!(!imported.fragments[0].markdown.contains("sacho:section:"));
+        }
+        let imported =
+            import_unreleased_region(&repo, "## Unreleased\n\n### Current API\n\n -  Fixed.\n")
+                .unwrap();
+        assert_eq!(imported.fragments[0].section.as_deref(), Some(" key "));
+    }
+
+    #[test]
+    fn metadata_unknown_id_never_falls_back_to_known_title() {
+        let (_temp, repo) = repo_with_config(
+            r#"[[sections]]
+id = "core"
+title = "API"
+directory = "core"
+"#,
+        );
+        let source =
+            "## Version 1.0.0\n\n### API\n\n<!-- sacho:section:v1 id=missing -->\n\n -  Fixed.\n";
+        let error = carry_release(&repo, source, "1.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing") && error.contains("API") && error.contains("manually"));
+        for source in [
+            "## Version 1.0.0\n\n### \n\n -  Fixed.\n",
+            "## Version 1.0.0\n\n### API\n\n -  Fixed.\n\n<!-- sacho:section:v1 id=core -->\n",
+        ] {
+            assert!(carry_release(&repo, source, "1.0.0").is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_validation_is_active_range_scoped_and_requires_sections() {
+        let (_temp, repo) = repo_with_config(
+            r#"[[sections]]
+id = "core"
+directory = "core"
+"#,
+        );
+        let good =
+            "## Version 1.0.0\n\n### core\n\n<!-- sacho:section:v1 id=core -->\n\n -  Fixed.\n";
+        let bad = "## Version 0.9.0\n\n### core\n\n<!-- sacho:section:v9 id=bad -->\n\n -  Old.\n";
+        assert!(carry_release(&repo, &format!("{good}\n{bad}"), "1.0.0").is_ok());
+        assert!(carry_release(&repo, &format!("{good}\n{bad}"), "0.9.0").is_err());
+        let (_temp, no_sections) = repo_with_config("");
+        for marker in [
+            "<!-- sacho:section:v1 id=core -->",
+            "<!-- sacho:section:broken -->",
+        ] {
+            let source = format!("## Version 1.0.0\n\n### core\n\n{marker}\n\n -  Fixed.\n");
+            assert!(
+                carry_release(&no_sections, &source, "1.0.0")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("section metadata requires sections")
+            );
+            let source = source.replace("Version 1.0.0", "Unreleased");
+            assert!(
+                import_unreleased_region(&no_sections, &source)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("section metadata requires sections")
+            );
+        }
+        assert!(
+            carry_release(
+                &no_sections,
+                "## Version 1.0.0\n\n### core\n\n -  Fixed.\n",
+                "1.0.0"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn metadata_nested_intro_and_inline_comments_fail_before_entry_processing() {
+        let (_temp, repo) = repo_with_config(
+            r#"[[sections]]
+id = "core"
+directory = "core"
+"#,
+        );
+        for body in [
+            "### core\n\n -  Nested <!-- sacho:section:v1 id=core -->\n",
+            "### core\n\n> <!-- sacho:section:v1 id=core -->\n",
+            "<!-- sacho:release-intro:begin -->\n\n### core\n\n<!-- sacho:section:v1 id=core -->\n\n<!-- sacho:release-intro:end -->\n\n### core\n\n -  Fixed.\n",
+        ] {
+            assert!(carry_release(&repo, &format!("## Version 1.0.0\n\n{body}"), "1.0.0").is_err());
+        }
+        let source =
+            "## Version 1.0.0\n\n### core\n\n -  Code `<!-- sacho:section:v1 id=core -->`.\n";
+        assert!(carry_release(&repo, source, "1.0.0").is_ok());
     }
 }

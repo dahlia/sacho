@@ -169,11 +169,12 @@ directory = "cli"
 paths = ["packages/cli/**"]
 ~~~~
 
-| Field       | Required | Meaning                                                        |
-| ----------- | -------- | -------------------------------------------------------------- |
-| `id`        | Yes      | Rendered section identifier and value accepted by `--section`. |
-| `directory` | Yes      | Fragment subdirectory, relative to `[fragments].directory`.    |
-| `paths`     | No       | Globs whose changes require a fragment in this section.        |
+| Field       | Required | Meaning                                                     |
+| ----------- | -------- | ----------------------------------------------------------- |
+| `id`        | Yes      | Stable section identifier accepted by `--section`.          |
+| `title`     | No       | Plain output heading; omission retains the ID heading.      |
+| `directory` | Yes      | Fragment subdirectory, relative to `[fragments].directory`. |
+| `paths`     | No       | Globs whose changes require a fragment in this section.     |
 
 Section ids and normalized directories must be unique. The array order controls
 the rendered section order.
@@ -192,9 +193,10 @@ paths = ["packages/{name}/src/**"]
 
 Section patterns derive any number of sections from a regular repository
 layout. `source` captures values from a repository subtree. `id` and
-`directory` reuse those captures for the changelog heading and fragment
-subdirectory. Omit `paths` to attribute the complete source subtree, or set it
-to a list of source-prefixed glob templates. An explicit empty list disables
+`directory` reuse those captures for the stable identifier and fragment
+subdirectory. Optional `title` renders a separate plain output heading. Omit
+`paths` to attribute the complete source subtree, or set it to a list of
+source-prefixed glob templates. An explicit empty list disables
 section-specific attribution.
 
 See [*Section pattern syntax*](./section-patterns) for the grammar, field
@@ -203,9 +205,89 @@ constraints, ordering, and precedence rules.
 for common layouts.
 
 
+`[[section-maps]]`
+------------------
+
+Carry maps retain historical names while keeping the current ID stable:
+
+~~~~ toml
+[[section-maps]]
+kind = "title"
+pattern = true
+from = "{name} (Rust crate)"
+to = "{name}"
+
+[[section-maps]]
+kind = "id"
+from = "old-core"
+to = "core"
+~~~~
+
+`kind` is required and is either `title` or `id`. `pattern` defaults to `false`;
+in that form, both values are literal, including braces. With `pattern = true`,
+`from` uses the reversible section-pattern grammar and must contain at least one
+capture, each used once. `to` can substitute those captures, repeat them, or
+omit them to merge several historical sections into one current section.
+Undeclared captures and unknown fields such as `patern` are errors.
+
+A target resolves directly through the current ID resolver. Targets are never
+titles or another map's source. Literal targets are checked at configuration
+load, so remove or update their history rules when deleting a target section.
+Pattern targets are checked when a selected rule matches concrete input.
+
+Title sources must be valid plain titles. Literal ID sources and targets use
+opaque ID spelling and are never trimmed. Maps require configured sections and
+apply only to `carry`; they do not create aliases for `--section` or affect
+`import-unreleased`. See the [carry reference](./commands#sacho-carry) for
+precedence and one-time overrides.
+
+
 Path rules
 ----------
 
 Configured paths must be relative to their anchor. Empty paths, absolute paths,
 and paths that escape their anchor with `..` are rejected. Sacho normalizes `.`
 and internal parent components before checking path uniqueness.
+
+
+Rust API migration in 0.4
+-------------------------
+
+The section identity changes add fields to public structs. Update struct
+literals when upgrading the library:
+
+| Type                                  | Added field                            | Legacy-compatible value |
+| ------------------------------------- | -------------------------------------- | ----------------------- |
+| `Config`                              | `section_maps: Vec<SectionMapConfig>`  | `Vec::new()`            |
+| `SectionConfig`                       | `title: Option<String>`                | `None`                  |
+| `SectionPatternConfig`                | `title: Option<SectionTitleTemplate>`  | `None`                  |
+| `commands::CarryOptions`              | `runtime_maps: Vec<RuntimeSectionMap>` | `Vec::new()`            |
+| `compile::CompiledSection`            | `title: Option<String>`                | `None`                  |
+| `released::ChangelogSectionCandidate` | `title: String`                        | Observed plain heading  |
+
+Public error enums also gain variants: `Error::SectionMapping` and
+`Error::SectionMetadata`; `ConfigError::InvalidSectionMaps`,
+`ConfigError::InvalidSectionTitle` and `ConfigError::DuplicateSectionTitle`;
+and `FragmentError::ReservedSectionMetadata`. Exhaustive matches need new arms
+or a wildcard arm when upgrading.
+
+`CompiledSection.id` remains the canonical ID. Its optional `title` records an
+explicit display title; when present, compiled Markdown also contains identity
+metadata. A sectionless compiled region has neither ID nor title. Discovery
+candidates now retain a recorded ID independently of the observed heading.
+`commands::infer_section_pattern()` accepts `(String, String)` ID/title pairs
+instead of an ID list; inconsistent titles keep explicit sections rather than
+being replaced with an inferred ID template.
+
+`SectionTitleTemplate` implements parsing, display, and string serde. Use
+`render()` with capture values for plain output and `reversible_pattern()` to
+check whether a template supports automatic recognition. Preserve `None` versus
+`Some` when serializing configuration: an explicit title equal to the ID still
+requests identity metadata.
+
+`released::carry_release()` remains the default-options wrapper. Use
+`released::carry_release_with_options()` and `CarryReleaseOptions.runtime_maps`
+for one-time library overrides. `RuntimeSectionMap::Literal { from, to }` and
+`RuntimeSectionMap::Pattern { from, to }` share the CLI evaluator; the default
+runtime list is empty. Configuration maps use `SectionMapConfig` with
+`SectionMapKind::Title` or `SectionMapKind::Id`.

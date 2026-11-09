@@ -89,6 +89,10 @@ pub struct CompiledSection {
     /// Section identifier, or `None` for repositories without sections.
     pub id: Option<SectionId>,
 
+    /// Explicit plain title; `Some` also records the stable ID in Markdown.
+    /// `None` retains legacy ID headings without identity metadata.
+    pub title: Option<String>,
+
     /// Markdown text for this section, without the version heading.
     pub markdown: String,
 
@@ -151,6 +155,13 @@ pub(crate) fn compile_parsed_fragments(
     let config = repo.config();
 
     validate_requested_section(repo, options.section.as_deref(), &fragments)?;
+    let titles = crate::section::active_titles(
+        config,
+        &fragments
+            .iter()
+            .filter_map(|fragment| fragment.section.clone())
+            .collect(),
+    )?;
     let resolved_links = resolved_link_overrides(&fragments)?;
     let mut items = sortable_items(fragments);
     if let Some(section) = &options.section {
@@ -172,8 +183,14 @@ pub(crate) fn compile_parsed_fragments(
         if section_items.is_empty() {
             continue;
         }
+        let title = section_id
+            .as_ref()
+            .and_then(|id| titles.get(id))
+            .cloned()
+            .flatten();
         sections.push(compile_section(
             section_id,
+            title,
             section_items,
             &config.links,
             &resolved_links,
@@ -352,6 +369,7 @@ fn ordered_sections(repo: &Repository, items: &[SortableItem]) -> Result<Vec<Opt
 
 fn compile_section(
     id: Option<SectionId>,
+    title: Option<String>,
     items: Vec<&SortableItem>,
     link_templates: &IndexMap<ReferenceSigil, UrlTemplate>,
     resolved_links: &BTreeMap<String, String>,
@@ -364,8 +382,17 @@ fn compile_section(
     let mut markdown = String::new();
     if let Some(id) = &id {
         markdown.push_str("### ");
-        markdown.push_str(id);
+        markdown.push_str(
+            &title
+                .as_ref()
+                .map(|title| escape_section_title(title))
+                .unwrap_or_else(|| id.clone()),
+        );
         markdown.push_str("\n\n");
+        if title.is_some() {
+            markdown.push_str(&crate::section_metadata::marker(id));
+            markdown.push_str("\n\n");
+        }
     }
     for item in &items {
         markdown.push_str(item.markdown.trim_end());
@@ -374,6 +401,7 @@ fn compile_section(
 
     CompiledSection {
         id,
+        title,
         markdown,
         items: items
             .into_iter()
@@ -463,8 +491,87 @@ fn format_region(
         }
     }
 
+    validate_title_headings(&markdown, sections)?;
     let formatted = format_markdown_with_word_wrap(&markdown, word_wrap)?;
+    validate_title_headings(&formatted, sections)?;
     Ok(trim_empty_list_item_trailing_spaces(&formatted))
+}
+
+/// Escape inline syntax while keeping ordinary package-name punctuation readable.
+pub(crate) fn escape_section_title(title: &str) -> String {
+    // Hongdown otherwise turns a single escaped hash into an ATX closer.
+    if title == "#" {
+        return "&#35;".into();
+    }
+    let mut escaped = String::new();
+    for character in title.chars() {
+        // Hongdown may drop a leading escape before an autolink or entity.
+        // Encode these opening characters so the plain spelling survives.
+        if escaped.is_empty() {
+            let entity = match character {
+                '<' => Some("&lt;"),
+                '&' => Some("&amp;"),
+                '\\' => Some("&#92;"),
+                _ => None,
+            };
+            if let Some(entity) = entity {
+                escaped.push_str(entity);
+                continue;
+            }
+        }
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '&' | '$' | '!' | '~' | '^' | '#'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn validate_title_headings(markdown: &str, sections: &[CompiledSection]) -> Result<()> {
+    let expected = sections
+        .iter()
+        .filter_map(|section| {
+            section
+                .title
+                .as_ref()
+                .map(|title| (section.id.as_deref().expect("title has ID"), title))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let arena = Arena::new();
+    let root = parse_document(&arena, markdown, &crate::release_context::options());
+    let mut observed = BTreeMap::new();
+    for heading in root.children().filter(
+        |node| matches!(node.data().value, NodeValue::Heading(heading) if heading.level == 3),
+    ) {
+        if let Some(id) = crate::section_metadata::probe(heading) {
+            let text = heading
+                .descendants()
+                .filter_map(|node| match &node.data().value {
+                    NodeValue::Text(text) => Some(text.to_string()),
+                    NodeValue::Code(code) => Some(code.literal.clone()),
+                    NodeValue::Math(math) => Some(math.literal.clone()),
+                    _ => None,
+                })
+                .collect::<String>();
+            observed.insert(id, text);
+        }
+    }
+    for (id, title) in expected {
+        if observed.get(id) != Some(title) {
+            return Err(crate::Error::SectionPattern {
+                message: format!(
+                    "section title {title:?} for {id:?} did not survive Markdown formatting as plain text"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn append_reference_definitions(markdown: &mut String, references: &[CompiledReference]) {
@@ -531,6 +638,96 @@ mod tests {
         fs::write(temp.path().join("sacho.toml"), config).expect("config");
         let repo = Repository::from_root(temp.path()).expect("repo");
         (temp, repo)
+    }
+
+    #[test]
+    fn explicit_titles_preserve_plain_text_and_opaque_identity() {
+        for title in [
+            "$x$ API",
+            "C #",
+            "#",
+            "<a>",
+            "<https://x.y>",
+            "<mailto:a@b.c>",
+            "<foo:bar>",
+            "&lt;",
+            "&gt;",
+            "&quot;",
+            "&lt;foo:bar>",
+            r"\<foo:bar>",
+            "&amp;",
+            r"back\slash",
+            "*strong* [link](url)",
+            "@scope/name (Rust)",
+            "{{braces}}",
+            "[^note]",
+            "~strike~",
+            "a  b",
+        ] {
+            let encoded = toml::Value::String(title.into()).to_string();
+            let (temp, repo) = repo_with_config(&format!(
+                "[[sections]]\nid = ' key '\ntitle = {encoded}\ndirectory = 'core'\n"
+            ));
+            fs::create_dir_all(temp.path().join("changes.d/core")).unwrap();
+            fs::write(
+                temp.path().join("changes.d/core/test.md"),
+                " -  Fixed API.\n",
+            )
+            .unwrap();
+            for wrap in [false, true] {
+                let compiled = compile_unreleased(
+                    &repo,
+                    CompileOptions {
+                        word_wrap: wrap,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(compiled.sections[0].title.as_deref(), Some(title));
+                assert!(
+                    compiled
+                        .markdown
+                        .contains("<!-- sacho:section:v1 id=%20key%20 -->")
+                );
+                validate_title_headings(&compiled.markdown, &compiled.sections).unwrap();
+            }
+        }
+        assert_eq!(
+            escape_section_title("@scope/name (Rust)"),
+            "@scope/name (Rust)"
+        );
+    }
+
+    #[test]
+    fn title_collisions_are_checked_before_single_section_filter() {
+        let (temp, repo) = repo_with_config(
+            r#"[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+title = "Shared API"
+directory = "{name}"
+"#,
+        );
+        for name in ["one", "two"] {
+            fs::create_dir_all(temp.path().join(format!("changes.d/{name}"))).unwrap();
+            fs::write(
+                temp.path().join(format!("changes.d/{name}/test.md")),
+                " -  Fixed.\n",
+            )
+            .unwrap();
+        }
+        assert!(
+            compile_unreleased(
+                &repo,
+                CompileOptions {
+                    section: Some("one".into()),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Shared API")
+        );
     }
 
     fn rendered_links(markdown: &str) -> Vec<(String, String, String)> {
@@ -1785,6 +1982,22 @@ mod tests {
 
     proptest! {
         #[test]
+        fn generated_plain_titles_survive_markdown_and_formatter(
+            prefix in prop_oneof![Just(""), Just("<foo:bar>"), Just("&lt;"), Just("&quot;"), Just(r"\<foo:bar>")],
+            body in "[ -~]{0,60}"
+        ) {
+            let title = format!("{prefix}{body}").trim().to_owned();
+            prop_assume!(!title.is_empty());
+            let section = CompiledSection {
+                id: Some("stable".into()), title: Some(title.clone()),
+                markdown: format!("### {}\n\n{}\n\n -  Fixed.\n", escape_section_title(&title), crate::section_metadata::marker("stable")),
+                items: vec![], references: vec![],
+            };
+            let formatted = format_region(&VersionLabel::Unreleased, "To be released.", std::slice::from_ref(&section), true);
+            prop_assert!(formatted.is_ok(), "title {:?}: {:?}", title, formatted);
+        }
+
+        #[test]
         fn compiled_item_order_matches_sorting_model(fragments in model_fragments()) {
             let (temp, repo) = repo_with_config("");
             write_model_fragments(temp.path(), &fragments);
@@ -1913,6 +2126,36 @@ mod tests {
             let second = compile_unreleased(&repo, CompileOptions::default()).expect("second");
 
             prop_assert_eq!(first.markdown, second.markdown);
+        }
+    }
+    #[test]
+    fn title_readback_validation_uses_comrak_plain_text_and_rejects_damage() {
+        // Match the reader's semantic text even when an intermediate AST has
+        // code or math nodes; generating explicit titles still escapes them.
+        let section = CompiledSection {
+            id: Some("stable".into()),
+            title: Some("API core x".into()),
+            markdown: String::new(),
+            items: vec![],
+            references: vec![],
+        };
+        let source = format!(
+            "### API `core` $x$\n\n{}\n",
+            crate::section_metadata::marker("stable")
+        );
+        assert!(validate_title_headings(&source, std::slice::from_ref(&section)).is_ok());
+        let formatted = format_markdown_with_word_wrap(&source, true).unwrap();
+        assert!(validate_title_headings(&formatted, std::slice::from_ref(&section)).is_ok());
+        for damaged in [
+            source.replace("$x$", "$y$"),
+            source.replace("`core`", "`other`"),
+            source.replace("id=stable", "id=unknown"),
+            source.replace(&crate::section_metadata::marker("stable"), ""),
+        ] {
+            assert!(
+                validate_title_headings(&damaged, std::slice::from_ref(&section)).is_err(),
+                "{damaged}"
+            );
         }
     }
 }

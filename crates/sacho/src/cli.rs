@@ -265,6 +265,16 @@ enum Command {
         /// Released version whose entries should be carried.
         #[arg(help = "Released version whose entries should be carried")]
         version: String,
+
+        /// Map one recorded ID or historical heading to a current stable ID.
+        #[arg(long = "map", num_args = 2, action = clap::ArgAction::Append,
+              value_names = ["FROM", "TO"], allow_hyphen_values = true)]
+        map: Vec<String>,
+
+        /// Map a historical family using reversible named captures.
+        #[arg(long = "map-pattern", num_args = 2, action = clap::ArgAction::Append,
+              value_names = ["FROM", "TO"], allow_hyphen_values = true)]
+        map_pattern: Vec<String>,
     },
 
     /// Import the materialized unreleased region into fragments.
@@ -542,9 +552,32 @@ impl Cli {
                 apply_release(&repo, plan)?;
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Carry { version } => {
+            Command::Carry {
+                version,
+                map,
+                map_pattern,
+            } => {
                 let repo = Repository::open_existing(".").map_err(CliReport::from)?;
-                let result = carry(&repo, CarryOptions { version })?;
+                let runtime_maps = map
+                    .chunks_exact(2)
+                    .map(|pair| sacho::RuntimeSectionMap::Literal {
+                        from: pair[0].clone(),
+                        to: pair[1].clone(),
+                    })
+                    .chain(map_pattern.chunks_exact(2).map(|pair| {
+                        sacho::RuntimeSectionMap::Pattern {
+                            from: pair[0].clone(),
+                            to: pair[1].clone(),
+                        }
+                    }))
+                    .collect();
+                let result = carry(
+                    &repo,
+                    CarryOptions {
+                        version,
+                        runtime_maps,
+                    },
+                )?;
                 print_mutation_cleanup_warnings("sacho carry", &result.cleanup_warnings);
                 Ok(ExitCode::SUCCESS)
             }
@@ -941,11 +974,19 @@ fn resolve_interactive_sections(
             Err(error) => eprintln!("{error}"),
         }
     };
-    let selected_ids = selected
+    let mut selected_sections = selected
         .iter()
-        .map(|index| candidates[*index].id.clone())
+        .map(|index| {
+            (
+                candidates[*index].id.clone(),
+                candidates[*index].title.clone(),
+            )
+        })
         .collect::<Vec<_>>();
-    if let Some(pattern) = infer_section_pattern(root, &selected_ids, fragment_directory)?
+    for (id, title) in &mut selected_sections {
+        prompt_section_title(id, title, |label| prompt(label, ""))?;
+    }
+    if let Some(pattern) = infer_section_pattern(root, &selected_sections, fragment_directory)?
         && prompt_bool(
             &format!(
                 "Use inferred section pattern {} -> {}",
@@ -959,7 +1000,7 @@ fn resolve_interactive_sections(
     let mut sections = Vec::new();
     let mut used_directories = Vec::new();
     let reserved_directories = [FragmentsConfig::default().next_file];
-    for index in selected {
+    for (position, index) in selected.into_iter().enumerate() {
         let candidate = &candidates[index];
         let suggested = suggest_section_directory_avoiding(
             &candidate.id,
@@ -988,6 +1029,7 @@ fn resolve_interactive_sections(
                 .collect()
         };
         sections.push(SectionConfig {
+            title: Some(selected_sections[position].1.clone()),
             id: candidate.id.clone(),
             directory,
             paths,
@@ -1068,6 +1110,25 @@ fn init_should_prompt(
     } else {
         Ok(auto_interactive)
     }
+}
+
+fn prompt_section_title(
+    id: &str,
+    title: &mut String,
+    mut ask: impl FnMut(&str) -> Result<String, CliReport>,
+) -> Result<(), CliReport> {
+    while let Err(error) = sacho::validate_section_title(title) {
+        eprintln!("Invalid title for {id}: {error}");
+        let answer = ask(&format!("Plain one-line title for {id}"))?;
+        if answer.is_empty() {
+            return Err(CliReport::SectionTitle {
+                section: id.to_owned(),
+                source: error,
+            });
+        }
+        *title = answer;
+    }
+    Ok(())
 }
 
 fn prompt(label: &str, default: &str) -> Result<String, CliReport> {
@@ -1172,6 +1233,14 @@ fn init_result_has_no_actions(result: &InitResult) -> bool {
 
 #[derive(Debug, Diagnostic, thiserror::Error)]
 pub enum CliReport {
+    #[error("no replacement title supplied for section {section:?}: {source}")]
+    #[diagnostic(code(sacho::section_title))]
+    SectionTitle {
+        section: String,
+        #[source]
+        source: sacho::SectionTitleError,
+    },
+
     #[error("{0}")]
     #[diagnostic(code(sacho::error))]
     Sacho(#[from] Error),
@@ -1206,6 +1275,33 @@ pub fn render_report(report: CliReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_or_end_of_input_aborts_invalid_discovered_title() {
+        let mut title = "a\tb".to_owned();
+        let mut calls = 0;
+        let error = prompt_section_title("stable", &mut title, |_| {
+            calls += 1;
+            assert_eq!(calls, 1, "must not prompt again after blank input or EOF");
+            Ok(String::new())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("no replacement title"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn discovered_title_prompt_retries_invalid_nonempty_answers() {
+        let mut title = "a\tb".to_owned();
+        let mut answers = ["still\tinvalid", "API"].into_iter();
+        prompt_section_title("stable", &mut title, |_| Ok(answers.next().unwrap().into())).unwrap();
+        assert_eq!(title, "API");
+        assert!(answers.next().is_none());
+        prompt_section_title("stable", &mut title, |_| {
+            panic!("valid titles need no prompt")
+        })
+        .unwrap();
+    }
 
     #[test]
     fn release_date_at_uses_the_timezone_calendar_date_across_boundaries() {

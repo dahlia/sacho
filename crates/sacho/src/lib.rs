@@ -33,8 +33,11 @@ pub mod released;
 pub mod repo;
 mod repository_url;
 mod section;
+mod section_map;
+mod section_metadata;
 /// Section pattern parsing and matching types.
 pub mod section_pattern;
+pub mod section_title;
 /// Version-control integration types.
 pub mod vcs;
 
@@ -44,8 +47,12 @@ pub use crate::config::{
     VcsPreset, VcsQuery,
 };
 pub use crate::error::{ConfigError, Error, FragmentError, MutationCommand, Result};
+pub use crate::released::{CarryReleaseOptions, carry_release_with_options};
 pub use crate::repo::Repository;
+pub use crate::section_map::{RuntimeSectionMap, SectionMapConfig, SectionMapKind};
 pub use crate::section_pattern::{
     SectionPattern, SectionPatternConfig, SectionPatternConfigError, SectionPatternError,
     SectionPatternSegment,
 };
+
+pub use crate::section_title::{SectionTitleError, SectionTitleTemplate, validate_section_title};

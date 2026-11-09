@@ -64,16 +64,16 @@ fragment appear in two generated sections. Use an explicit `[[sections]]`
 entry when a section intentionally needs a configured alias.
 
 
-The four fields
----------------
+Pattern fields
+--------------
 
 `source` is a repository-relative subtree pattern. It establishes the capture
 names for the table and must contain at least one capture. Each capture name
 must appear once.
 
-`id` renders the section heading and supplies the value accepted by
-`--section`. It must contain every capture from `source` exactly once and
-cannot introduce another capture.
+`id` supplies the stable section key accepted by `--section`. With no `title`,
+it also supplies the legacy heading. It must contain every capture from
+`source` exactly once and cannot introduce another capture.
 
 `directory` renders a path below `[fragments].directory`. It follows the same
 capture rule as `id` and must also be a safe relative path.
@@ -118,6 +118,42 @@ paths = [
 
 The captured package name is treated as literal text even if it contains glob
 characters.
+
+
+Title templates
+---------------
+
+`title` is an optional plain-text rendering template. It uses captures declared
+by `source`, but may repeat or omit them and may contain ordinary slashes:
+
+~~~~ toml
+[[section-patterns]]
+source = "packages/{scope}/{name}"
+id = "@{scope}/{name}"
+title = "{name} (JavaScript/TypeScript)"
+directory = "javascript/{scope}/{name}"
+~~~~
+
+Double each literal opening or closing brace. This template surrounds the
+captured name with literal braces:
+
+~~~~ toml
+title = "{{{name}}}"
+~~~~
+
+Undeclared capture names are errors. Rendered titles follow the same plain-title
+rules as explicit sections.
+
+Title rendering does not require reversibility. Automatic recognition of a
+current title in an older document does: the template must contain every source
+capture exactly once and satisfy the path-pattern grammar above. Repeated or
+omitted captures and multiple captures in one segment prevent this inverse.
+Sacho reads those titles using their recorded identity comments or a carry map.
+
+For the example above, omitting `{scope}` can give two packages the same title.
+Sacho checks actual output sections for collisions; it does not prove uniqueness
+across every possible package name or enumerate source directories to choose a
+matching section.
 
 
 Resolution and precedence

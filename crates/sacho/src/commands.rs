@@ -37,8 +37,8 @@ use crate::link_resolution::{LinkResolutionPolicy, ReferenceUrlResolver, is_http
 use crate::markdown::format_markdown;
 use crate::merge::{MergeDriverOptions, MergeDriverResult, merge_driver};
 use crate::released::{
-    carry_release, has_released_sections, import_unreleased_document_region, insertion_title_span,
-    render_released_section,
+    CarryReleaseOptions, carry_release_with_options, has_released_sections,
+    import_unreleased_document_region, insertion_title_span, render_released_section,
 };
 #[cfg(test)]
 use crate::repo::MUTATION_LOCK_FILE;
@@ -524,6 +524,9 @@ pub struct ReleaseResult {
 pub struct CarryOptions {
     /// Released version to decompile back into fragments.
     pub version: String,
+
+    /// Carry-only historical title or ID overrides, applied before config maps.
+    pub runtime_maps: Vec<crate::RuntimeSectionMap>,
 }
 
 /// Options for showing a released changelog section.
@@ -961,7 +964,7 @@ pub fn infer_section_paths(
     Ok(matches)
 }
 
-/// Infers one reversible section pattern from selected changelog section ids.
+/// Infers a reversible ID pattern and a consistent observed title template.
 ///
 /// Inference succeeds only when at least two ids share the same prefix and
 /// their final components name sibling directories under exactly one common
@@ -969,9 +972,13 @@ pub fn infer_section_paths(
 /// also pass the runtime path-safety checks for patterned sections.
 pub fn infer_section_pattern(
     root: impl AsRef<Path>,
-    ids: &[String],
+    sections: &[(String, String)],
     fragment_directory: &Path,
 ) -> Result<Option<SectionPatternConfig>> {
+    let ids = sections
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
     if ids.len() < 2 {
         return Ok(None);
     }
@@ -981,7 +988,7 @@ pub fn infer_section_pattern(
     let mut id_prefix = None::<&str>;
     let mut common_parents = None::<BTreeSet<String>>;
     let mut capture_values = BTreeSet::new();
-    for id in ids {
+    for id in &ids {
         let stem = id.rsplit('/').next().unwrap_or(id);
         if capture_pattern.captures(stem).is_none() || !capture_values.insert(stem) {
             return Ok(None);
@@ -1028,7 +1035,43 @@ pub fn infer_section_pattern(
     let Ok(id) = SectionPattern::from_str(&id) else {
         return Ok(None);
     };
+    // A package name may also occur literally in its scope. Try the repeated-
+    // capture and final-occurrence candidates from every observed title. Sorting
+    // and deduplicating candidates keeps inference independent of section order.
+    let mut title_sources = BTreeSet::new();
+    for (id, observed) in sections {
+        let name = id.rsplit('/').next().unwrap_or(id);
+        let Some((before_name, after_name)) = observed.rsplit_once(name) else {
+            return Ok(None);
+        };
+        title_sources.insert(
+            observed
+                .split(name)
+                .map(escape_section_pattern_literal)
+                .collect::<Vec<_>>()
+                .join("{name}"),
+        );
+        title_sources.insert(format!(
+            "{}{{name}}{}",
+            escape_section_pattern_literal(before_name),
+            escape_section_pattern_literal(after_name),
+        ));
+    }
+    let Some(title) = title_sources
+        .into_iter()
+        .filter_map(|source| source.parse::<crate::SectionTitleTemplate>().ok())
+        .find(|title| {
+            sections.iter().all(|(id, observed)| {
+                let name = id.rsplit('/').next().unwrap_or(id);
+                let captures = BTreeMap::from([("name".into(), name.to_owned())]);
+                title.render(&captures).ok().as_ref() == Some(observed)
+            })
+        })
+    else {
+        return Ok(None);
+    };
     let pattern = SectionPatternConfig {
+        title: Some(title),
         source,
         id,
         directory: capture_pattern,
@@ -1037,7 +1080,7 @@ pub fn infer_section_pattern(
     if pattern.validate().is_err() {
         return Ok(None);
     }
-    if !inferred_section_pattern_is_safe(root.as_ref(), ids, fragment_directory, &pattern) {
+    if !inferred_section_pattern_is_safe(root.as_ref(), &ids, fragment_directory, &pattern) {
         return Ok(None);
     }
     Ok(Some(pattern))
@@ -2784,7 +2827,8 @@ pub fn apply_release(repo: &Repository, plan: ReleasePlan) -> Result<ReleaseResu
 /// [`CarryResult::cleanup_warnings`].
 pub fn carry(repo: &Repository, options: CarryOptions) -> Result<CarryResult> {
     let _lock = acquire_mutation_lock(repo)?;
-    let (plan, written_fragments, sync) = plan_carry_mutation(repo, &options.version)?;
+    let (plan, written_fragments, sync) =
+        plan_carry_mutation(repo, &options.version, &options.runtime_maps)?;
     let outcome = apply_repository_mutation(repo, &plan)?;
     Ok(CarryResult {
         written_fragments,
@@ -2942,6 +2986,7 @@ pub fn apply_import_unreleased(
 fn plan_carry_mutation(
     repo: &Repository,
     version: &str,
+    runtime_maps: &[crate::RuntimeSectionMap],
 ) -> Result<(RepositoryMutationPlan, Vec<PathBuf>, Option<SyncResult>)> {
     let changelog_path = repo.config().changelog.path.clone();
     let changelog_before = read_release_file_state(repo, &changelog_path)?;
@@ -2952,7 +2997,14 @@ fn plan_carry_mutation(
                 source: std::io::Error::new(ErrorKind::NotFound, "changelog does not exist"),
             }
         })?;
-    let mut carried = carry_release(repo, changelog, version)?;
+    let mut carried = carry_release_with_options(
+        repo,
+        changelog,
+        version,
+        &CarryReleaseOptions {
+            runtime_maps: runtime_maps.to_vec(),
+        },
+    )?;
     for fragment in &mut carried.fragments {
         fragment.markdown = format_fragment_source(&fragment.markdown)
             .map_err(|error| with_fragment_path(error, fragment.path.clone()))?;
@@ -2996,6 +3048,13 @@ fn plan_carry_mutation(
         }
     }
     after_sources.sort_by(|left, right| compare_fragment_paths(&left.path, &right.path));
+    crate::section::active_titles(
+        repo.config(),
+        &after_sources
+            .iter()
+            .filter_map(|source| source.section.clone())
+            .collect(),
+    )?;
     let parsed_after = repo
         .config()
         .changelog
@@ -5976,6 +6035,19 @@ fn ensure_materialized_current_before_mutation(repo: &Repository) -> Result<()> 
 
 fn format_fragment_source(source: &str) -> Result<String> {
     let parsed = parse_frontmatter_for_format(source)?;
+    // Reuse the formatter's lossless frontmatter split; typed fragment parsing
+    // remains after formatting, and this preflight checks reserved HTML only.
+    let body_start = source.len() - parsed.body.len();
+    let body_line_offset = source[..body_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    crate::fragment::validate_section_metadata_html(parsed.body, body_line_offset).map_err(
+        |source| Error::Fragment {
+            path: PathBuf::new(),
+            source,
+        },
+    )?;
     let body = format_markdown(parsed.body)?;
     let mut output = canonical_frontmatter(parsed.frontmatter)?;
     output.push_str(body.trim_end());
@@ -6312,6 +6384,9 @@ fn render_init_config(config: &Config) -> String {
     for section in &config.sections {
         output.push_str("\n[[sections]]\n");
         output.push_str(&format!("id = {}\n", toml_basic_string(&section.id)));
+        if let Some(title) = &section.title {
+            output.push_str(&format!("title = {}\n", toml_basic_string(title)));
+        }
         output.push_str(&format!(
             "directory = {}\n",
             toml_basic_string(&section.directory.display().to_string())
@@ -6328,6 +6403,12 @@ fn render_init_config(config: &Config) -> String {
             "id = {}\n",
             toml_basic_string(&pattern.id.to_string())
         ));
+        if let Some(title) = &pattern.title {
+            output.push_str(&format!(
+                "title = {}\n",
+                toml_basic_string(&title.to_string())
+            ));
+        }
         output.push_str(&format!(
             "directory = {}\n",
             toml_basic_string(&pattern.directory.to_string())
@@ -7373,6 +7454,153 @@ mod tests {
     }
 
     #[test]
+    fn title_aware_inference_preserves_titles_and_declines_inconsistent_titles() {
+        let temp = TempDir::new().unwrap();
+        for name in ["core", "cli"] {
+            fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+        }
+        let selected = [
+            ("@pkg/core".into(), "core (Rust)".into()),
+            ("@pkg/cli".into(), "cli (Rust)".into()),
+        ];
+        let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pattern.id.to_string(), "@pkg/{name}");
+        assert_eq!(pattern.title.unwrap().to_string(), "{name} (Rust)");
+        let repeated = [
+            ("@pkg/core".into(), "core / core".into()),
+            ("@pkg/cli".into(), "cli / cli".into()),
+        ];
+        let pattern = infer_section_pattern(temp.path(), &repeated, Path::new("changes.d"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pattern.title.unwrap().to_string(), "{name} / {name}");
+        let inconsistent = [
+            ("@pkg/core".into(), "Main API".into()),
+            ("@pkg/cli".into(), "Command API".into()),
+        ];
+        assert!(
+            infer_section_pattern(temp.path(), &inconsistent, Path::new("changes.d"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn title_aware_inference_handles_names_in_scopes_in_either_order() {
+        for (scope, name) in [("pkg", "pkg"), ("acme", "me")] {
+            let temp = TempDir::new().unwrap();
+            for name in [name, "cli"] {
+                fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+            }
+            let mut selected = [
+                (format!("@{scope}/{name}"), format!("@{scope}/{name}")),
+                (format!("@{scope}/cli"), format!("@{scope}/cli")),
+            ];
+            for _ in 0..2 {
+                let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(pattern.id.to_string(), format!("@{scope}/{{name}}"));
+                assert_eq!(
+                    pattern.title.unwrap().to_string(),
+                    format!("@{scope}/{{name}}")
+                );
+                selected.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn title_aware_inference_combines_scope_overlap_and_repeated_names() {
+        let temp = TempDir::new().unwrap();
+        for name in ["pkg", "cli"] {
+            fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+        }
+        let mut selected = [
+            ("@pkg/pkg".into(), "@pkg/pkg / pkg".into()),
+            ("@pkg/cli".into(), "@pkg/cli / cli".into()),
+        ];
+        for _ in 0..2 {
+            let pattern = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pattern.title.unwrap().to_string(), "@pkg/{name} / {name}");
+            selected.reverse();
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn inferred_title_templates_are_independent_of_section_permutation(suffix in "[a-z]{1,5}") {
+            let scope = format!("pkg{suffix}");
+            let names = [scope.as_str(), "cli", "tool"];
+            let temp = TempDir::new().unwrap();
+            for name in names {
+                fs::create_dir_all(temp.path().join(format!("packages/{name}"))).unwrap();
+            }
+            let selected = names.map(|name| (
+                format!("@{scope}/{name}"),
+                format!("@{scope}/{name} / {name}"),
+            ));
+            let expected = infer_section_pattern(temp.path(), &selected, Path::new("changes.d"))
+                .unwrap().unwrap();
+            prop_assert_eq!(
+                expected.title.as_ref().unwrap().to_string(),
+                format!("@{scope}/{{name}} / {{name}}"),
+            );
+            for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+                let ordered = order.map(|index| selected[index].clone());
+                prop_assert_eq!(
+                    infer_section_pattern(temp.path(), &ordered, Path::new("changes.d")).unwrap(),
+                    Some(expected.clone()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_preserves_plain_titles_and_rejects_invalid_titles_before_writes() {
+        let temp = TempDir::new().unwrap();
+        let section = SectionConfig {
+            id: "opaque".into(),
+            title: Some("API (Rust)".into()),
+            directory: "core".into(),
+            paths: vec![],
+        };
+        let options = InitOptions {
+            sections: vec![section.clone()],
+            ..Default::default()
+        };
+        let config = default_init_config(temp.path(), &options).unwrap();
+        assert_eq!(
+            Config::parse(&render_init_config(&config))
+                .unwrap()
+                .sections,
+            vec![section.clone()]
+        );
+        let invalid = SectionConfig {
+            title: Some(" API".into()),
+            ..section
+        };
+        let before = fs::read_dir(temp.path()).unwrap().count();
+        assert!(
+            init_repository(
+                temp.path(),
+                InitOptions {
+                    sections: vec![invalid],
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("sacho.toml").exists());
+        assert!(!temp.path().join("changes.d").exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), before);
+    }
+
+    #[test]
     fn init_config_omits_blank_repository_url() {
         let config = default_init_config(
             Path::new("project"),
@@ -7398,6 +7626,7 @@ mod tests {
     fn init_config_renders_selected_sections() {
         let options = InitOptions {
             sections: vec![SectionConfig {
+                title: None,
                 id: String::from("👨‍👩‍👧 core"),
                 directory: PathBuf::from("core"),
                 paths: vec![String::from("packages/core/**")],
@@ -7423,7 +7652,10 @@ mod tests {
         fs::create_dir_all(temp.path().join("packages/cli")).expect("cli package");
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference");
@@ -7512,7 +7744,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7532,7 +7767,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7552,7 +7790,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/next".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/next".to_owned(), "@example/next".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("best-effort inference");
@@ -7574,7 +7815,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("generated/changes"),
         )
         .expect("best-effort inference");
@@ -7596,7 +7840,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["@example/core".to_owned(), "@example/cli".to_owned()],
+            &[
+                ("@example/core".to_owned(), "@example/core".to_owned()),
+                ("@example/cli".to_owned(), "@example/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference");
@@ -7612,13 +7859,19 @@ mod tests {
 
         let duplicate = infer_section_pattern(
             temp.path(),
-            &["team{old}/core".to_owned(), "team{old}/core".to_owned()],
+            &[
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("duplicate inference");
         let pattern = infer_section_pattern(
             temp.path(),
-            &["team{old}/core".to_owned(), "team{old}/cli".to_owned()],
+            &[
+                ("team{old}/core".to_owned(), "team{old}/core".to_owned()),
+                ("team{old}/cli".to_owned(), "team{old}/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("pattern inference")
@@ -7637,7 +7890,10 @@ mod tests {
 
         let pattern = infer_section_pattern(
             temp.path(),
-            &["/packages/core".to_owned(), "/packages/cli".to_owned()],
+            &[
+                ("/packages/core".to_owned(), "/packages/core".to_owned()),
+                ("/packages/cli".to_owned(), "/packages/cli".to_owned()),
+            ],
             Path::new("changes.d"),
         )
         .expect("best-effort inference");
@@ -9201,6 +9457,7 @@ mod tests {
         let carry_error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9518,6 +9775,7 @@ mod tests {
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9623,6 +9881,7 @@ Released on July 1, 2026.
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9659,6 +9918,7 @@ Released on July 1, 2026.
         carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9691,6 +9951,7 @@ Released on July 1, 2026.
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9738,6 +9999,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9787,6 +10049,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9822,6 +10085,7 @@ links:
         carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9864,6 +10128,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9903,6 +10168,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9932,6 +10198,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -9982,6 +10249,7 @@ links:
         let result = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10039,6 +10307,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10077,6 +10346,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -10114,6 +10384,7 @@ links:
         let error = carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.5"),
             },
         )
@@ -12841,6 +13112,7 @@ Released previously.
         assert_mutation_locked(carry(
             &repo,
             CarryOptions {
+                runtime_maps: Vec::new(),
                 version: String::from("1.1.0"),
             },
         ));
@@ -18316,6 +18588,27 @@ priority: 0
             let name = format!("{prefix}..{suffix}");
 
             prop_assert!(validate_fragment_name(&name).is_err());
+        }
+    }
+    #[test]
+    fn metadata_format_reports_original_location_without_writing() {
+        for prefix in [
+            "",
+            "---\npriority: 1\n---\n",
+            "\u{feff}---\r\npriority: 1\r\n---\r\n",
+        ] {
+            let (temp, repo) = repo_with_config("");
+            fs::create_dir_all(temp.path().join("changes.d")).unwrap();
+            let source = format!("{prefix} -  Item.\n\n    <!-- sacho:section:v1 id=evil -->\n");
+            let path = temp.path().join("changes.d/a.md");
+            fs::write(&path, &source).unwrap();
+            let expected_line = 3 + prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let error = plan_format(&repo, FormatOptions).unwrap_err();
+            assert!(
+                matches!(error, Error::Fragment { path, source: crate::FragmentError::ReservedSectionMetadata { line, column: 5 } } if path == PathBuf::from("changes.d/a.md") && line == expected_line)
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            assert!(!temp.path().join("CHANGES.md").exists());
         }
     }
 }

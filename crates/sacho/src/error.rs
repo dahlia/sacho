@@ -93,6 +93,23 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    /// Historical mapping syntax, usage, target, or precedence is invalid.
+    #[snafu(display("section mapping failed: {message}"))]
+    SectionMapping {
+        /// Mapping detail with heading and recorded-ID context when available.
+        message: String,
+    },
+    /// Section identity metadata is malformed, misplaced, or unresolvable.
+    #[snafu(display("section metadata at {line}:{column}: {message}"))]
+    SectionMetadata {
+        /// Original one-based source line.
+        line: usize,
+        /// Original one-based source column.
+        column: usize,
+        /// Diagnostic including recovery guidance where appropriate.
+        message: String,
+    },
+
     /// Per-release Markdown content or stored boundaries are invalid.
     #[snafu(display("invalid {option}: {message}"))]
     InvalidReleaseContext {
@@ -750,6 +767,31 @@ pub enum Error {
 /// Configuration-specific error.
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
+    /// Historical mapping syntax or a literal current-ID target is invalid.
+    #[snafu(display("invalid section maps: {message}"))]
+    InvalidSectionMaps {
+        /// Explanation of the invalid mapping or unresolved target.
+        message: String,
+    },
+    /// An explicitly configured plain title is invalid.
+    #[snafu(display("invalid sections[{index}].title: {message}"))]
+    InvalidSectionTitle {
+        /// Section configuration index.
+        index: usize,
+        /// Validation diagnostic.
+        message: String,
+    },
+    /// Two explicit sections have the same effective output title.
+    #[snafu(display("section title {title:?} is shared by {first_id:?} and {second_id:?}"))]
+    DuplicateSectionTitle {
+        /// Conflicting output title.
+        title: String,
+        /// First stable identifier.
+        first_id: String,
+        /// Second stable identifier.
+        second_id: String,
+    },
+
     /// The TOML document could not be parsed.
     #[snafu(display("TOML parse error: {source}"))]
     Parse {
@@ -958,6 +1000,17 @@ pub enum ConfigError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum FragmentError {
+    /// Reserved section identity HTML appeared inside a fragment.
+    #[snafu(display(
+        "reserved section metadata is not allowed in fragments at {line}:{column}; use a code block or inline code for examples"
+    ))]
+    ReservedSectionMetadata {
+        /// Original one-based source line, including YAML frontmatter.
+        line: usize,
+        /// Original one-based source column.
+        column: usize,
+    },
+
     /// YAML frontmatter was opened but never closed.
     #[snafu(display("YAML frontmatter delimiter was not closed"))]
     UnclosedFrontmatter,

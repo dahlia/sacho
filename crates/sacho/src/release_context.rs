@@ -55,6 +55,7 @@ pub(crate) fn validate(note: Option<&str>, intro: Option<&str>) -> Result<()> {
             };
             if html.is_some_and(|html| {
                 [
+                    crate::section_metadata::RESERVED_PREFIX,
                     INTRO_BEGIN,
                     INTRO_END,
                     crate::changelog::BEGIN_MARKER,
@@ -438,6 +439,25 @@ pub(crate) fn validate_meaning(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn metadata_rejects_reserved_section_identity_html_but_accepts_code_examples() {
+        for source in [
+            "<!-- sacho:section:v1 id=core -->",
+            "Nested <!-- sacho:section:broken -->",
+        ] {
+            assert!(validate(None, Some(source)).is_err());
+            assert!(validate(Some(source), None).is_err());
+        }
+        assert!(validate(Some("Example `<!-- sacho:section:v1 id=core -->`."), None).is_ok());
+        assert!(
+            validate(
+                None,
+                Some("```html\n<!-- sacho:section:v1 id=core -->\n```\n")
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn footnote_block_attributes_are_part_of_their_meaning() {

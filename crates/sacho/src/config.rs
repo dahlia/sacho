@@ -44,6 +44,10 @@ pub struct Config {
     /// Ordered section pattern configuration.
     #[serde(default)]
     pub section_patterns: Vec<SectionPatternConfig>,
+
+    /// Historical title and ID mappings used only when carrying releases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub section_maps: Vec<crate::section_map::SectionMapConfig>,
 }
 
 impl Config {
@@ -87,6 +91,26 @@ impl Config {
             }
             section_ids.push((&section.id, id_key));
 
+            if let Some(title) = &section.title {
+                crate::section_title::validate_section_title(title).map_err(|error| {
+                    ConfigError::InvalidSectionTitle {
+                        index,
+                        message: error.to_string(),
+                    }
+                })?;
+            }
+            let title = section.title.as_deref().unwrap_or(&section.id);
+            if let Some(first) = self.sections[..index]
+                .iter()
+                .find(|other| other.title.as_deref().unwrap_or(&other.id) == title)
+            {
+                return Err(ConfigError::DuplicateSectionTitle {
+                    title: title.to_owned(),
+                    first_id: first.id.clone(),
+                    second_id: section.id.clone(),
+                });
+            }
+
             let directory_key = format!("sections[{index}].directory");
             let comparison_path = validate_config_path(&directory_key, &section.directory)?;
             if let Some((_, first_key)) = section_directories
@@ -105,9 +129,32 @@ impl Config {
             pattern
                 .validate()
                 .map_err(|source| ConfigError::InvalidSectionPattern { index, source })?;
-            if self.section_patterns[..index].contains(pattern) {
+            if self.section_patterns[..index].iter().any(|existing| {
+                existing.source == pattern.source
+                    && existing.id == pattern.id
+                    && existing.directory == pattern.directory
+                    && existing.paths == pattern.paths
+            }) {
                 return Err(ConfigError::DuplicateSectionPattern { index });
             }
+        }
+        if !self.section_maps.is_empty() {
+            if !crate::section::has_sections(self) {
+                return Err(ConfigError::InvalidSectionMaps {
+                    message: "maps require sections".into(),
+                });
+            }
+            let resolver =
+                crate::section::SectionResolver::new(&self.sections, &self.section_patterns)
+                    .map_err(|error| ConfigError::InvalidSectionMaps {
+                        message: error.to_string(),
+                    })?;
+            crate::section_map::CompiledMaps::configuration(&self.section_maps, |id| {
+                resolver.resolve_id(id).map_err(|error| error.to_string())
+            })
+            .map_err(|error| ConfigError::InvalidSectionMaps {
+                message: error.to_string(),
+            })?;
         }
         self.vcs.validate()?;
         Ok(())
@@ -482,8 +529,12 @@ pub struct CheckConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SectionConfig {
-    /// Rendered section identifier.
+    /// Stable section identifier.
     pub id: String,
+
+    /// Explicit plain output title; omission preserves the legacy ID heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 
     /// Fragment subdirectory for this section.
     pub directory: PathBuf,
@@ -498,6 +549,71 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn plain_titles_validate_and_round_trip_without_changing_ids() {
+        let config = Config::parse(
+            r#"[[sections]]
+id = " key "
+title = "API"
+directory = "api"
+[[section-patterns]]
+source = "packages/{scope}/{name}"
+id = "@{scope}/{name}"
+title = "{name} / {name}"
+directory = "{scope}/{name}"
+"#,
+        )
+        .unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded = Config::parse(&encoded).unwrap();
+        assert_eq!(decoded, config);
+        assert_eq!(decoded.sections[0].id, " key ");
+        assert!(
+            Config::parse(
+                r#"[[sections]]
+id = "api"
+title = " API"
+directory = "api"
+"#
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse(
+                r#"[[sections]]
+id = "first"
+title = "second"
+directory = "first"
+[[sections]]
+id = "second"
+directory = "second"
+"#
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse(
+                r#"[[section-patterns]]
+source = "packages/{name}"
+id = "{name}"
+title = "{unknown}"
+directory = "{name}"
+"#
+            )
+            .is_err()
+        );
+        let omitted = Config::parse(
+            r#"[[sections]]
+id = "core"
+directory = "core"
+"#,
+        )
+        .unwrap();
+        let serialized: toml::Value = toml::from_str(&toml::to_string(&omitted).unwrap()).unwrap();
+        assert!(serialized["sections"][0].get("title").is_none());
+        assert!(omitted.sections[0].title.is_none());
+    }
 
     fn safe_text() -> impl Strategy<Value = String> {
         "[A-Za-z0-9][A-Za-z0-9_-]{0,12}"
@@ -533,6 +649,7 @@ mod tests {
                         continue;
                     }
                     unique_sections.push(SectionConfig {
+                        title: None,
                         id,
                         directory,
                         paths: Vec::new(),
@@ -554,6 +671,7 @@ mod tests {
                     check: CheckConfig::default(),
                     sections: unique_sections,
                     section_patterns: Vec::new(),
+                    section_maps: Vec::new(),
                 }
             })
     }
@@ -626,6 +744,42 @@ directory = "{name}"
             duplicate,
             ConfigError::DuplicateSectionPattern { index: 1 }
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_pattern_identity_with_different_titles() {
+        for title in ["{name}", "{name} (Rust)"] {
+            let source = format!(
+                "[[section-patterns]]\nsource = 'crates/{{name}}'\nid = '{{name}}'\ndirectory = '{{name}}'\n\n[[section-patterns]]\nsource = 'crates/{{name}}'\nid = '{{name}}'\ndirectory = '{{name}}'\ntitle = '{title}'\n"
+            );
+            assert!(matches!(
+                Config::parse(&source),
+                Err(ConfigError::DuplicateSectionPattern { index: 1 })
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_patterns_differing_in_one_identity_field() {
+        let pattern = |source: &str, id: &str, directory: &str, paths: &str| {
+            format!(
+                "[[section-patterns]]\nsource = '{source}'\nid = '{id}'\ndirectory = '{directory}'\npaths = {paths}\n"
+            )
+        };
+        let base = pattern("packages/{name}", "{name}", "{name}", "[]");
+        for variant in [
+            pattern("crates/{name}", "{name}", "{name}", "[]"),
+            pattern("packages/{name}", "api/{name}", "{name}", "[]"),
+            pattern("packages/{name}", "{name}", "api/{name}", "[]"),
+            pattern(
+                "packages/{name}",
+                "{name}",
+                "{name}",
+                "['packages/{name}/src/**']",
+            ),
+        ] {
+            assert!(Config::parse(&format!("{base}\n{variant}")).is_ok());
+        }
     }
 
     #[test]

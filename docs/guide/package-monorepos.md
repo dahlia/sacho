@@ -131,3 +131,44 @@ first. Within each family, Sacho sorts the concrete section ids.
 
 See [*Section pattern syntax*](../reference/section-patterns) for the complete
 grammar, field constraints, `paths` behavior, and ambiguity rules.
+
+
+Rename headings without rewriting releases
+------------------------------------------
+
+Keep package IDs stable while distinguishing language bindings in the output:
+
+~~~~ toml
+[[section-patterns]]
+source = "crates/{name}"
+id = "{name}"
+title = "{name} (Rust)"
+directory = "rust/{name}"
+
+[[section-patterns]]
+source = "packages/{name}"
+id = "@acme/{name}"
+title = "@acme/{name} (JavaScript/TypeScript)"
+directory = "javascript/{name}"
+
+[[section-patterns]]
+source = "python/{name}"
+id = "python/{name}"
+title = "{name} (Python)"
+directory = "python/{name}"
+~~~~
+
+An old heading `core` still resolves to the Rust ID `core`, while `@acme/cli`
+still resolves to its JavaScript ID. Carry writes into the new fragment
+directories without editing the old release text. Deleted source directories do
+not prevent this resolution. New output records each stable ID below its new
+heading. Do not reuse an existing ID for a different component.
+
+If an old heading no longer matches a current title or ID, add a historical
+`[[section-maps]]` rule, or use `sacho carry VERSION --map FROM TO` for one
+release. Maps do not create aliases for `add --section` or `preview --section`.
+See the [configuration reference](../reference/configuration#section-maps) and
+[carry reference](../reference/commands#sacho-carry) for family rules and
+precedence. A missing or deleted identity comment returns the document to
+legacy title interpretation; Sacho cannot recover the meaning of a reused old
+title without an explicit map.

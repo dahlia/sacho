@@ -1,0 +1,16 @@
+[changelog]
+materialize = true
+region-detection = "marker"
+
+[links]
+"#" = "https://github.com/example/project/issues/{n}"
+
+[[section-patterns]]
+source = "crates/{name}"
+id = "{name}"
+directory = "crates/{name}"
+
+[[section-patterns]]
+source = "packages/{name}"
+id = "@gukhanmun/{name}"
+directory = "packages/{name}"
