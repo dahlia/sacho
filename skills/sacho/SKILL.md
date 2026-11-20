@@ -118,8 +118,37 @@ require a fragment in that package's section.
 Writing a fragment for a change
 -------------------------------
 
-The everyday loop is four commands. Create the fragment, write it, format, and
-check:
+Before running `sacho add`, search `changes.d/` for an existing fragment about
+the same user-visible change. When a change extends, fixes, renames, or removes
+a feature, check whether users of the affected package or release line ever
+received the behavior you're changing. Start with the released sections of
+`CHANGES.md`. If they don't settle it, check the code or docs at the relevant
+release tag, or inspect the published package. A merge is not a release, and a
+missing entry does not prove a feature never shipped. If you still can't tell,
+ask the maintainer before drafting the entry.
+
+ -  If the feature hasn't shipped and the change is part of introducing it,
+    edit the existing fragment to describe what will ship. If there is no
+    fragment yet, write one for the final behavior. If `remove_all()` becomes
+    `clear()` before either ships, record only the addition of `clear()`.
+ -  If a feature is dropped or a change is reverted before it ships, remove the
+    outdated entry. Delete the fragment if it contains nothing else. If the
+    revert leaves a smaller user-visible change, keep only that part.
+ -  If the old behavior shipped, leave the released entry alone. Record what
+    changes for users in the next release. For a rename, removal, or changed
+    default, check whether existing usage still works and tell users what to
+    do if it doesn't.
+ -  If several commits or PRs touch the same feature, combine their entries only
+    if they describe the same change for users. Keep separate changes users
+    need to know about, even if they affect the same feature.
+ -  For an internal-looking change, check for effects on output, defaults,
+    compatibility, or security before deciding to skip it. If the change has
+    no effect users need to know about, omit the entry. If coverage checks
+    require an exemption, use the project's opt-out rather than writing a
+    filler entry.
+
+If you need a new fragment, create it and write the entry. After editing the
+fragments, format, preview, and check:
 
 ~~~~ sh
 sacho add clear-function      # add --section <id> <name> in a sectioned repo
@@ -130,9 +159,7 @@ sacho check
 
 `sacho add` creates `changes.d/<name>.md` holding an empty list item and prints
 the path. Name the file after the change itself (`clear-function`), never after
-an issue or PR number. Topic names make the right follow-up natural: when a
-later commit reworks the same feature, you edit the existing fragment instead of
-adding a second one that documents a state users never saw.
+an issue or PR number, so the next person who changes the feature can find it.
 
 Keep the fragment in the same commit series as the implementation. Stored in the
 repository, it travels with the change through merges, rebases, cherry-picks,
@@ -150,11 +177,6 @@ Address the person upgrading, in the vocabulary of the public surface. A
 refactor that touches forty files but changes nothing users can observe is a
 real commit and a nonexistent entry. A one-line dependency bump that closes a
 vulnerability is a trivial commit and a critical entry.
-
-Write one entry per user-visible change. If a release adds `remove_all()` and a
-later commit in the same cycle renames it to `clear()`, the released changelog
-contains a single line, `Added clear() function`, not the two-step history. Edit
-the existing fragment; never narrate intermediate states that never shipped.
 
 Be concise, and keep internal names out. Private type names, module paths, and
 subsystem nicknames tell the reader this document is not for them. If a
@@ -210,8 +232,11 @@ sacho preview
 sacho check
 ~~~~
 
-In the preview, merge entries that describe the same change, drop development
-history, and confirm each entry names public behavior. Then compile:
+Read the preview against the previous release for the package or release line.
+Merge entries that describe the same change, drop intermediate states that
+never shipped, and check that each entry says what users will notice or need to
+do. `sacho check` can catch missing fragments, not make those editorial
+decisions. Then compile:
 
 ~~~~ sh
 sacho release --next 1.3.0            # reads the version from changes.d/next
@@ -283,10 +308,14 @@ The scenario: a fix lands on `1.1-maintenance`, `1.1.5` ships, and the fix needs
 to reach `1.2-maintenance` and `main`. Two paths, and which one you are on
 decides the work.
 
-Merge before releasing, and there is nothing to do. If you merge
-`1.1-maintenance` into `1.2-maintenance` while the fix's fragment still exists,
-the VCS carries the fragment along, and each branch later consumes its own copy.
-Prefer this ordering when you can; it needs no Sacho command.
+After a merge or cherry-pick, check that the receiving branch has the entry it
+needs. Compare with that branch's previous release: a fix for a shipped bug on
+one branch may only revise an unreleased feature on another.
+
+If you merge `1.1-maintenance` into `1.2-maintenance` while the fix's fragment
+still exists, the VCS carries the fragment along, and each branch later consumes
+its own copy. Prefer this ordering when you can; there's no need to recover a
+fragment from a released section.
 
 Merge the release tag, and the fragment arrives already consumed. The incoming
 `1.1.5` release commit deleted the fragment, so the merge brings only the frozen
@@ -324,6 +353,6 @@ discarding hand edits, and `sacho sync --force` skips that prompt, so read the
 diff first.
 
 A missing-fragment failure names the affected section and suggests `sacho add`.
-Either write the entry or, if the commit truly has no user-visible effect, use
-the `Changelog: none` exemption. For anything stranger, fetch
-`troubleshooting.md`.
+Check whether to update an existing fragment before adding one. If the
+commit truly needs no entry, use the `Changelog: none` exemption. For anything
+stranger, fetch `troubleshooting.md`.
